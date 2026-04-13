@@ -1,3 +1,7 @@
+Changes made so far:
+Swapped out fasttransport functionality to use existing udp transport when possible. Swapped out/replaced other erpc related function calls in bench folder.
+
+
 # Ionia
 
 IONIA: High-Performance Replication for key-value stores
