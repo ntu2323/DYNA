@@ -43,6 +43,7 @@
 #include "lib/udptransport.h"
 
 #include <algorithm>
+#include <chrono>
 #include <random>
 #include <boost/config.hpp>
 #include <vector>
@@ -150,11 +151,14 @@ VRReplica::VRReplica(Configuration config, int myIdx,
 
     std::thread t([&]()
     {
+        const auto t0 = std::chrono::steady_clock::now();
         while (true)
         {
-            static erpc::ChronoTimer timer;
+            const double elapsed_ms = std::chrono::duration<double, std::milli>(
+                                          std::chrono::steady_clock::now() - t0)
+                                          .count();
             Notice("TIME [%f] [%d] [%d] [%d] [%d] [%d] [%d] [%d] [%d] [%d] [%d] [%d]",
-                timer.get_ms(),
+                elapsed_ms,
                 app->GetDurabilityLogIndex(),
                 lastCommitted,
                 app->GetKVSize(),

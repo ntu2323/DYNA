@@ -36,6 +36,7 @@
 #include "bench/benchmark.h"
 #include "common/client.h"
 #include "lib/configuration.h"
+#include "lib/cpu_affinity.h"
 #include "vr/client.h"
 
 #include <unistd.h>
@@ -293,7 +294,7 @@ int main(int argc, char **argv)
     auto client_thread_func = [&](specpaxos::Configuration config, uint8_t numa_node, uint8_t thread_id, size_t total_threads)
     {
         // Some hardware has limit of x of queues for rpc (16 for xl170)
-        const size_t num_socket_cores = erpc::get_lcores_for_numa_node(numa_node).size();
+        const size_t num_socket_cores = CpuCountOnNumaNode(numa_node);
         auto ht_ct = std::min(num_socket_cores, static_cast<std::size_t>(numRequests));
 
         FastTransport transport(config, ht_ct, 1, physical_port, numa_node, thread_id);
@@ -401,7 +402,8 @@ int main(int argc, char **argv)
         for (auto j = 0; j < totalThreads; j++) {
             auto benchmark_client_thread = std::thread(client_thread_func, config, numa_node, j + 1, totalThreads);
             benchmark_client_threads.emplace_back(std::move(benchmark_client_thread)); 
-            erpc::bind_to_core(benchmark_client_threads.back(), numa_node, coreBoundIdx);
+            BindThreadToNumaCpu(benchmark_client_threads.back(), numa_node,
+                                coreBoundIdx);
             coreBoundIdx++;
         }
 

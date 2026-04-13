@@ -3,6 +3,7 @@ d := $(dir $(lastword $(MAKEFILE_LIST)))
 SRCS += $(addprefix $(d), \
 	lookup3.cc message.cc memory.cc \
 	latency.cc configuration.cc transport.cc udptransport.cc simtransport.cc fasttransport.cc \
+	cpu_affinity.cc \
 	workertasks.cc batchgen.cc data_structure.cc db.cc)
 
 PROTOS += $(addprefix $(d), \
@@ -27,6 +28,8 @@ LIB-simtransport := $(o)simtransport.o $(LIB-transport) $(LIB-request) $(LIB-no-
 LIB-udptransport := $(o)udptransport.o $(LIB-transport)
 
 LIB-fasttransport := $(o)fasttransport.o $(LIB-transport)
+
+LIB-cpu_affinity := $(o)cpu_affinity.o
 
 LIB-batchgen := $(o)batchgen.o
 

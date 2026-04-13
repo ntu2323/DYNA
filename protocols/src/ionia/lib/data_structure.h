@@ -5,7 +5,6 @@
 #include "third_party/readerwriterqueue/readerwriterqueue.h"
 #include "third_party/unordered_dense/include/ankerl/unordered_dense.h"
 #include "third_party/function2/include/function2/function2.hpp"
-#include "rpc.h"
 #include "lib/message.h"
 
 #include <google/protobuf/message.h>

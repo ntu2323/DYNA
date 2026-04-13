@@ -37,6 +37,7 @@
 #include "common/replica.h"
 #include "lib/udptransport.h"
 #include "lib/fasttransport.h"
+#include "lib/cpu_affinity.h"
 #include "vr/replica.h"
 #include "vr/durabilityreplica.h"
 
@@ -244,7 +245,7 @@ main(int argc, char **argv)
     // Some hardware has limit of x of queues for rpc (16 for xl170)
     //uint8_t numa_node = (i % 4 < 2)?0:1;
     uint8_t numa_node = 0;
-    const size_t num_socket_cores = erpc::get_lcores_for_numa_node(numa_node).size();        
+    const size_t num_socket_cores = CpuCountOnNumaNode(numa_node);        
     auto ht_ct = 0;
 
     //UDPTransport internalTransport(dropRate, reorderRate, dscp, nullptr);
@@ -302,7 +303,7 @@ main(int argc, char **argv)
 
         internal_transport.Run();
     });
-    erpc::bind_to_core(internal_transport_thread, numa_node, 0);
+    BindThreadToNumaCpu(internal_transport_thread, numa_node, 0);
     {
         int policy;
         struct sched_param param;
@@ -335,7 +336,7 @@ main(int argc, char **argv)
             // Skip this core because of HT... background thread should occupy the whole physical core
             idx++;
         }
-        erpc::bind_to_core(durability_threads[i], numa_node, idx);
+        BindThreadToNumaCpu(durability_threads[i], numa_node, idx);
         idx++;
     }
 

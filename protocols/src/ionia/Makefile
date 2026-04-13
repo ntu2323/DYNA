@@ -50,14 +50,6 @@ LIBUNWIND_LDFLAGS := -lunwind
 CFLAGS += $(LIBUNWIND_CFLAGS)
 LDFLAGS += $(LIBUNWIND_LDFLAGS)
 
-ERPC_PATH= "./third_party/eRPC"
-
-ERPC_CFLAGS_DPDK := -I $(ERPC_PATH)/src -I /usr/include/dpdk -DERPC_DPDK=true -DPERF=true -DERPC_TESTING=false -Ofast -march=native
-ERPC_LDFLAGS_DPDK := -L $(ERPC_PATH)/build -lerpc -lpthread -lnuma -ldl -lgflags -Wl,--whole-archive -ldpdk -Wl,--no-whole-archive -lnuma -ldl -libverbs -lmlx5
-
-CFLAGS += $(ERPC_CFLAGS_DPDK)
-LDFLAGS += $(ERPC_LDFLAGS_DPDK)
-
 PARALLEL_HASHMAP_PATH= "./third_party/parallel-hashmap"
 
 PARALLEL_HASHMAP_CFLAGS := -I $(PARALLEL_HASHMAP_PATH)

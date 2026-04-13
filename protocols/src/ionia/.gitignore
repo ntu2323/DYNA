@@ -57,3 +57,13 @@ Thumbs.db
 .cproject
 .project
 /build/
+
+# third_party/setup.sh — cloned / extracted (not part of this repo’s source of truth)
+third_party/eRPC/
+third_party/parallel-hashmap/
+third_party/concurrentqueue/
+third_party/readerwriterqueue/
+third_party/unordered_dense/
+third_party/function2/
+third_party/protobuf-*/
+third_party/jemalloc/
