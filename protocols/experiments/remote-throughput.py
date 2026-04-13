@@ -179,8 +179,9 @@ if __name__ == '__main__':
 	# populate constructed values
 	context.servers =  [str(x+1) for x in range(context.num_nodes)]
 	context.local_mount_point = os.getcwd()
-	context.remote_dir = '/mnt/sda4/replicated_kvstore/'
-	context.remote_mount_point = '/mnt/sda4/replicated_kvstore/protocols/experiments'
+	# Must match --repo_dir in setup/skyros_upload.py (default IONIA) after cp to /mnt/sda4
+	context.remote_dir = '/mnt/sda4/IONIA/'
+	context.remote_mount_point = '/mnt/sda4/IONIA/protocols/experiments'
 	context.system_home_dir = target_system.home_dir(context) 
 	assert context.system_home_dir is not None
 	#uppath = lambda _path, n: os.sep.join(_path.split(os.sep)[:-n])

@@ -31,7 +31,7 @@ def parallel_start_and_join(threads):
 	map(lambda t: t.join(), threads)
 
 def update_machine(src_machine):
-	run_remote(src_machine, "cd /mnt/sda4/replicated_kvstore/protocols/src/ionia/; git pull; make -j; git status")
+	run_remote(src_machine, "cd /mnt/sda4/IONIA/protocols/src/ionia/; git pull; make -j; git status")
 
 def main():
 	with open('./external_ips', 'r') as ip_reader:

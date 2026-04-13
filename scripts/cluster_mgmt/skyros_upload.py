@@ -11,6 +11,9 @@ parser.add_argument('--config_file', type=str, help='XML config containing descr
 parser.add_argument('--identity_file', type=str, help='SSH identity file to access cloudlab machine', default='cloudlab.pem')
 parser.add_argument('--username', type=str, help='Username', default='makneee')
 parser.add_argument('--step', type=int, default=0)
+parser.add_argument('--repo_url', type=str, default='https://github.com/ntu2323/IONIA.git')
+parser.add_argument('--repo_dir', type=str, default='IONIA')
+parser.add_argument('--branch', type=str, default='main')
 args = parser.parse_args()
 
 config_file = args.config_file
@@ -40,24 +43,36 @@ if __name__ == '__main__':
                 #await run_command(r'sudo cp -r mold-1.1.1-x86_64-linux/* /usr')
                 #await run_command(r'rm -rf mold-1.1.1-x86_64-linux/')
 
-                await run_command(r'rm -rf replicated_kvstore && git clone https://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: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@github.com/y4xu/replicated_kvstore.git')
-                await run_command(r'cd replicated_kvstore/scripts && ./run_1.sh')
+                await run_command(
+                    f'rm -rf {args.repo_dir} && git clone {args.repo_url} {args.repo_dir}'
+                )
+                await run_command(f'cd {args.repo_dir}/scripts && ./run_1.sh')
             elif args.step == 1:
                 base_dir = '~'
-                await asyncssh.scp('mount.sh', (conn, f'{base_dir}/replicated_kvstore/scripts/mount.sh'))
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && ./mount.sh')
-                await run_command(r'cp -r ~/replicated_kvstore /mnt/sda4/')
+                await asyncssh.scp('mount.sh', (conn, f'{base_dir}/{args.repo_dir}/scripts/mount.sh'))
+                await run_command(f'cd {base_dir}/{args.repo_dir}/scripts && ./mount.sh')
+                await run_command(f'cp -r ~/{args.repo_dir} /mnt/sda4/')
             elif args.step == 2:
                 base_dir = '/mnt/sda4'
 
-                await run_command(f'cd {base_dir}/replicated_kvstore && git checkout main && git pull')
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && (echo "n" | ./setup_eRPC.sh)')
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && ./folly.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf eRPC && ./erpc.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
-
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/skyros/third_party && sudo rm -rf eRPC && ./setup.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/skyros && make clean && make -j')
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir} && git fetch origin && git checkout {args.branch} && git pull'
+                )
+                await run_command(f'cd {base_dir}/{args.repo_dir}/scripts && (echo "n" | ./setup_eRPC.sh)')
+                await run_command(f'cd {base_dir}/{args.repo_dir}/scripts && ./folly.sh')
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf eRPC && ./erpc.sh'
+                )
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh'
+                )
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party && '
+                    f'sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh'
+                )
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && make clean && make -j'
+                )
                 
             return True
         

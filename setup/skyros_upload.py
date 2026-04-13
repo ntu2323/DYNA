@@ -11,6 +11,24 @@ parser.add_argument('--config_file', type=str, help='XML config containing descr
 parser.add_argument('--identity_file', type=str, help='SSH identity file to access cloudlab machine', default='~/cloudlab_nopass')
 parser.add_argument('--username', type=str, help='Username', default='makneee')
 parser.add_argument('--step', type=int, default=0)
+parser.add_argument(
+    '--repo_url',
+    type=str,
+    default='https://github.com/ntu2323/IONIA.git',
+    help='Git remote for IONIA (HTTPS or SSH URL).',
+)
+parser.add_argument(
+    '--repo_dir',
+    type=str,
+    default='IONIA',
+    help='Directory name created by git clone under $HOME (must match experiments remote paths).',
+)
+parser.add_argument(
+    '--branch',
+    type=str,
+    default='main',
+    help='Git branch to checkout in steps 2, 4, 5, and 6.',
+)
 args = parser.parse_args()
 
 config_file = args.config_file
@@ -41,40 +59,31 @@ if __name__ == '__main__':
                 #await run_command(r'sudo cp -r mold-1.1.1-x86_64-linux/* /usr')
                 #await run_command(r'rm -rf mold-1.1.1-x86_64-linux/')
 
-                await run_command(r'rm -rf replicated_kvstore && git clone https://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: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@github.com/y4xu/replicated_kvstore.git')
-                await run_command(r'cd replicated_kvstore/scripts && ./run_1.sh')
+                await run_command(
+                    f'rm -rf {args.repo_dir} && git clone {args.repo_url} {args.repo_dir}'
+                )
+                await run_command(f'cd {args.repo_dir}/scripts && ./run_1.sh')
             elif args.step == 1:
                 base_dir = '~'
-                await asyncssh.scp('mount.sh', (conn, f'{base_dir}/replicated_kvstore/scripts/mount.sh'))
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && ./mount.sh')
-                await run_command(r'cp -r ~/replicated_kvstore /mnt/sda4/')
+                await asyncssh.scp('mount.sh', (conn, f'{base_dir}/{args.repo_dir}/scripts/mount.sh'))
+                await run_command(f'cd {base_dir}/{args.repo_dir}/scripts && ./mount.sh')
+                await run_command(f'cp -r ~/{args.repo_dir} /mnt/sda4/')
             elif args.step == 2:
                 base_dir = '~'
-                #await run_command(r'cp -r ~/replicated_kvstore /mnt/sda4/')
-                #await asyncssh.scp('config_fasttransport', (conn, f'{base_dir}/replicated_kvstore/skyros/src/skyros/sample/config_fasttransport'))
-                #await asyncssh.scp('config_fasttransport.client', (conn, f'{base_dir}/replicated_kvstore/skyros/src/skyros/sample/config_fasttransport.client'))
+                #await run_command(r'cp -r ~/{args.repo_dir} /mnt/sda4/')
+                #await asyncssh.scp('config_fasttransport', (conn, f'{base_dir}/{args.repo_dir}/skyros/src/skyros/sample/config_fasttransport'))
+                #await asyncssh.scp('config_fasttransport.client', (conn, f'{base_dir}/{args.repo_dir}/skyros/src/skyros/sample/config_fasttransport.client'))
 
-                #await asyncssh.scp('mount.sh', (conn, f'{base_dir}/replicated_kvstore/scripts/mount.sh'))
-                #await asyncssh.scp('run-after-setup.sh', (conn, f'{base_dir}/replicated_kvstore/scripts/run-after-setup.sh'))
+                #await asyncssh.scp('mount.sh', (conn, f'{base_dir}/{args.repo_dir}/scripts/mount.sh'))
+                #await asyncssh.scp('run-after-setup.sh', (conn, f'{base_dir}/{args.repo_dir}/scripts/run-after-setup.sh'))
 
-                await run_command(f'cd {base_dir}/replicated_kvstore && git checkout main && git pull')
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && (echo "n" | ./setup_eRPC.sh)')
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && ./folly.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/deps/ && sudo rm -rf eRPC && ./erpc.sh')
-                await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/replicated_kvstore/skyros/src/deps/splinter.sh'))
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
-
-                #await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/skyros/ && git checkout fasttransport_multiple_threads')
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/skyros/third_party && sudo rm -rf eRPC && ./setup.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/skyros && make clean && make -j')
-                '''
-                await run_command(f'cd {base_dir}/replicated_kvstore && git checkout main')
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && ./setup_eRPC.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/scripts && ./folly.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/deps/ && ./erpc.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/deps/ && ./splinter.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/skyros && make clean && make -j')
-                '''
+                # This IONIA tree does not include protocols/src/skyros. Step 4 builds ionia + deps.
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir} && git fetch origin && git checkout {args.branch} && git pull'
+                )
+                print(
+                    f'[{conn._host}] Step 2: skipped legacy Skyros build; use step 4 for ionia ({args.branch}).'
+                )
             elif args.step == 3:
                 base_dir = '/mnt/sda4'
                 # base_dir = '~'
@@ -92,27 +101,31 @@ if __name__ == '__main__':
             elif args.step == 4:
                 base_dir = '~'
 
-                await run_command(f'cd {base_dir}/replicated_kvstore && sudo chown -R {args.username} .')
-                await run_command(f'cd {base_dir}/replicated_kvstore && git stash && git checkout perf && git pull')
+                await run_command(f'cd {base_dir}/{args.repo_dir} && sudo chown -R {args.username} .')
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir} && git stash && git checkout {args.branch} && git pull'
+                )
                 
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf eRPC && ./erpc.sh')
-                await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/replicated_kvstore/protocols/src/deps/splinter.sh'))
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf eRPC && ./erpc.sh')
+                await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/deps/splinter.sh'))
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
 
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia/third_party && sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh')
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party && sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh')
 
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && make clean && make -j')
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && make clean && make -j')
             elif args.step == 5:
                 base_dir = '~'
 
-                await run_command(f'cd {base_dir}/replicated_kvstore && git stash && git fetch && git checkout perf-test')
-                # await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia/third_party && sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh')
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia/third_party/ && rm -rf concurrentqueue && git clone https://github.com/cameron314/concurrentqueue')
-                # await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && make clean && make -j')
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir} && git stash && git fetch && git checkout {args.branch} && git pull'
+                )
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party && sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party/ && rm -rf concurrentqueue && git clone https://github.com/cameron314/concurrentqueue')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && make clean && make -j')
                 # await run_command(f'sudo bash -c "echo 16192 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"')
 
-                await asyncssh.scp('config_fasttransport', (conn, f'{base_dir}/replicated_kvstore/protocols/src/ionia/config_fasttransport'))
-                await asyncssh.scp('config_fasttransport.client', (conn, f'{base_dir}/replicated_kvstore/protocols/src/ionia/config_fasttransport.client'))
+                await asyncssh.scp('config_fasttransport', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/ionia/config_fasttransport'))
+                await asyncssh.scp('config_fasttransport.client', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/ionia/config_fasttransport.client'))
 
                 await run_command(f'cd {base_dir} && rm -f protobuf-cpp-3.21.12.tar.gz && wget https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protobuf-cpp-3.21.12.tar.gz')
                 await run_command(f'cd {base_dir} && tar xvf protobuf-cpp-3.21.12.tar.gz && rm -f protobuf-cpp-3.21.12.tar.gz')
@@ -120,7 +133,7 @@ if __name__ == '__main__':
 
                 await run_command('git clone https://github.com/jemalloc/jemalloc.git && cd jemalloc && autoconf && ./configure && make dist && sudo make install')
 
-                await asyncssh.scp('vr.py', (conn, f'{base_dir}/replicated_kvstore/protocols/experiments/vr.py'))
+                await asyncssh.scp('vr.py', (conn, f'{base_dir}/{args.repo_dir}/protocols/experiments/vr.py'))
                 await run_command(f'wget https://github.com/rui314/mold/releases/download/v1.10.1/mold-1.10.1-x86_64-linux.tar.gz')
                 await run_command(f'tar xvf mold-1.10.1-x86_64-linux.tar.gz')
                 await run_command(f'cd ~/mold-1.10.1-x86_64-linux/ && sudo cp -r bin/* /usr/local/bin && sudo cp -r lib/* /usr/local/lib')
@@ -135,20 +148,20 @@ if __name__ == '__main__':
                 base_dir = '~'
                 traces_dir = '/mnt/sda4'
                 
-                #await run_command(f'chmod +x {base_dir}/replicated_kvstore/protocols/experiments/udp_parms')
-                #await run_command(f'sudo {base_dir}/replicated_kvstore/protocols/experiments/udp_parms')
+                #await run_command(f'chmod +x {base_dir}/{args.repo_dir}/protocols/experiments/udp_parms')
+                #await run_command(f'sudo {base_dir}/{args.repo_dir}/protocols/experiments/udp_parms')
                 
                 # await run_command(f'sudo apt install ccache -y')
                 # await run_command(f'sudo mkdir -p /ramdisk/ccache && sudo mount -t tmpfs -o size=2048M tmpfs /ramdisk/ccache && sudo chown -R {args.username} /ramdisk/ccache')
                 # await run_command(f'echo "cache_dir = /ramdisk/ccache" > {base_dir}/.ccache/ccache.conf')
                 # await run_command(f'sudo rm -rf /tmp && sudo rm -rf {base_dir}/.cache && sudo rm -rf {base_dir}/.vscode-server && sudo rm -rf {base_dir}/jemalloc')
-                # await run_command(r'sudo rm -rf /tmp && sudo find ~/replicated_kvstore -size +20M -delete')
+                # await run_command(r'sudo rm -rf /tmp && sudo find ~/{args.repo_dir} -size +20M -delete')
                 # await run_command(f'sudo rm -rf {base_dir}/traces/runt')
-                # await run_command(f'sudo rm -rf {base_dir}/replicated_kvstore/protocols/src/ionia/third_party/eRPC/third_party')
-                # await run_command(f'sudo rm -rf {base_dir}/replicated_kvstore/protocols/src/ionia/third_party/eRPC/lib')
-                await asyncssh.scp('config_fasttransport', (conn, f'{base_dir}/replicated_kvstore/protocols/src/ionia/config_fasttransport'))
-                await asyncssh.scp('config_fasttransport.client', (conn, f'{base_dir}/replicated_kvstore/protocols/src/ionia/config_fasttransport.client'))
-                #await run_command(f'cd {base_dir}/replicated_kvstore && sudo pkill replica')
+                # await run_command(f'sudo rm -rf {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party/eRPC/third_party')
+                # await run_command(f'sudo rm -rf {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party/eRPC/lib')
+                await asyncssh.scp('config_fasttransport', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/ionia/config_fasttransport'))
+                await asyncssh.scp('config_fasttransport.client', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/ionia/config_fasttransport.client'))
+                #await run_command(f'cd {base_dir}/{args.repo_dir} && sudo pkill replica')
 
                 # if is_client:
                 #     await asyncssh.scp('split_results.sh', (conn, f'{traces_dir}/traces/runt/split_results.sh'))
@@ -161,7 +174,9 @@ if __name__ == '__main__':
                             RUN_FILENAME = f'run{RUN}'
                             CLIENTS = 15
                             await run_command(f'cd {traces_dir} && rm -rf ycsb-tracegen')
-                            await run_command(f'cd {traces_dir} && git clone https://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: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@github.com/dassl-uiuc/ycsb-tracegen.git')
+                            await run_command(
+                                f'cd {traces_dir} && git clone https://github.com/dassl-uiuc/ycsb-tracegen.git'
+                            )
                             await run_command(f'cd {traces_dir}/ycsb-tracegen && sudo apt install maven -y')
                             await run_command(f'cd {traces_dir}/ycsb-tracegen && mvn clean package -T 1C -DskipTests || true')
                             await run_command(f'cd {traces_dir}/ycsb-tracegen && ./gen-trace.py load && ./convert.py 32 load')
@@ -170,8 +185,6 @@ if __name__ == '__main__':
                             await run_command(f'cd {traces_dir} && mkdir -p traces && cd {traces_dir}/traces/ && rm -rf {RUN_FILENAME}')
                             await run_command(f'cd {traces_dir}/ycsb-tracegen && cp -rf client_traces/run* {traces_dir}/traces')
                             ## await run_command(f'cd {traces_dir}/ycsb-tracegen && cp -rf client_traces/load {traces_dir}/traces/{RUN_FILENAME}')
-                            aa()
-
                             ## await asyncssh.scp('split_results_load.sh', (conn, f'{traces_dir}/traces/{RUN_FILENAME}/load/split_results_load.sh'))
                             ## await run_command(f'cd {traces_dir}/traces/{RUN_FILENAME}/load && ./split_results_load.sh w {4 * CLIENTS}')
                             ## await asyncssh.scp('split_results.sh', (conn, f'{traces_dir}/traces/{RUN_FILENAME}/split_results.sh'))
@@ -187,7 +200,6 @@ if __name__ == '__main__':
 
                         await run_command(f'cd {traces_dir}/ && true')
                     await run_command(f'cd {traces_dir}/ && true')
-                aa()
 
                 await run_command(f'sudo pkill -9 replica || true')
                 await run_command(f'sudo pkill -9 client || true')
@@ -203,9 +215,9 @@ if __name__ == '__main__':
                 #     await run_command(f'cd {traces_dir} && rsync -avP -e "ssh -oStrictHostKeyChecking=no -i {args.identity_file}" {username}@{hostname}:{traces_dir}/traces /mnt/sda4')
 
                 # await run_command(f'cd {base_dir}/ && rm -rf protobuf-3.21.12 && rm -rf jemalloc || true')
-                # await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && sudo rm -rf third_party/protobuf-3.21.12 || true')
-                # await run_command(f'cd {base_dir}/replicated_kvstore/skyros/src/deps && sudo rm -rf eRPC || true')
-                # await run_command(f'cd {base_dir}/replicated_kvstore/scripts && sudo rm -rf MLNX_OFED_LINUX-5.6-2.0.9.0-ubuntu20.04-x86_64.iso || true')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && sudo rm -rf third_party/protobuf-3.21.12 || true')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/skyros/src/deps && sudo rm -rf eRPC || true')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/scripts && sudo rm -rf MLNX_OFED_LINUX-5.6-2.0.9.0-ubuntu20.04-x86_64.iso || true')
                 # await run_command(f'cd {base_dir}/ && rm -rf .ccache || true')
 
                 # if is_client:
@@ -228,55 +240,57 @@ if __name__ == '__main__':
 
                 # # await run_command(f'curl -LO https://github.com/ClementTsang/bottom/releases/download/0.8.0/bottom_0.8.0_amd64.deb && sudo dpkg -i bottom_0.8.0_amd64.deb')
                 # # double check if cleared db, should fail
-                # await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && sudo rm /mnt/sda4/bench/replica')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && sudo rm /mnt/sda4/bench/replica')
 
                 if not is_client:
-                    await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && sudo rm -rf /mnt/sda4/splinterdb.db')
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore && git stash && pkill python && sudo pkill client || true')
-                #await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-foreground-change-ycsb-c-splinter && git pull')
-                #await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-unreplicated && git pull && rm -rf /tmp/ionia_lock')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads && git pull && rm -rf /tmp/ionia_lock')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-full-applied-index-step-2 && git pull')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-test-sync-reads-false && git pull')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-test-sync-reads-false-old-mapping && git pull')
+                    await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && sudo rm -rf /mnt/sda4/splinterdb.db')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
+                await run_command(f'cd {base_dir}/{args.repo_dir} && git stash && pkill python && sudo pkill client || true')
+                #await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-foreground-change-ycsb-c-splinter && git pull')
+                #await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-unreplicated && git pull && rm -rf /tmp/ionia_lock')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads && git pull && rm -rf /tmp/ionia_lock')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-full-applied-index-step-2 && git pull')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-test-sync-reads-false && git pull')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-test-sync-reads-false-old-mapping && git pull')
                 # await run_command(f'sudo bash -c "echo 12000 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"')
                 # await run_command(f'sudo bash -c "echo 16384 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"')
-                # await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia/third_party && ./setup.sh')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party && ./setup.sh')
 
 
-                await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-full && git pull && rm -rf /tmp/ionia_lock')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-full-throughput-second-client && git pull && rm -rf /tmp/ionia_lock')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-full-applied-index-step-2 && git pull')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-pe && git pull')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-unreplicated && git pull && rm -rf /tmp/ionia_lock')
+                await run_command(
+                    f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout {args.branch} && git pull && rm -rf /tmp/ionia_lock'
+                )
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-full-throughput-second-client && git pull && rm -rf /tmp/ionia_lock')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-full-applied-index-step-2 && git pull')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-pe && git pull')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-unreplicated && git pull && rm -rf /tmp/ionia_lock')
 
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git fetch && git checkout perf-test-execution-reads-pe && git pull')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git fetch && git checkout perf-test-execution-reads-pe && git pull')
 
-                # await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && mold -run make -j')
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && make clean && mold -run make -j')
+                # await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && mold -run make -j')
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && make clean && mold -run make -j')
 
                 # await run_command(f'cd {base_dir} && rm -rf splinter-odirect-stat && git clone https://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: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@github.com/y4xu/splinter-odirect-stat/')
                 # await run_command(f'cd {base_dir}/splinter-odirect-stat/splinter-ycsb/YCSB-C && sudo apt-get install libtbb-dev librocksdb-dev libhiredis-dev -y && make && cp ycsbc /mnt/sda4/ycsbc && cp -r workloads /mnt/sda4/')
                 # /mnt/sda4/ycsbc -db splinterdb -threads 12 -L workloads/load.spec -w fieldlength 100 -w recordcount 670000000 -W workloads/workloada.spec -w operationcount 160000000
 
-                #await run_command(f'cd {base_dir}/replicated_kvstore && git stash && git fetch && git checkout perf-paxos-fasttransport')
+                #await run_command(f'cd {base_dir}/{args.repo_dir} && git stash && git fetch && git checkout perf-paxos-fasttransport')
                 #await run_command(f'sudo bash -c "echo 24192 > /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages"')
-                #await asyncssh.scp('vrclient.py', (conn, f'{base_dir}/replicated_kvstore/protocols/experiments/vrclient.py'))
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/paxos && git stash && git pull && make clean && make -j')
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia/third_party && sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh')
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/paxos && git stash && git pull && make -j')
+                #await asyncssh.scp('vrclient.py', (conn, f'{base_dir}/{args.repo_dir}/protocols/experiments/vrclient.py'))
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/paxos && git stash && git pull && make clean && make -j')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party && sudo rm -rf eRPC && sudo rm -rf parallel-hashmap && ./setup.sh')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/paxos && git stash && git pull && make -j')
 
-                #await run_command(f'cd {base_dir}/replicated_kvstore && git stash && git fetch && git checkout perf-skyros-fasttransport')
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/skyros && make clean && make -j')
+                #await run_command(f'cd {base_dir}/{args.repo_dir} && git stash && git fetch && git checkout perf-skyros-fasttransport')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/skyros && make clean && make -j')
                 
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf eRPC && ./erpc.sh')
-                #await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/replicated_kvstore/protocols/src/deps/splinter.sh'))
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf eRPC && ./erpc.sh')
+                #await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/deps/splinter.sh'))
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
 
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia/third_party && sudo rm -rf eRPC && ./setup.sh')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia/third_party && sudo rm -rf eRPC && ./setup.sh')
 
-                #await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && make clean && make -j')
+                #await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && make clean && make -j')
             elif args.step == 7:
                 base_dir = '/mnt/sda4'
 
@@ -286,12 +300,12 @@ if __name__ == '__main__':
             elif args.step == 8:
                 base_dir = '~'
                 await asyncssh.scp('format_disk.sh', (conn, f'{base_dir}/format_disk.sh'))
-                await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/replicated_kvstore/protocols/src/deps/splinter.sh'))
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
-                await run_command(f'cd {base_dir}/replicated_kvstore/protocols/src/ionia && make clean && mold -run make -j')
+                await asyncssh.scp('splinter.sh', (conn, f'{base_dir}/{args.repo_dir}/protocols/src/deps/splinter.sh'))
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/deps/ && sudo rm -rf splinterdb && ./splinter.sh')
+                await run_command(f'cd {base_dir}/{args.repo_dir}/protocols/src/ionia && make clean && mold -run make -j')
 
                 # await run_command(f'sudo apt install zstd pzstd -y')
-                # await run_command(f'cd {base_dir}/replicated_kvstore && git stash && git fetch && git checkout perf-test-execution-foreground-change')
+                # await run_command(f'cd {base_dir}/{args.repo_dir} && git stash && git fetch && git checkout perf-test-execution-foreground-change')
 
 
             return True
