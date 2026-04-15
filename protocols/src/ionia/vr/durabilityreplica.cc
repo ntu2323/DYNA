@@ -63,9 +63,7 @@ VRDurabilityReplica:: VRDurabilityReplica(Configuration clientConfig, int myIdx,
 
     app->RegisterDurabilityThread();
 
-    // we are a client to the consensus group
-    // so register like a client would do
-    internalTransport->Register(this, internalConfig, -2, -2);
+    internalTransport->Register(this, internalConfig, -1, -1);
 
     MakeDurabilityServerKnownMessage mdsm;
     mdsm.set_replicaidx(this->replicaIdx);

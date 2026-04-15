@@ -294,8 +294,8 @@ int main(int argc, char **argv)
     auto client_thread_func = [&](specpaxos::Configuration config, uint8_t numa_node, uint8_t thread_id, size_t total_threads)
     {
         // Some hardware has limit of x of queues for rpc (16 for xl170)
-        const size_t num_socket_cores = CpuCountOnNumaNode(numa_node);
-        auto ht_ct = std::min(num_socket_cores, static_cast<std::size_t>(numRequests));
+        const size_t num_socket_cores = std::max<std::size_t>(1, CpuCountOnNumaNode(numa_node));
+        auto ht_ct = std::max<std::size_t>(1, std::min(num_socket_cores, static_cast<std::size_t>(numRequests)));
 
         FastTransport transport(config, ht_ct, 1, physical_port, numa_node, thread_id);
 
@@ -396,6 +396,7 @@ int main(int argc, char **argv)
 
     // Just use the first config as reference for number of threads per server
     uint8_t coreBoundIdx = 0;
+    const auto total_cores = std::max(1u, std::thread::hardware_concurrency());
     for (auto i = 0; i < 1; i++) {
         auto replica_config = config.replica(0, i);
 
@@ -403,7 +404,7 @@ int main(int argc, char **argv)
             auto benchmark_client_thread = std::thread(client_thread_func, config, numa_node, j + 1, totalThreads);
             benchmark_client_threads.emplace_back(std::move(benchmark_client_thread)); 
             BindThreadToNumaCpu(benchmark_client_threads.back(), numa_node,
-                                coreBoundIdx);
+                                static_cast<uint8_t>(coreBoundIdx % total_cores));
             coreBoundIdx++;
         }
 

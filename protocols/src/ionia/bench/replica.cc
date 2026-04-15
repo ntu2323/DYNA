@@ -245,7 +245,7 @@ main(int argc, char **argv)
     // Some hardware has limit of x of queues for rpc (16 for xl170)
     //uint8_t numa_node = (i % 4 < 2)?0:1;
     uint8_t numa_node = 0;
-    const size_t num_socket_cores = CpuCountOnNumaNode(numa_node);        
+    const size_t num_socket_cores = std::max<std::size_t>(1, CpuCountOnNumaNode(numa_node));
     auto ht_ct = 0;
 
     //UDPTransport internalTransport(dropRate, reorderRate, dscp, nullptr);
@@ -288,7 +288,11 @@ main(int argc, char **argv)
 
     specpaxos::Configuration clientConfig(clientConfigStream);
 
-    assert(ht_ct < num_socket_cores);
+    if (static_cast<size_t>(ht_ct) >= num_socket_cores) {
+        Warning("Requested durability threads (%d) >= visible cores (%zu); "
+                "continuing in oversubscribed mode for container compatibility.",
+                ht_ct, num_socket_cores);
+    }
 
     auto& internal_transport = internalTransport;
     std::atomic<bool> internal_transport_thread_ready = false;
@@ -314,29 +318,26 @@ main(int argc, char **argv)
     // erpc::bind_to_core(internal_transport_thread, numa_node, 10);
     while (!internal_transport_thread_ready);
 
-    auto total_cores = std::thread::hardware_concurrency();
+    auto total_cores = std::max(1u, std::thread::hardware_concurrency());
 
     ht_ct = totalThreads;
     nullApp->SetNumDurabilityReplicas(ht_ct);
 
     auto server_thread_func = [&](specpaxos::Configuration config, uint8_t numa_node, uint8_t thread_id)
     {
-        FastTransport client_transport(config, ht_ct, 1, physical_port, numa_node, thread_id);
+        const uint8_t transport_id = config.n > 0 ? static_cast<uint8_t>(thread_id % config.n) : 0;
+        FastTransport client_transport(config, ht_ct, 1, physical_port, numa_node, transport_id);
 
-        auto durability_replica = specpaxos::vr::VRDurabilityReplica(config, index, !recover, &client_transport, batchSize, nullApp, internalConfig, &internal_transport, thread_id - 1);
+        auto durability_replica = specpaxos::vr::VRDurabilityReplica(config, index, !recover, &client_transport, batchSize, nullApp, internalConfig, &internal_transport, thread_id);
 
         client_transport.Run();
     };
     std::vector<std::thread> durability_threads(ht_ct);
     uint8_t idx = 1;//i/4 + (i % 2) * 20;
     for (uint8_t i = 0; i < ht_ct; i++) {
-        durability_threads[i] = std::thread(server_thread_func, clientConfig, numa_node, i + 1);
-        if (idx % (total_cores / 2) == 0)
-        {
-            // Skip this core because of HT... background thread should occupy the whole physical core
-            idx++;
-        }
-        BindThreadToNumaCpu(durability_threads[i], numa_node, idx);
+        durability_threads[i] = std::thread(server_thread_func, clientConfig, numa_node, i);
+        uint8_t bind_idx = static_cast<uint8_t>(idx % total_cores);
+        BindThreadToNumaCpu(durability_threads[i], numa_node, bind_idx);
         idx++;
     }
 

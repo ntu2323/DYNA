@@ -1,0 +1,10 @@
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+**/.mypy_cache/
+**/.DS_Store
+
+protocols/experiments/results_repro/
+protocols/src/ionia/.obj/
+docker/smoke-output/

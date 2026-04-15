@@ -198,27 +198,31 @@ public:
 			props.SetProperty(k, v);
 		}
 
+		if (const char *db_mode = std::getenv("IONIA_DB_MODE"); db_mode && *db_mode)
+		{
+			props.SetProperty("db", db_mode);
+		}
+		if (const char *cache_mb = std::getenv("IONIA_SPLINTER_CACHE_MB"); cache_mb && *cache_mb)
+		{
+			props.SetProperty("splinterdb.cache_size_mb", cache_mb);
+		}
+		if (const char *disk_gb = std::getenv("IONIA_SPLINTER_DISK_GB"); disk_gb && *disk_gb)
+		{
+			props.SetProperty("splinterdb.disk_size_gb", disk_gb);
+		}
+
 		namespace fs = std::filesystem;
 		auto splinterdb_exists = fs::exists(props.GetProperty("splinterdb.filename"));
 		Warning("Splinterdb exists: %d", splinterdb_exists);
 
-		for (const auto& [k, v] : DB_PROPS)
+		const std::string db_kind = props.GetProperty("db");
+		if (db_kind == "memory")
 		{
-			if (k == "db")
-			{
-				if (v == "memory")
-				{
-					db = std::make_unique<InMemoryDB>(props, splinterdb_exists);
-				}
-				else if (v == "splinter")
-				{
-					db = std::make_unique<SplinterDB>(props, splinterdb_exists);
-					// if (splinterdb_exists)
-					// {
-					// 	Warning("SplinterDB preloaded size: %d", db->Size());
-					// }
-				}
-			}
+			db = std::make_unique<InMemoryDB>(props, splinterdb_exists);
+		}
+		else if (db_kind == "splinter")
+		{
+			db = std::make_unique<SplinterDB>(props, splinterdb_exists);
 		}
 
 		if (db == nullptr)

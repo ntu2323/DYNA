@@ -44,8 +44,6 @@
 #include "folly/AtomicHashMap.h"
 #include "folly/FBVector.h"
 
-#include "third_party/eRPC/src/util/mempool.h"
-
 namespace specpaxos {
 namespace vr {
 

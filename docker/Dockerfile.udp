@@ -1,0 +1,62 @@
+FROM ubuntu:20.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    ca-certificates \
+    git \
+    build-essential \
+    cmake \
+    ninja-build \
+    pkg-config \
+    ccache \
+    autoconf \
+    automake \
+    libtool \
+    binutils-dev \
+    libiberty-dev \
+    libelf-dev \
+    wget \
+    protobuf-compiler \
+    libprotobuf-dev \
+    libevent-dev \
+    libssl-dev \
+    libunwind-dev \
+    libboost-all-dev \
+    libdouble-conversion-dev \
+    libgoogle-glog-dev \
+    libgflags-dev \
+    libfmt-dev \
+    liblz4-dev \
+    liblzma-dev \
+    libsnappy-dev \
+    libsodium-dev \
+    libzstd-dev \
+    zlib1g-dev \
+    libjemalloc-dev \
+    libaio-dev \
+    libxxhash-dev \
+    libtbb-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN git clone https://github.com/facebook/folly.git /tmp/folly && \
+    cd /tmp/folly && \
+    git checkout 49926b98f5afb5667d0c06807da79d606a6d43c3 && \
+    cmake -S . -B _build \
+      -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DBUILD_TESTS=OFF \
+      -DFOLLY_USE_SYMBOLIZER=OFF && \
+    cmake --build _build -j"$(nproc)" && \
+    cmake --install _build && \
+    rm -rf /tmp/folly
+
+WORKDIR /work/ionia
+COPY . .
+
+RUN chmod +x docker/bootstrap_deps.sh docker/run_udp_smoke.sh docker/docker-smoke.sh && \
+    ./docker/bootstrap_deps.sh && \
+    make -C protocols/src/ionia
+
+CMD ["/bin/bash"]
