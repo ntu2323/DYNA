@@ -26,7 +26,7 @@ chmod +x docker/docker-smoke.sh   # once
 docker run --rm -it --platform linux/amd64 ionia-udp ./docker/run_udp_smoke.sh
 ```
 
-### 3) Interactive shell (optional)
+### 3) Interactive shell
 
 ```bash
 docker run --rm -it --platform linux/amd64 ionia-udp
@@ -38,7 +38,9 @@ Then inside container:
 cd /work/ionia/protocols/src/ionia
 ./bench/replica -i 0 -j 1 -b 1 -c sample/config -m vr
 
+```
 
+Below is README content from original repo. 
 
 # Ionia
 
