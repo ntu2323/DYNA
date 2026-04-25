@@ -89,6 +89,9 @@ void FastTransport::Run()
 
 void FastTransport::RunOnce()
 {
+    // Match deprecated FastTransport: pump the I/O loop once, then run the
+    // optional app hook (e.g. durability execution). UDP replaces eRPC here.
+    udp_transport->RunOnce();
     if (on_event_loop_function) {
         on_event_loop_function();
     }

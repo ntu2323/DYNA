@@ -586,6 +586,12 @@ UDPTransport::Run()
 }
 
 void
+UDPTransport::RunOnce()
+{
+    event_base_loop(libeventBase, EVLOOP_ONCE | EVLOOP_NONBLOCK);
+}
+
+void
 UDPTransport::Stop()
 {
     event_base_loopbreak(libeventBase);

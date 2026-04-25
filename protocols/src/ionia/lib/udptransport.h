@@ -152,6 +152,7 @@ public:
                                   const std::vector<int> &groups,
                                   const Message &m) override;
     void Run() override;
+    void RunOnce() override;
     void Stop() override;
     int Timer(uint64_t ms, timer_callback_t cb) override;
     int TimerUS(uint64_t us, timer_callback_t cb) override;
