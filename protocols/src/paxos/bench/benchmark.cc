@@ -156,6 +156,8 @@ BenchmarkClient::WarmupDone()
            warmupSec, n);
     gettimeofday(&startTime, NULL);
     n = 0;
+    expStartTime = std::chrono::high_resolution_clock::now();
+    SendNext();
 }
 
 void
@@ -196,7 +198,11 @@ BenchmarkClient::CooldownDone()
 void
 BenchmarkClient::SendNext()
 {
-    if (n >= numRequests || operations.empty()) {
+    if (operations.empty()) {
+        return;
+    }
+    // During warmup, keep sending even after n reaches numRequests (time-based warmup).
+    if (started && n >= numRequests) {
         return;
     }
 
