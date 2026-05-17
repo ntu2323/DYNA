@@ -196,11 +196,10 @@ BenchmarkClient::CooldownDone()
 void
 BenchmarkClient::SendNext()
 {
-    if(n >= numRequests){
+    if (n >= numRequests || operations.empty()) {
         return;
     }
 
-    ASSERT(!operations.empty());
     const size_t opIdx = n % operations.size();
     const auto &opPair = operations[opIdx];
 
