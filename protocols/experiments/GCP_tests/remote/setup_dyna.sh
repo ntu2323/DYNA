@@ -22,8 +22,13 @@ exec >>"${LOGFILE}" 2>&1
 echo "=== DYNA remote setup started at $(date -Iseconds) pid=$$ ==="
 echo "=== bundle: ${SETUP_BUNDLE} log: ${LOGFILE} ==="
 
-# shellcheck source=/dev/null
-source "${SETUP_BUNDLE}/ionia_repo.sh"
+if [[ -f "${SETUP_BUNDLE}/ionia_repo.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "${SETUP_BUNDLE}/ionia_repo.sh"
+elif ! declare -f install_ssh_from_bundle >/dev/null 2>&1; then
+  echo "Missing git/SSH helpers (ionia_repo.sh or inlined run.sh). Re-run setup_dyna_cluster.py" >&2
+  exit 1
+fi
 
 ROLE="$(cat "${SETUP_BUNDLE}/role.txt")"
 REPLICA_INDEX="$(cat "${SETUP_BUNDLE}/replica_index.txt" 2>/dev/null || true)"
@@ -92,11 +97,12 @@ install_folly_if_needed() {
   if pkg-config --exists folly 2>/dev/null; then
     return 0
   fi
-  echo "Building Folly..."
+  FOLLY_COMMIT="${FOLLY_COMMIT:-49926b98f5afb5667d0c06807da79d606a6d43c3}"
+  echo "Building Folly at ${FOLLY_COMMIT}..."
   rm -rf /tmp/folly
-  git clone --depth 1 https://github.com/facebook/folly.git /tmp/folly
+  git clone https://github.com/facebook/folly.git /tmp/folly
   cd /tmp/folly
-  git checkout 49926b98f5afb5667d0c06807da79d606a6d43c3
+  git checkout "${FOLLY_COMMIT}"
   cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DFOLLY_USE_SYMBOLIZER=OFF
   cmake --build _build -j"$(nproc)"
   sudo cmake --install _build

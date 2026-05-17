@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -67,6 +68,33 @@ def scp_to(host: str, ssh_user: str, ssh_key: Optional[str], local_path: str, re
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def rsync_dir_to_remote(
+    local_dir: str,
+    host: str,
+    ssh_user: str,
+    ssh_key: Optional[str],
+    remote_dir: str,
+) -> None:
+    """Rsync local_dir/* into remote_dir/ (avoids scp nesting e.g. setup_bundle/bundle/)."""
+    ssh_part = " ".join(ssh_common_opts())
+    if ssh_key:
+        ssh_part = f"-i {ssh_key} " + ssh_part
+    src = os.path.join(os.path.abspath(local_dir), "")
+    subprocess.run(
+        [
+            "rsync",
+            "-az",
+            "-e",
+            f"ssh {ssh_part}",
+            src,
+            f"{ssh_user}@{host}:{remote_dir.rstrip('/')}/",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 def rsync_ionia(local_root: str, host: str, ssh_user: str, ssh_key: Optional[str]) -> None:
     ssh_part = " ".join(ssh_common_opts())
     if ssh_key:
@@ -121,12 +149,40 @@ def write_bundle(
             f.write(content)
 
 
-def attach_ionia_repo_helper(bundle_dir: str, remote_script_path: str) -> None:
-    """Copy ionia_repo.sh next to run.sh in the setup bundle."""
+def ionia_repo_helper_path(remote_script_path: str) -> str:
     helper = os.path.join(os.path.dirname(remote_script_path), "ionia_repo.sh")
     if not os.path.isfile(helper):
         raise FileNotFoundError(f"Missing {helper}")
-    shutil.copy2(helper, os.path.join(bundle_dir, "ionia_repo.sh"))
+    return helper
+
+
+def build_combined_run_sh(bundle_dir: str, remote_script_path: str) -> str:
+    """Merge ionia_repo.sh + setup script into bundle/run.sh (single file to upload)."""
+    helper_path = ionia_repo_helper_path(remote_script_path)
+    run_path = os.path.join(bundle_dir, "run.sh")
+    with open(helper_path, encoding="utf-8") as hf:
+        helper = hf.read()
+    with open(remote_script_path, encoding="utf-8") as rf:
+        main = rf.read()
+    main = re.sub(
+        r"if \[\[ -f \"\$\{SETUP_BUNDLE\}/ionia_repo\.sh\" \]\]; then\n"
+        r"(?:.*\n)*?"
+        r"^fi\n",
+        "",
+        main,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    with open(run_path, "w", encoding="utf-8") as out:
+        out.write("# Combined by gcp_remote_setup.py: ionia_repo.sh + setup script\n")
+        out.write(helper)
+        if not helper.endswith("\n"):
+            out.write("\n")
+        out.write(main)
+    os.chmod(run_path, 0o755)
+    # Standalone copy for debugging on the VM.
+    shutil.copy2(helper_path, os.path.join(bundle_dir, "ionia_repo.sh"))
+    return run_path
 
 
 def upload_and_launch(
@@ -134,7 +190,6 @@ def upload_and_launch(
     ssh_user: str,
     ssh_key: Optional[str],
     bundle_dir: str,
-    remote_script: str,
     *,
     remote_log: str,
     skip_build: bool,
@@ -143,8 +198,17 @@ def upload_and_launch(
 ) -> str:
     remote_bundle = "~/bench/setup_bundle"
     ssh_run(host, ssh_user, ssh_key, f"rm -rf {remote_bundle} && mkdir -p {remote_bundle}")
-    scp_to(host, ssh_user, ssh_key, bundle_dir + "/", remote_bundle + "/")
-    scp_to(host, ssh_user, ssh_key, remote_script, remote_bundle + "/run.sh")
+    rsync_dir_to_remote(bundle_dir, host, ssh_user, ssh_key, remote_bundle)
+    verify = (
+        f"test -f {remote_bundle}/run.sh && test -f {remote_bundle}/role.txt "
+        f"&& test -f {remote_bundle}/ionia_repo.sh"
+    )
+    r = ssh_run(host, ssh_user, ssh_key, verify)
+    if r.returncode != 0:
+        listing = ssh_run(host, ssh_user, ssh_key, f"ls -la {remote_bundle} 2>&1 || true")
+        raise RuntimeError(
+            f"Setup bundle incomplete on {host} (missing run.sh or config files):\n{listing.stdout}"
+        )
     skip = "1" if skip_build else "0"
     git_flag = "1" if use_git else "0"
     env = (
@@ -264,13 +328,12 @@ def deploy_role(
             ssh_public=ssh_public,
             extra_files=bundle_files,
         )
-        attach_ionia_repo_helper(bundle_dir, remote_script_path)
+        build_combined_run_sh(bundle_dir, remote_script_path)
         pid = upload_and_launch(
             host,
             ssh_user,
             ssh_key,
             bundle_dir,
-            remote_script_path,
             remote_log=remote_log,
             skip_build=skip_build,
             use_git=use_git,

@@ -28,7 +28,7 @@ sudo apt-get install -y -qq \
 if ! pkg-config --exists folly 2>/dev/null; then
   echo "Building Folly..."
   rm -rf /tmp/folly
-  git clone --depth 1 https://github.com/facebook/folly.git /tmp/folly
+  git clone https://github.com/facebook/folly.git /tmp/folly
   cd /tmp/folly
   git checkout 49926b98f5afb5667d0c06807da79d606a6d43c3
   cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DFOLLY_USE_SYMBOLIZER=OFF
