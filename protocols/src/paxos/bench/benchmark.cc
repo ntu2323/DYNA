@@ -200,26 +200,35 @@ BenchmarkClient::SendNext()
         return;
     }
 
+    ASSERT(!operations.empty());
+    const size_t opIdx = n % operations.size();
+    const auto &opPair = operations[opIdx];
+
     std::ostringstream msg;
 
-    msg << operations[n].first << operations[n].second;
-    bool isRead = msg.str().c_str()[0] == 'r' || msg.str().c_str()[0] == 'R';
-    bool isUpdate = msg.str().c_str()[0] == 'u' || msg.str().c_str()[0] == 'U';
-    bool nonNilext = msg.str().c_str()[0] == 'e' || msg.str().c_str()[0] == 'E';
+    msg << opPair.first << opPair.second;
+    const string req = msg.str();
+    const char op = req[0];
+    bool isRead = op == 'r' || op == 'R';
+    bool isUpdate = op == 'u' || op == 'U';
+    bool nonNilext = op == 'e' || op == 'E';
 
-    if(!isRead) {
-    	if (isUpdate || nonNilext)
-    		msg << string(VAL_SIZE, 'x');
-    	else
-    		msg << string(VAL_SIZE, 'v');
+    std::ostringstream full;
+    full << opPair.first << opPair.second;
+    if (!isRead) {
+        if (isUpdate || nonNilext)
+            full << string(VAL_SIZE, 'x');
+        else
+            full << string(VAL_SIZE, 'v');
     }
+    const string request = full.str();
 
     Latency_Start(&latency);
-    opcodes.push_back(msg.str().c_str()[0]);
-    client.Invoke(msg.str(), std::bind(&BenchmarkClient::OnReply,
-                                       this,
-                                       std::placeholders::_1,
-                                       std::placeholders::_2));
+    opcodes.push_back(op);
+    client.Invoke(request, std::bind(&BenchmarkClient::OnReply,
+                                    this,
+                                    std::placeholders::_1,
+                                    std::placeholders::_2));
 }
 
 void
