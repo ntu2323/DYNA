@@ -1,0 +1,15 @@
+{
+  "hosts": {
+    "receiver1": "34.48.149.136",
+    "receiver2": "136.107.64.157",
+    "receiver3": "35.245.91.68",
+    "sender1": "34.150.128.65"
+  },
+  "machine_count": 4,
+  "name_prefix": "ionia",
+  "receiver_internal": {
+    "receiver1": "10.150.0.19",
+    "receiver2": "10.150.0.18",
+    "receiver3": "10.150.0.20"
+  }
+}

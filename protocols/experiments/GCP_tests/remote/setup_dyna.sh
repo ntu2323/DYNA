@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Full DYNA (ionia -m dyna) setup on one VM: deps, build, SSH keys, config, helpers.
+# Launched via nohup from setup_dyna_cluster.py.
+#
+# Bundle files: role.txt, replica_index.txt, dynaconfig, trace/run1,
+#   id_ed25519, ssh_public_line
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  exec /usr/bin/env bash "$0" "$@"
+fi
+
+set -euo pipefail
+
+SETUP_BUNDLE="${SETUP_BUNDLE:-${HOME}/bench/setup_bundle}"
+LOGFILE="${HOME}/dyna_setup.log"
+DONE_MARKER="${HOME}/bench/.setup_dyna_done"
+FAIL_MARKER="${HOME}/bench/.setup_dyna_failed"
+IONIA_DIR="${HOME}/Ionia/protocols/src/ionia"
+REPLICA_PORT="${REPLICA_PORT:-31880}"
+
+rm -f "${DONE_MARKER}" "${FAIL_MARKER}"
+trap 'echo "=== setup failed at $(date -Iseconds) ===" >> "${LOGFILE}"; touch "${FAIL_MARKER}"' ERR
+
+exec >>"${LOGFILE}" 2>&1
+echo "=== DYNA remote setup started at $(date -Iseconds) pid=$$ ==="
+echo "=== bundle: ${SETUP_BUNDLE} log: ${LOGFILE} ==="
+
+ROLE="$(cat "${SETUP_BUNDLE}/role.txt")"
+REPLICA_INDEX="$(cat "${SETUP_BUNDLE}/replica_index.txt" 2>/dev/null || true)"
+SKIP_BUILD="${SKIP_BUILD:-0}"
+USE_GIT="${USE_GIT:-0}"
+
+install_ssh() {
+  mkdir -p ~/.ssh ~/bench/trace
+  chmod 700 ~/.ssh
+  cp "${SETUP_BUNDLE}/id_ed25519" ~/.ssh/id_ed25519
+  chmod 600 ~/.ssh/id_ed25519
+  touch ~/.ssh/authorized_keys
+  chmod 600 ~/.ssh/authorized_keys
+  pub="$(tr -d '\r\n' < "${SETUP_BUNDLE}/ssh_public_line")"
+  grep -qxF "${pub}" ~/.ssh/authorized_keys || echo "${pub}" >> ~/.ssh/authorized_keys
+}
+
+install_config() {
+  cp "${SETUP_BUNDLE}/dynaconfig" ~/bench/dynaconfig
+  cp "${SETUP_BUNDLE}/trace/run1" ~/bench/trace/run1
+}
+
+install_helpers() {
+  cat > ~/bench/start_dyna_replica.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+IDX="${1:?replica index 0|1|2}"
+export IONIA_DB_MODE=memory
+export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
+export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
+export DYNA_WAL_DIR="${DYNA_WAL_DIR:-$HOME/bench/wal}"
+mkdir -p "$DYNA_WAL_DIR"
+cd "${HOME}/Ionia/protocols/src/ionia"
+pkill -f 'bench/replica' 2>/dev/null || true
+sleep 1
+nohup ./bench/replica -i "${IDX}" -j 1 -b 1 -c ~/bench/dynaconfig -m dyna \
+  > ~/bench/replica-"${IDX}".log 2>&1 &
+echo "Started DYNA replica index=${IDX} pid=$!"
+EOF
+  chmod +x ~/bench/start_dyna_replica.sh
+
+  cat > ~/bench/run_dyna_client.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: ./run_dyna_client.sh <client_id> [threads] [num_ops] [experiment_secs] [warmup_secs]
+CLIENT_ID="${1:-1}"
+THREADS="${2:-1}"
+NUM_OPS="${3:-100000}"
+EXPERIMENT_SECS="${4:-60}"
+WARMUP_SECS="${5:-5}"
+cd "${HOME}/Ionia/protocols/src/ionia"
+mkdir -p ~/bench
+pkill -f 'bench/client' 2>/dev/null || true
+sleep 1
+TRACE_PREFIX=~/bench/trace/run
+if [[ ! -f "${TRACE_PREFIX}1" ]]; then
+  echo "Missing ${TRACE_PREFIX}1" >&2
+  exit 1
+fi
+nohup ./bench/client \
+  -s ~/bench/dynaconfig \
+  -c ~/bench/dynaconfig \
+  -m dyna \
+  -k "${TRACE_PREFIX}" \
+  -n "${NUM_OPS}" \
+  -e "${EXPERIMENT_SECS}" \
+  -w "${WARMUP_SECS}" \
+  -t "${THREADS}" \
+  -j "${CLIENT_ID}" \
+  -l ~/bench/latencies \
+  > ~/bench/client-"${CLIENT_ID}".log 2>&1 &
+echo "Started DYNA client client_id=${CLIENT_ID} threads=${THREADS} pid=$!"
+EOF
+  chmod +x ~/bench/run_dyna_client.sh
+}
+
+install_folly_if_needed() {
+  if pkg-config --exists folly 2>/dev/null; then
+    return 0
+  fi
+  echo "Building Folly..."
+  rm -rf /tmp/folly
+  git clone --depth 1 https://github.com/facebook/folly.git /tmp/folly
+  cd /tmp/folly
+  git checkout 49926b98f5afb5667d0c06807da79d606a6d43c3
+  cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DFOLLY_USE_SYMBOLIZER=OFF
+  cmake --build _build -j"$(nproc)"
+  sudo cmake --install _build
+  cd "${HOME}"
+}
+
+install_apt_deps() {
+  export DEBIAN_FRONTEND=noninteractive
+  sudo cloud-init status --wait || true
+  sudo apt-get update -qq
+  sudo apt-get install -y -qq \
+    git build-essential cmake ninja-build pkg-config \
+    protobuf-compiler libprotobuf-dev libevent-dev libssl-dev \
+    libunwind-dev libboost-all-dev libdouble-conversion-dev \
+    libgoogle-glog-dev libgflags-dev libfmt-dev liblz4-dev liblzma-dev \
+    libsnappy-dev zlib1g-dev binutils-dev libjemalloc-dev libaio-dev \
+    libxxhash-dev libtbb-dev libnuma-dev numactl g++ gcc make
+}
+
+ensure_ionia_repo() {
+  if [[ -d "${HOME}/Ionia/protocols/src/ionia" ]]; then
+    return 0
+  fi
+  if [[ "${USE_GIT}" != "1" ]]; then
+    echo "Missing ${HOME}/Ionia — rsync source first or set USE_GIT=1" >&2
+    exit 1
+  fi
+  ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
+  git clone git@github.com:ntu2323/IONIA.git "${HOME}/Ionia"
+  cd "${HOME}/Ionia"
+  git submodule update --init --recursive || true
+  cd "${HOME}"
+}
+
+build_dyna() {
+  cd "${HOME}/Ionia"
+  chmod +x docker/bootstrap_deps.sh
+  ./docker/bootstrap_deps.sh
+  make -C protocols/src/ionia bench/replica bench/client -j"$(nproc)"
+  test -x "${IONIA_DIR}/bench/replica"
+  test -x "${IONIA_DIR}/bench/client"
+}
+
+install_ssh
+install_config
+install_helpers
+echo "Config and helpers installed for role=${ROLE}"
+
+if [[ "${SKIP_BUILD}" == "1" ]]; then
+  echo "SKIP_BUILD=1 — skipping compile"
+else
+  install_apt_deps
+  install_folly_if_needed
+  ensure_ionia_repo
+  build_dyna
+fi
+
+if [[ "${ROLE}" == receiver* ]] && [[ -n "${REPLICA_INDEX}" ]]; then
+  echo "Receiver ${ROLE} default replica index: ${REPLICA_INDEX}"
+  echo "Start with: ~/bench/start_dyna_replica.sh ${REPLICA_INDEX}"
+elif [[ "${ROLE}" == sender* ]]; then
+  echo "Sender ${ROLE}: ~/bench/run_dyna_client.sh <client_id> ..."
+fi
+
+touch "${DONE_MARKER}"
+echo "=== DYNA remote setup finished at $(date -Iseconds) ==="
+echo "Done marker: ${DONE_MARKER}"
+echo "UDP port ${REPLICA_PORT} — open firewall between cluster VMs."

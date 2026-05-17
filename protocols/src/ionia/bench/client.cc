@@ -37,6 +37,7 @@
 #include "common/client.h"
 #include "lib/configuration.h"
 #include "lib/cpu_affinity.h"
+#include "dyna/client.h"
 #include "vr/client.h"
 
 #include <unistd.h>
@@ -46,7 +47,7 @@
 static void
 Usage(const char *progName)
 {
-        fprintf(stderr, "usage: %s [-n requests] [-t threads] [-w warmup-secs] [-l latency-file] [-q dscp] [-d delay-ms] -c conf-file -m vr\n",
+        fprintf(stderr, "usage: %s [-n requests] [-t threads] [-w warmup-secs] [-l latency-file] [-q dscp] [-d delay-ms] -c conf-file -m {vr|dyna}\n",
                 progName);
         exit(1);
 }
@@ -75,7 +76,8 @@ int main(int argc, char **argv)
     enum
     {
         PROTO_UNKNOWN,
-        PROTO_VR
+        PROTO_VR,
+        PROTO_DYNA
     } proto = PROTO_UNKNOWN;
 
     string latencyFile;
@@ -145,6 +147,8 @@ int main(int argc, char **argv)
         case 'm':
             if (strcasecmp(optarg, "vr") == 0) {
                 proto = PROTO_VR;
+            } else if (strcasecmp(optarg, "dyna") == 0) {
+                proto = PROTO_DYNA;
             } else {
                 fprintf(stderr, "unknown mode '%s'\n", optarg);
                 Usage(argv[0]);
@@ -317,6 +321,9 @@ int main(int argc, char **argv)
             case PROTO_VR:
                 client = new specpaxos::vr::VRClient(config, &transport, client_id);
                 break;
+            case PROTO_DYNA:
+                client = new specpaxos::dyna::DynaClient(config, &transport, client_id);
+                break;
 
             default:
                 NOT_REACHABLE();
@@ -411,7 +418,7 @@ int main(int argc, char **argv)
         while (threads_finished_setup != totalThreads) {
             continue;
         }
-        Notice("%d != %d", benchClients.size(), totalThreads);
+        Notice("Bench setup: %zu bench client(s), %d thread(s)", benchClients.size(), totalThreads);
         for (auto i = 0; i < benchClients.size(); i++) {
             auto* bench = benchClients[i];
             auto* transport = transports[i];
