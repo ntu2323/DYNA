@@ -39,7 +39,7 @@ fi
 
 cd "${HOME}/Ionia"
 echo "Building RocksDB..."
-make -C protocols/src/deps/rocksdb-6.12.7 -j"$(nproc)" static_lib
+make -C protocols/src/deps/rocksdb-6.12.7 -j"$(nproc)" static_lib DISABLE_WARNING_AS_ERROR=1
 echo "Building paxos bench/replica bench/client..."
 make -C protocols/src/paxos bench/replica bench/client -j"$(nproc)"
 echo "=== NOPaxos VR rsync build finished at $(date -Iseconds) ==="

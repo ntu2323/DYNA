@@ -30,6 +30,14 @@ elif ! declare -f install_ssh_from_bundle >/dev/null 2>&1; then
   exit 1
 fi
 
+if [[ -f "${SETUP_BUNDLE}/folly_build.sh" ]]; then
+  # shellcheck source=/dev/null
+  source "${SETUP_BUNDLE}/folly_build.sh"
+elif ! declare -f install_folly_if_needed >/dev/null 2>&1; then
+  echo "Missing folly_build.sh. Re-run setup_dyna_cluster.py" >&2
+  exit 1
+fi
+
 ROLE="$(cat "${SETUP_BUNDLE}/role.txt")"
 REPLICA_INDEX="$(cat "${SETUP_BUNDLE}/replica_index.txt" 2>/dev/null || true)"
 SKIP_BUILD="${SKIP_BUILD:-0}"
@@ -93,28 +101,12 @@ EOF
   chmod +x ~/bench/run_dyna_client.sh
 }
 
-install_folly_if_needed() {
-  if pkg-config --exists folly 2>/dev/null; then
-    return 0
-  fi
-  FOLLY_COMMIT="${FOLLY_COMMIT:-49926b98f5afb5667d0c06807da79d606a6d43c3}"
-  echo "Building Folly at ${FOLLY_COMMIT}..."
-  rm -rf /tmp/folly
-  git clone https://github.com/facebook/folly.git /tmp/folly
-  cd /tmp/folly
-  git checkout "${FOLLY_COMMIT}"
-  cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DFOLLY_USE_SYMBOLIZER=OFF
-  cmake --build _build -j"$(nproc)"
-  sudo cmake --install _build
-  cd "${HOME}"
-}
-
 install_apt_deps() {
   export DEBIAN_FRONTEND=noninteractive
   sudo cloud-init status --wait || true
   sudo apt-get update -qq
   sudo apt-get install -y -qq \
-    git openssh-client build-essential cmake ninja-build pkg-config \
+    git python3 openssh-client build-essential cmake ninja-build pkg-config \
     protobuf-compiler libprotobuf-dev libevent-dev libssl-dev \
     libunwind-dev libboost-all-dev libdouble-conversion-dev \
     libgoogle-glog-dev libgflags-dev libfmt-dev liblz4-dev liblzma-dev \

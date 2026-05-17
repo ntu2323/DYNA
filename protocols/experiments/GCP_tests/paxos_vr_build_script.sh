@@ -53,7 +53,7 @@ cd "${IONIA_DIR}"
 git submodule update --init --recursive || true
 
 echo "Building RocksDB (static lib)..."
-make -C protocols/src/deps/rocksdb-6.12.7 -j"$(nproc)" static_lib
+make -C protocols/src/deps/rocksdb-6.12.7 -j"$(nproc)" static_lib DISABLE_WARNING_AS_ERROR=1
 
 echo "Building paxos bench/replica and bench/client..."
 make -C protocols/src/paxos bench/replica bench/client -j"$(nproc)"

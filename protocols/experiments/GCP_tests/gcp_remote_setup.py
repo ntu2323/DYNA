@@ -149,19 +149,28 @@ def write_bundle(
             f.write(content)
 
 
-def ionia_repo_helper_path(remote_script_path: str) -> str:
-    helper = os.path.join(os.path.dirname(remote_script_path), "ionia_repo.sh")
-    if not os.path.isfile(helper):
-        raise FileNotFoundError(f"Missing {helper}")
-    return helper
+_BUNDLE_HELPERS = ("ionia_repo.sh", "folly_build.sh")
+
+
+def _remote_helper_path(remote_script_path: str, name: str) -> str:
+    path = os.path.join(os.path.dirname(remote_script_path), name)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(f"Missing {path}")
+    return path
+
+
+def attach_bundle_helpers(bundle_dir: str, remote_script_path: str) -> None:
+    for name in _BUNDLE_HELPERS:
+        shutil.copy2(_remote_helper_path(remote_script_path, name), os.path.join(bundle_dir, name))
 
 
 def build_combined_run_sh(bundle_dir: str, remote_script_path: str) -> str:
-    """Merge ionia_repo.sh + setup script into bundle/run.sh (single file to upload)."""
-    helper_path = ionia_repo_helper_path(remote_script_path)
+    """Merge helper scripts + setup script into bundle/run.sh (single file to upload)."""
     run_path = os.path.join(bundle_dir, "run.sh")
-    with open(helper_path, encoding="utf-8") as hf:
-        helper = hf.read()
+    helper_parts: List[str] = []
+    for name in _BUNDLE_HELPERS:
+        with open(_remote_helper_path(remote_script_path, name), encoding="utf-8") as hf:
+            helper_parts.append(hf.read())
     with open(remote_script_path, encoding="utf-8") as rf:
         main = rf.read()
     main = re.sub(
@@ -173,15 +182,24 @@ def build_combined_run_sh(bundle_dir: str, remote_script_path: str) -> str:
         count=1,
         flags=re.MULTILINE,
     )
+    main = re.sub(
+        r"if \[\[ -f \"\$\{SETUP_BUNDLE\}/folly_build\.sh\" \]\]; then\n"
+        r"(?:.*\n)*?"
+        r"^fi\n",
+        "",
+        main,
+        count=1,
+        flags=re.MULTILINE,
+    )
     with open(run_path, "w", encoding="utf-8") as out:
-        out.write("# Combined by gcp_remote_setup.py: ionia_repo.sh + setup script\n")
-        out.write(helper)
-        if not helper.endswith("\n"):
-            out.write("\n")
+        out.write("# Combined by gcp_remote_setup.py: ionia_repo + folly_build + setup\n")
+        for part in helper_parts:
+            out.write(part)
+            if not part.endswith("\n"):
+                out.write("\n")
         out.write(main)
     os.chmod(run_path, 0o755)
-    # Standalone copy for debugging on the VM.
-    shutil.copy2(helper_path, os.path.join(bundle_dir, "ionia_repo.sh"))
+    attach_bundle_helpers(bundle_dir, remote_script_path)
     return run_path
 
 
