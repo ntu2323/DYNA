@@ -21,7 +21,8 @@ sudo apt-get install -y -qq \
   protobuf-compiler libprotobuf-dev libevent-dev libssl-dev \
   libunwind-dev libboost-all-dev libdouble-conversion-dev \
   libgoogle-glog-dev libgflags-dev libfmt-dev liblz4-dev liblzma-dev \
-  libsnappy-dev zlib1g-dev binutils-dev libjemalloc-dev libaio-dev \
+  libsnappy-dev zlib1g-dev binutils-dev libiberty-dev libelf-dev \
+  libjemalloc-dev libaio-dev \
   libxxhash-dev libtbb-dev libnuma-dev numactl g++ gcc make
 
 if ! pkg-config --exists folly 2>/dev/null; then
