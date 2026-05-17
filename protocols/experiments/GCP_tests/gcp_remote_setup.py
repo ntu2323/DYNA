@@ -8,7 +8,11 @@ import tempfile
 import time
 from typing import Dict, List, Optional
 
+import shutil
+
 import gcp_setup_log
+
+IONIA_GIT_URL = "git@github.com:ntu2323/IONIA.git"
 
 
 def wait_for_ssh(
@@ -117,6 +121,14 @@ def write_bundle(
             f.write(content)
 
 
+def attach_ionia_repo_helper(bundle_dir: str, remote_script_path: str) -> None:
+    """Copy ionia_repo.sh next to run.sh in the setup bundle."""
+    helper = os.path.join(os.path.dirname(remote_script_path), "ionia_repo.sh")
+    if not os.path.isfile(helper):
+        raise FileNotFoundError(f"Missing {helper}")
+    shutil.copy2(helper, os.path.join(bundle_dir, "ionia_repo.sh"))
+
+
 def upload_and_launch(
     host: str,
     ssh_user: str,
@@ -127,6 +139,7 @@ def upload_and_launch(
     remote_log: str,
     skip_build: bool,
     use_git: bool,
+    git_ref: str = "",
 ) -> str:
     remote_bundle = "~/bench/setup_bundle"
     ssh_run(host, ssh_user, ssh_key, f"rm -rf {remote_bundle} && mkdir -p {remote_bundle}")
@@ -134,10 +147,15 @@ def upload_and_launch(
     scp_to(host, ssh_user, ssh_key, remote_script, remote_bundle + "/run.sh")
     skip = "1" if skip_build else "0"
     git_flag = "1" if use_git else "0"
+    env = (
+        f"SETUP_BUNDLE={remote_bundle} SKIP_BUILD={skip} USE_GIT={git_flag} "
+        f"IONIA_GIT_URL={IONIA_GIT_URL}"
+    )
+    if git_ref:
+        env += f" IONIA_GIT_REF={git_ref}"
     launch = (
         f"cd {remote_bundle} && "
-        f"nohup env SETUP_BUNDLE={remote_bundle} SKIP_BUILD={skip} USE_GIT={git_flag} "
-        f"bash run.sh >> {remote_log} 2>&1 </dev/null & echo $!"
+        f"nohup env {env} bash run.sh >> {remote_log} 2>&1 </dev/null & echo $!"
     )
     r = ssh_run(host, ssh_user, ssh_key, launch)
     if r.returncode != 0:
@@ -229,10 +247,13 @@ def deploy_role(
     rsync_from: Optional[str],
     skip_build: bool,
     use_git: bool,
+    git_ref: str = "",
 ) -> str:
     if rsync_from and not skip_build and not use_git:
-        print(f"  [{role}] rsync {rsync_from} -> {host}:~/Ionia/")
+        print(f"  [{role}] rsync {rsync_from} -> {host}:~/Ionia/ (USE_GIT=0)")
         rsync_ionia(rsync_from, host, ssh_user, ssh_key)
+    elif use_git and not skip_build:
+        print(f"  [{role}] will git clone {IONIA_GIT_URL} on VM")
     with tempfile.TemporaryDirectory(prefix=f"gcp_setup_{role}_") as tmp:
         bundle_dir = os.path.join(tmp, "bundle")
         write_bundle(
@@ -243,6 +264,7 @@ def deploy_role(
             ssh_public=ssh_public,
             extra_files=bundle_files,
         )
+        attach_ionia_repo_helper(bundle_dir, remote_script_path)
         pid = upload_and_launch(
             host,
             ssh_user,
@@ -252,5 +274,6 @@ def deploy_role(
             remote_log=remote_log,
             skip_build=skip_build,
             use_git=use_git,
+            git_ref=git_ref,
         )
     return pid

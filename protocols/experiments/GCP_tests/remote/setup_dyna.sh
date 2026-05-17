@@ -1,9 +1,6 @@
 #!/usr/bin/env bash
-# Full DYNA (ionia -m dyna) setup on one VM: deps, build, SSH keys, config, helpers.
-# Launched via nohup from setup_dyna_cluster.py.
-#
-# Bundle files: role.txt, replica_index.txt, dynaconfig, trace/run1,
-#   id_ed25519, ssh_public_line
+# Full DYNA (ionia -m dyna) setup on one VM: deps, git clone, build, config, helpers.
+# Default: git clone git@github.com:ntu2323/IONIA.git (keys from gcp_secrets.py bundle).
 
 if [ -z "${BASH_VERSION:-}" ]; then
   exec /usr/bin/env bash "$0" "$@"
@@ -15,7 +12,7 @@ SETUP_BUNDLE="${SETUP_BUNDLE:-${HOME}/bench/setup_bundle}"
 LOGFILE="${HOME}/dyna_setup.log"
 DONE_MARKER="${HOME}/bench/.setup_dyna_done"
 FAIL_MARKER="${HOME}/bench/.setup_dyna_failed"
-IONIA_DIR="${HOME}/Ionia/protocols/src/ionia"
+IONIA_SRC="${HOME}/Ionia/protocols/src/ionia"
 REPLICA_PORT="${REPLICA_PORT:-31880}"
 
 rm -f "${DONE_MARKER}" "${FAIL_MARKER}"
@@ -25,21 +22,12 @@ exec >>"${LOGFILE}" 2>&1
 echo "=== DYNA remote setup started at $(date -Iseconds) pid=$$ ==="
 echo "=== bundle: ${SETUP_BUNDLE} log: ${LOGFILE} ==="
 
+# shellcheck source=/dev/null
+source "${SETUP_BUNDLE}/ionia_repo.sh"
+
 ROLE="$(cat "${SETUP_BUNDLE}/role.txt")"
 REPLICA_INDEX="$(cat "${SETUP_BUNDLE}/replica_index.txt" 2>/dev/null || true)"
 SKIP_BUILD="${SKIP_BUILD:-0}"
-USE_GIT="${USE_GIT:-0}"
-
-install_ssh() {
-  mkdir -p ~/.ssh ~/bench/trace
-  chmod 700 ~/.ssh
-  cp "${SETUP_BUNDLE}/id_ed25519" ~/.ssh/id_ed25519
-  chmod 600 ~/.ssh/id_ed25519
-  touch ~/.ssh/authorized_keys
-  chmod 600 ~/.ssh/authorized_keys
-  pub="$(tr -d '\r\n' < "${SETUP_BUNDLE}/ssh_public_line")"
-  grep -qxF "${pub}" ~/.ssh/authorized_keys || echo "${pub}" >> ~/.ssh/authorized_keys
-}
 
 install_config() {
   cp "${SETUP_BUNDLE}/dynaconfig" ~/bench/dynaconfig
@@ -120,7 +108,7 @@ install_apt_deps() {
   sudo cloud-init status --wait || true
   sudo apt-get update -qq
   sudo apt-get install -y -qq \
-    git build-essential cmake ninja-build pkg-config \
+    git openssh-client build-essential cmake ninja-build pkg-config \
     protobuf-compiler libprotobuf-dev libevent-dev libssl-dev \
     libunwind-dev libboost-all-dev libdouble-conversion-dev \
     libgoogle-glog-dev libgflags-dev libfmt-dev liblz4-dev liblzma-dev \
@@ -128,41 +116,28 @@ install_apt_deps() {
     libxxhash-dev libtbb-dev libnuma-dev numactl g++ gcc make
 }
 
-ensure_ionia_repo() {
-  if [[ -d "${HOME}/Ionia/protocols/src/ionia" ]]; then
-    return 0
-  fi
-  if [[ "${USE_GIT}" != "1" ]]; then
-    echo "Missing ${HOME}/Ionia — rsync source first or set USE_GIT=1" >&2
-    exit 1
-  fi
-  ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
-  git clone git@github.com:ntu2323/IONIA.git "${HOME}/Ionia"
-  cd "${HOME}/Ionia"
-  git submodule update --init --recursive || true
-  cd "${HOME}"
-}
-
 build_dyna() {
+  test -d "${IONIA_SRC}" || { echo "Missing ${IONIA_SRC} after git clone" >&2; exit 1; }
   cd "${HOME}/Ionia"
   chmod +x docker/bootstrap_deps.sh
   ./docker/bootstrap_deps.sh
   make -C protocols/src/ionia bench/replica bench/client -j"$(nproc)"
-  test -x "${IONIA_DIR}/bench/replica"
-  test -x "${IONIA_DIR}/bench/client"
+  test -x "${IONIA_SRC}/bench/replica"
+  test -x "${IONIA_SRC}/bench/client"
 }
 
-install_ssh
+install_ssh_from_bundle
+mkdir -p ~/bench/trace
 install_config
 install_helpers
-echo "Config and helpers installed for role=${ROLE}"
+echo "SSH keys and config installed for role=${ROLE} (USE_GIT=${USE_GIT})"
 
 if [[ "${SKIP_BUILD}" == "1" ]]; then
-  echo "SKIP_BUILD=1 — skipping compile"
+  echo "SKIP_BUILD=1 — skipping apt/git/compile"
 else
   install_apt_deps
-  install_folly_if_needed
   ensure_ionia_repo
+  install_folly_if_needed
   build_dyna
 fi
 
@@ -175,5 +150,6 @@ fi
 
 touch "${DONE_MARKER}"
 echo "=== DYNA remote setup finished at $(date -Iseconds) ==="
+echo "Repo: ${IONIA_DIR} (${IONIA_GIT_URL})"
 echo "Done marker: ${DONE_MARKER}"
 echo "UDP port ${REPLICA_PORT} — open firewall between cluster VMs."

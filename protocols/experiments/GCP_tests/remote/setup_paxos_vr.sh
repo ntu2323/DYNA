@@ -1,15 +1,12 @@
 #!/usr/bin/env bash
-# Full NOPaxos VR (paxos/vr) setup on one VM: deps, build, SSH keys, config, helpers.
+# Full NOPaxos VR (paxos/vr) setup on one VM: deps, git clone, build, config, helpers.
 # Launched via nohup from setup_paxos_vr_cluster.py so SSH drops do not stop the build.
 #
-# Expects a bundle under SETUP_BUNDLE (default ~/bench/setup_bundle):
-#   role.txt, replica_index.txt (empty for senders), vrconfig, trace.micro,
-#   id_ed25519, ssh_public_line
+# Bundle (~/bench/setup_bundle): role.txt, replica_index.txt, vrconfig, trace.micro,
+#   id_ed25519, ssh_public_line, ionia_repo.sh
 #
-# Env:
-#   SETUP_BUNDLE   path to bundle directory
-#   SKIP_BUILD=1   skip apt/folly/rocksdb/make (config + helpers only)
-#   USE_GIT=1      clone ~/Ionia from GitHub if missing (needs id_ed25519 in bundle)
+# Default: git clone git@github.com:ntu2323/IONIA.git using keys from gcp_secrets.py.
+# Set USE_GIT=0 only when source was rsync'd from laptop (--rsync-from).
 
 if [ -z "${BASH_VERSION:-}" ]; then
   exec /usr/bin/env bash "$0" "$@"
@@ -31,21 +28,12 @@ exec >>"${LOGFILE}" 2>&1
 echo "=== NOPaxos VR remote setup started at $(date -Iseconds) pid=$$ ==="
 echo "=== bundle: ${SETUP_BUNDLE} log: ${LOGFILE} ==="
 
+# shellcheck source=/dev/null
+source "${SETUP_BUNDLE}/ionia_repo.sh"
+
 ROLE="$(cat "${SETUP_BUNDLE}/role.txt")"
 REPLICA_INDEX="$(cat "${SETUP_BUNDLE}/replica_index.txt" 2>/dev/null || true)"
 SKIP_BUILD="${SKIP_BUILD:-0}"
-USE_GIT="${USE_GIT:-0}"
-
-install_ssh() {
-  mkdir -p ~/.ssh ~/bench
-  chmod 700 ~/.ssh
-  cp "${SETUP_BUNDLE}/id_ed25519" ~/.ssh/id_ed25519
-  chmod 600 ~/.ssh/id_ed25519
-  touch ~/.ssh/authorized_keys
-  chmod 600 ~/.ssh/authorized_keys
-  pub="$(tr -d '\r\n' < "${SETUP_BUNDLE}/ssh_public_line")"
-  grep -qxF "${pub}" ~/.ssh/authorized_keys || echo "${pub}" >> ~/.ssh/authorized_keys
-}
 
 install_config() {
   cp "${SETUP_BUNDLE}/vrconfig" ~/bench/vrconfig
@@ -119,7 +107,7 @@ install_apt_deps() {
   sudo cloud-init status --wait || true
   sudo apt-get update -qq
   sudo apt-get install -y -qq \
-    git build-essential cmake ninja-build pkg-config \
+    git openssh-client build-essential cmake ninja-build pkg-config \
     protobuf-compiler libprotobuf-dev libevent-dev libssl-dev \
     libunwind-dev libboost-all-dev libdouble-conversion-dev \
     libgoogle-glog-dev libgflags-dev libfmt-dev liblz4-dev liblzma-dev \
@@ -127,22 +115,8 @@ install_apt_deps() {
     libxxhash-dev libtbb-dev libnuma-dev numactl g++ gcc make
 }
 
-ensure_ionia_repo() {
-  if [[ -d "${HOME}/Ionia/protocols/src/paxos" ]]; then
-    return 0
-  fi
-  if [[ "${USE_GIT}" != "1" ]]; then
-    echo "Missing ${HOME}/Ionia — rsync source first or set USE_GIT=1" >&2
-    exit 1
-  fi
-  ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
-  git clone git@github.com:ntu2323/IONIA.git "${HOME}/Ionia"
-  cd "${HOME}/Ionia"
-  git submodule update --init --recursive || true
-  cd "${HOME}"
-}
-
 build_paxos() {
+  test -d "${PAXOS_DIR}" || { echo "Missing ${PAXOS_DIR} after git clone" >&2; exit 1; }
   cd "${HOME}/Ionia"
   echo "Building RocksDB..."
   make -C protocols/src/deps/rocksdb-6.12.7 -j"$(nproc)" static_lib
@@ -152,17 +126,18 @@ build_paxos() {
   test -x "${PAXOS_DIR}/bench/client"
 }
 
-install_ssh
+# SSH keys (for GitHub + inter-VM ssh) and bench config first.
+install_ssh_from_bundle
 install_config
 install_helpers
-echo "Config and helpers installed for role=${ROLE}"
+echo "SSH keys and config installed for role=${ROLE} (USE_GIT=${USE_GIT})"
 
 if [[ "${SKIP_BUILD}" == "1" ]]; then
-  echo "SKIP_BUILD=1 — skipping compile"
+  echo "SKIP_BUILD=1 — skipping apt/git/compile"
 else
   install_apt_deps
-  install_folly_if_needed
   ensure_ionia_repo
+  install_folly_if_needed
   build_paxos
 fi
 
@@ -175,5 +150,6 @@ fi
 
 touch "${DONE_MARKER}"
 echo "=== NOPaxos VR remote setup finished at $(date -Iseconds) ==="
+echo "Repo: ${IONIA_DIR} (${IONIA_GIT_URL})"
 echo "Done marker: ${DONE_MARKER}"
 echo "UDP port ${VR_PORT} — open firewall between cluster VMs."

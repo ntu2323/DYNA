@@ -2,11 +2,13 @@
 """
 Set up an existing GCP bench cluster for classic NOPaxos VR (protocols/src/paxos/vr).
 
-Uploads source (rsync), drops a setup bundle + bash script on each VM, and launches
-setup under nohup so a dropped SSH session does not stop the long build.
+Each VM git-clones git@github.com:ntu2323/IONIA.git using SSH keys from
+secrets/gcp_secrets.py, then builds under nohup (SSH drops won't stop the build).
 
 Example:
   SSH_USER=ubuntu python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
+
+Optional: --rsync-from /path/to/Ionia for a local tree instead of git.
 
 If you disconnect, check progress on a VM:
   tail -f ~/paxos_vr_setup.log
@@ -32,7 +34,6 @@ _REMOTE_SETUP_SCRIPT = os.path.join(_SCRIPT_DIR, "remote", "setup_paxos_vr.sh")
 _REMOTE_LOG = "~/paxos_vr_setup.log"
 _DONE_MARKER = "~/bench/.setup_paxos_done"
 _FAIL_MARKER = "~/bench/.setup_paxos_failed"
-_DEFAULT_IONIA_ROOT = os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", ".."))
 
 NUM_RECEIVERS = 3
 VR_PORT = 31880
@@ -102,8 +103,16 @@ def main() -> None:
     ap.add_argument("--hosts-file", default=os.path.join(_SCRIPT_DIR, "cluster_hosts.json"))
     ap.add_argument("--ssh-user", default=os.environ.get("SSH_USER", ""))
     ap.add_argument("--ssh-key", default=os.environ.get("SSH_KEY_FILE", ""))
-    ap.add_argument("--rsync-from", default=os.environ.get("IONIA_REPO_ROOT", _DEFAULT_IONIA_ROOT))
-    ap.add_argument("--git-build", action="store_true", help="Clone Ionia on VM instead of rsync.")
+    ap.add_argument(
+        "--rsync-from",
+        default=os.environ.get("IONIA_REPO_ROOT", ""),
+        help="Rsync local Ionia tree instead of git clone (dev only).",
+    )
+    ap.add_argument(
+        "--git-ref",
+        default=os.environ.get("IONIA_GIT_REF", ""),
+        help="Git branch/tag/commit to checkout after clone (default: remote HEAD).",
+    )
     ap.add_argument("--skip-build", action="store_true", help="Config/helpers only (repo must exist).")
     ap.add_argument(
         "--no-wait",
@@ -141,7 +150,10 @@ def main() -> None:
     ssh_private = getattr(secrets, "SSH_PRIVATE_KEY", "").strip()
     ssh_public = getattr(secrets, "SSH_PUBLIC_KEY", "").strip()
     if not ssh_private or not ssh_public:
-        sys.exit("SSH_PRIVATE_KEY and SSH_PUBLIC_KEY required in gcp_secrets.py")
+        sys.exit(
+            "SSH_PRIVATE_KEY and SSH_PUBLIC_KEY required in secrets/gcp_secrets.py "
+            "(deploy key must be authorized on github.com/ntu2323/IONIA)"
+        )
 
     hosts_path = args.hosts_file
     if not os.path.isabs(hosts_path):
@@ -157,14 +169,17 @@ def main() -> None:
     bundle_files = {"vrconfig": vrconfig, "trace.micro": trace}
 
     ssh_key = args.ssh_key or None
-    use_rsync = (
-        bool(args.rsync_from)
-        and not args.git_build
-        and not args.skip_build
-        and os.path.isdir(args.rsync_from)
-    )
-    rsync_root = os.path.abspath(args.rsync_from) if use_rsync else None
-    use_git = bool(args.git_build) and not args.skip_build
+    rsync_path = args.rsync_from.strip()
+    use_rsync = bool(rsync_path) and not args.skip_build
+    if use_rsync:
+        if not os.path.isdir(rsync_path):
+            sys.exit(f"--rsync-from not a directory: {rsync_path}")
+        rsync_root = os.path.abspath(rsync_path)
+        use_git = False
+    else:
+        rsync_root = None
+        use_git = not args.skip_build
+    git_ref = args.git_ref.strip()
 
     print("Waiting for SSH...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(all_roles)) as ex:
@@ -176,7 +191,11 @@ def main() -> None:
             if not fut.result():
                 sys.exit(f"SSH timeout for {futs[fut]}")
 
-    mode = "wire-only" if args.skip_build else ("git" if use_git else "rsync+nohup")
+    mode = (
+        "wire-only"
+        if args.skip_build
+        else (f"git clone {gcp_remote_setup.IONIA_GIT_URL}" if use_git else "rsync+nohup")
+    )
     print(f"Launching remote setup on {len(all_roles)} VM(s) ({mode})...")
 
     def _deploy(role: str) -> Tuple[str, str]:
@@ -195,6 +214,7 @@ def main() -> None:
             rsync_from=rsync_root,
             skip_build=args.skip_build,
             use_git=use_git,
+            git_ref=git_ref,
         )
         return role, pid
 
