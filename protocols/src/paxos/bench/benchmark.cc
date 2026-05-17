@@ -74,6 +74,7 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
     started = false;
     done = false;
     cooldownDone = false;
+    requestInFlight = false;
     _Latency_Init(&latency, "op");
     latencies.reserve(numRequests);
     opcodes.reserve(numRequests);
@@ -157,7 +158,10 @@ BenchmarkClient::WarmupDone()
     gettimeofday(&startTime, NULL);
     n = 0;
     expStartTime = std::chrono::high_resolution_clock::now();
-    SendNext();
+    // VR allows one pending request; only kick measured phase if idle.
+    if (!requestInFlight) {
+        SendNext();
+    }
 }
 
 void
@@ -230,6 +234,7 @@ BenchmarkClient::SendNext()
 
     Latency_Start(&latency);
     opcodes.push_back(op);
+    requestInFlight = true;
     client.Invoke(request, std::bind(&BenchmarkClient::OnReply,
                                     this,
                                     std::placeholders::_1,
@@ -243,6 +248,7 @@ BenchmarkClient::OnReply(const string &request, const string &reply)
         return;
     }
 
+    requestInFlight = false;
     n++;
     if ((started) && (!done) && (n != 0)) {
     	uint64_t ns = Latency_End(&latency);

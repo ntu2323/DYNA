@@ -78,6 +78,7 @@ private:
     int opLastInterval;
     std::chrono::time_point<std::chrono::high_resolution_clock> expStartTime;
     std::vector<std::pair<std::string, std::string>> operations;
+    bool requestInFlight;
 };
 
 } // namespace specpaxos
