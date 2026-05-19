@@ -23,7 +23,7 @@ import time
 # -----------------------------------------------------------------------------
 PROJECT_ID = "corfu-488815"
 ZONE = "us-east4-c"
-MACHINE_TYPE = "e2-medium"  # 2 GB RAM; needed for clone + deps + build on each VM
+MACHINE_TYPE = "n2-standard-2"  # 2 GB RAM; needed for clone + deps + build on each VM
 IMAGE_PROJECT = "ubuntu-os-cloud"
 IMAGE_FAMILY = "ubuntu-2204-lts"  # Folly pin patched in remote/folly_build.sh (glibc 2.34 / SIGSTKSZ)
 INSTANCE_NAME = "lazylog-vm-1"

@@ -1,0 +1,6 @@
+# Per-deployment cluster state (VM IPs)
+cluster_hosts.json
+
+# GCP credentials and deploy keys (keep template files)
+secrets/*
+!secrets/*.example

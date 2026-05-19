@@ -36,9 +36,29 @@ open(path, "w", encoding="utf-8").write(text)
 PY
 }
 
-install_folly_if_needed() {
+# cmake --install puts libraries under /usr/local; .pc may not be on default PKG_CONFIG_PATH.
+export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+folly_already_installed() {
   if pkg-config --exists folly 2>/dev/null; then
-    echo "Using system Folly ($(pkg-config --modversion folly 2>/dev/null || echo installed))"
+    return 0
+  fi
+  if [[ -f /usr/local/lib/libfolly.so ]] || [[ -f /usr/local/lib/libfolly.a ]]; then
+    return 0
+  fi
+  if [[ -f /usr/local/lib64/libfolly.so ]] || [[ -f /usr/local/lib64/libfolly.a ]]; then
+    return 0
+  fi
+  return 1
+}
+
+install_folly_if_needed() {
+  if folly_already_installed; then
+    if pkg-config --exists folly 2>/dev/null; then
+      echo "Using system Folly ($(pkg-config --modversion folly 2>/dev/null || echo installed))"
+    else
+      echo "Using installed Folly libraries in /usr/local/lib (pkg-config .pc not found; skipping rebuild)"
+    fi
     return 0
   fi
   FOLLY_COMMIT="${FOLLY_COMMIT:-49926b98f5afb5667d0c06807da79d606a6d43c3}"
@@ -51,5 +71,15 @@ install_folly_if_needed() {
   cmake -S . -B _build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTS=OFF -DFOLLY_USE_SYMBOLIZER=OFF
   cmake --build _build -j"$(nproc)"
   sudo cmake --install _build
+  sudo ldconfig
   cd "${HOME}"
+  export PKG_CONFIG_PATH="/usr/local/lib/pkgconfig:/usr/local/lib64/pkgconfig:${PKG_CONFIG_PATH:-}"
+  if pkg-config --exists folly 2>/dev/null; then
+    echo "Folly installed; pkg-config version $(pkg-config --modversion folly)"
+  elif folly_already_installed; then
+    echo "Folly libraries installed under /usr/local/lib but folly.pc missing (builds will still link -lfolly)"
+  else
+    echo "ERROR: Folly install finished but libraries not found under /usr/local" >&2
+    return 1
+  fi
 }
