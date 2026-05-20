@@ -40,10 +40,12 @@ Environment (optional overrides):
 | `DYNA_OWD_WINDOW_LEN` | Replica sliding window length; default `100`. |
 | `DYNA_OWD_PERCENTILE` | Percentile in `[0,100]` over sorted window; default `50`. |
 
-### Replica threading (Stage A)
+### Replica threading (Nezha-style pipeline)
 
-- **Transport thread:** `ReceiveMessage` copies each inbound UDP message and enqueues `InboundWork`.
-- **Worker thread:** drains `inboundQu_`, dispatches to existing handlers, runs `Tick()` every 1 ms (`ProcessDueRequests` / early-buffer release). All partition state and `transport->SendMessage` run on the worker.
+- **Transport thread:** `ReceiveMessage` copies inbound UDP payloads and enqueues work (no protocol logic).
+- **Fast worker (one thread):** drains `fastInboundQu_` for client `RequestMessage` only. On the fast path it sends `FastReply` immediately, then enqueues a `BufferedRequest` on `incomingQu_[partition]` for replication. Slow-path leader requests are forwarded to `commitQu_[partition]` without a fast reply on this thread.
+- **Commit worker (one thread per partition):** exclusively owns `PartitionState[partition]`. Drains `incomingQu_` into `earlyBuffer` / `latBuffer`, drains `commitQu_` for sync/commit/fetch/late-sync and slow-path requests, and runs `ProcessDueRequests` every 1 ms. WAL `fsync`, `CommitBroadcast`, and `ApplyCommittedUpTo` run here only.
+- **Shared state:** `deadlineCounter` per partition is `std::atomic` (fast worker reads for slow-path gate; commit worker updates on apply). `kvStore` / `appliedWrites` updates are guarded by `kvMutex_` because multiple commit threads may apply concurrently. `ReplicaOwdEstimator` is guarded by `owdMutex_` (fast worker samples; commit/slow path may read estimates).
 
 ### Fast path (single-shard network partition)
 

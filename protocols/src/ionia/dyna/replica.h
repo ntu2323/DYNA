@@ -14,6 +14,7 @@
 #include <chrono>
 #include <deque>
 #include <memory>
+#include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
@@ -104,8 +105,8 @@ private:
     };
 
     struct PartitionState {
-        uint64_t viewId = 0;
-        uint64_t deadlineCounter = 0;
+        std::atomic<uint64_t> viewId{0};
+        std::atomic<uint64_t> deadlineCounter{0};
         uint64_t nextSequence = 0;
         uint64_t nextLogIndex = 0;
         uint64_t commitPoint = 0;
@@ -129,19 +130,33 @@ private:
     std::unordered_map<std::string, std::string> kvStore;
     ReplicaOwdEstimator owdEstimator_;
     std::string walDir_;
+    mutable std::mutex owdMutex_;
+    mutable std::mutex kvMutex_;
 
-    moodycamel::ConcurrentQueue<InboundWork> inboundQu_;
-    std::thread workerThread_;
-    std::atomic<bool> workerRunning_{false};
+    moodycamel::ConcurrentQueue<InboundWork> fastInboundQu_;
+    std::vector<moodycamel::ConcurrentQueue<InboundWork>> commitQu_;
+    std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> incomingQu_;
+    std::thread fastWorkerThread_;
+    std::vector<std::thread> commitThreads_;
+    std::atomic<bool> workersRunning_{false};
 
-    void StartWorker();
-    void StopWorker();
-    void WorkerLoop();
-    void DispatchInbound(InboundWork &work);
-    bool EnqueueInbound(InboundKind kind,
-                        const TransportAddress &remote,
-                        const std::string_view type,
-                        const std::string_view data);
+    void StartWorkers();
+    void StopWorkers();
+    void FastWorkerLoop();
+    void CommitPartitionLoop(uint32_t partitionId);
+    void DispatchFastInbound(InboundWork &work);
+    void DispatchCommitInbound(uint32_t partitionId, InboundWork &work);
+    void DrainIncomingBuffered(uint32_t partitionId);
+    bool EnqueueFast(InboundKind kind,
+                     const TransportAddress &remote,
+                     const std::string_view data);
+    bool EnqueueCommit(uint32_t partitionId,
+                       InboundKind kind,
+                       const TransportAddress &remote,
+                       const std::string_view data);
+    void HandleRequestFast(const TransportAddress &remote, const proto::RequestMessage &req);
+    void HandleRequestSlow(const TransportAddress &remote, const proto::RequestMessage &req);
+    static void UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t value);
 
     uint64_t NowMicros() const;
     uint32_t PartitionLeader(uint32_t partitionId) const;
@@ -149,8 +164,7 @@ private:
     RequestKey KeyOf(const proto::RequestMessage &req) const;
     PartitionState &StateFor(uint32_t partitionId);
     const PartitionState &StateFor(uint32_t partitionId) const;
-    void Tick();
-    void HandleRequest(const TransportAddress &remote, const proto::RequestMessage &req);
+    void ProcessDueRequestsTick(uint32_t partitionId);
     void HandleLateRequest(const TransportAddress &remote, const proto::RequestMessage &req, uint32_t partitionId);
     void HandleLateSyncBroadcast(const TransportAddress &remote, const proto::LateSyncBroadcast &lsb);
     void HandleSyncBroadcast(const TransportAddress &remote, const proto::SyncBroadcast &sb);

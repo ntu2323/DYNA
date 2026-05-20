@@ -1,15 +1,15 @@
 {
   "hosts": {
-    "receiver1": "136.107.64.157",
-    "receiver2": "34.48.149.136",
-    "receiver3": "34.150.128.65",
-    "sender1": "35.245.91.68"
+    "receiver1": "34.182.132.108",
+    "receiver2": "34.182.216.10",
+    "receiver3": "34.181.215.3",
+    "sender1": "34.85.161.13"
   },
   "machine_count": 4,
   "name_prefix": "ionia",
   "receiver_internal": {
-    "receiver1": "10.150.0.49",
-    "receiver2": "10.150.0.45",
-    "receiver3": "10.150.0.55"
+    "receiver1": "10.150.15.221",
+    "receiver2": "10.150.15.222",
+    "receiver3": "10.150.15.225"
   }
 }
