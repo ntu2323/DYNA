@@ -26,6 +26,8 @@ python3 create_cluster.py 4 --hosts-file cluster_hosts.json
 
 ---
 
+Bench traces are **write-only** (Insert/Update; no reads) in `trace.micro`, shared by VR and DYNA. Both clients **cycle** the trace for `-n` (e.g. 100000).
+
 ## 2. Setup VR (all VMs)
 
 ```bash
@@ -37,7 +39,10 @@ SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.
 #   --hosts-file cluster_hosts.json --rsync-from "$IONIA_REPO_ROOT"
 ```
 
-SSH_USER=nathan python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
+# Image already has deps: refresh IONIA from GitHub + incremental make (push code first)
+SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
+# Optional branch: IONIA_GIT_REF=my-branch SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py ... --skip-build
+# Or sync local tree: IONIA_REPO_ROOT=/path/to/Ionia python3 setup_paxos_vr_cluster.py ... --skip-build --rsync-from "$IONIA_REPO_ROOT"
 
 ---
 
@@ -49,7 +54,9 @@ Run after VR setup (or first). Do **not** run both setup scripts at the same tim
 SSH_USER=$SSH_USER python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
 ```
 
-SSH_USER=nathan python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=$SSH_USER python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
+
+(Same as VR: `--skip-build` runs `git pull` on `git@github.com:ntu2323/IONIA.git` then incremental `make`; skips apt/folly.)
 
 
 ---
@@ -113,7 +120,7 @@ cd ~/Ionia/protocols/src/paxos
 # DYNA
 cd ~/Ionia/protocols/src/ionia
 ./bench/client -s ~/bench/dynaconfig -c ~/bench/dynaconfig -m dyna \
-  -k ~/bench/trace/run -n 100 -e 30 -w 3 -t 1 -j 1 -i 1000 \
+  -k ~/bench/trace.micro -n 100 -e 30 -w 3 -t 1 -j 1 -i 1000 \
   -l ~/bench/latencies 2>&1 | tee ~/bench/client-fg.log
 ```
 
@@ -126,7 +133,6 @@ Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh`.
 | Path | Purpose |
 |------|---------|
 | `~/bench/vrconfig` / `~/bench/dynaconfig` | Replica addresses (internal IPs, port 31880) |
-| `~/bench/trace.micro` | VR trace |
-| `~/bench/trace/run1` | DYNA trace |
+| `~/bench/trace.micro` | Write-only micro trace (VR & DYNA; cycles for `-n`) |
 | `~/bench/.setup_paxos_done` / `.setup_dyna_done` | Remote setup success |
 | `~/paxos_vr_setup.log` / `~/dyna_setup.log` | Remote setup build log |

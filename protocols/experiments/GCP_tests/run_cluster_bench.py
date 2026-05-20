@@ -103,7 +103,7 @@ def _build_client_cmd(
             "-s", "$HOME/bench/dynaconfig",
             "-c", "$HOME/bench/dynaconfig",
             "-m", "dyna",
-            "-k", "$HOME/bench/trace/run",
+            "-k", "$HOME/bench/trace.micro",
             "-n", str(num_ops),
             "-e", str(experiment_sec),
             "-w", str(warmup_sec),

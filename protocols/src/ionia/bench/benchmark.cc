@@ -35,6 +35,7 @@
 
 #include "bench/benchmark.h"
 #include "common/client.h"
+#include "lib/assert.h"
 #include "lib/latency.h"
 #include "lib/message.h"
 #include "lib/transport.h"
@@ -89,36 +90,15 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
     int rc = 0;
     assert(!(rc = stat(traceFile.c_str(), &stat_buf)));
     void* vaddr =  mmap(NULL, stat_buf.st_size, PROT_READ, MAP_SHARED , traceFd, 0);
-    std::size_t n = 0;
-    {
-        size_t off = 0;
-        char* curr = (char*) vaddr;
-        while(off < (uint32_t) stat_buf.st_size) {
-            char* op_ptr = curr;
-            curr += OPCODE_SIZE + 1; 
-            off += OPCODE_SIZE + 1;
-
-            char* key_ptr = curr;
-            curr += KEY_SIZE + 1;
-            off += KEY_SIZE + 1;
-            n++;
-        }
-    }
 
     size_t off = 0;
     char* curr = (char*) vaddr;
-    numRequests = std::min(numRequests, (int)n);
-    opcodes.reserve(numRequests);
-    messages.reserve(numRequests);
+    messages.reserve(32);
+    opcodes.reserve(32);
 
-    std::size_t i = 0;
-    while(off < (uint32_t) stat_buf.st_size) {
-        if (i == numRequests)
-        {
-            break;
-        }
+    while (off < (uint32_t) stat_buf.st_size) {
         char* op_ptr = curr;
-        curr += OPCODE_SIZE + 1; 
+        curr += OPCODE_SIZE + 1;
         off += OPCODE_SIZE + 1;
 
         char* key_ptr = curr;
@@ -130,53 +110,41 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
         assert(op.length() == OPCODE_SIZE);
         assert(key.length() == KEY_SIZE);
 
+        const bool isRead = op[0] == 'r' || op[0] == 'R';
+        if (isRead) {
+            continue;
+        }
+
         std::ostringstream msg;
-
         msg << op << key;
-        bool isRead = op[0] == 'r' || op[0] == 'R';
-        bool isUpdate = op[0] == 'u' || op[0] == 'U';
-        bool isNonNilext = op[0] == 'e' || op[0] == 'E';
-
-        if(!isRead) {
-            if (isUpdate || isNonNilext)
-                msg << string(VAL_SIZE, 'x');
-            else
-                msg << string(VAL_SIZE, 'v');
+        const bool isUpdate = op[0] == 'u' || op[0] == 'U';
+        const bool isNonNilext = op[0] == 'e' || op[0] == 'E';
+        if (isUpdate || isNonNilext) {
+            msg << string(VAL_SIZE, 'x');
+        } else {
+            msg << string(VAL_SIZE, 'v');
         }
-        auto str = msg.str();
 
-        //Latency_Start(&latency);
         opcodes.push_back(op[0]);
-        messages.emplace_back(str);
-
-        // load 100 more requests from the file 
-        // sometimes the benchmark sends slightly more requests than n...
-        if(messages.size() >= (uint32_t) numRequests + 100) {
-            break;
-        }
-
-        i++;
-        // Notice("op: %s key:%s", operations.back().first.c_str(), operations.back().second.c_str());
+        messages.emplace_back(msg.str());
     }
     munmap(vaddr, stat_buf.st_size);
     close(traceFd);
 
-    if (logLatency)
-    {
-        latencies.reserve(numRequests);
+    if (messages.empty()) {
+        Panic("No write operations in tracefile %s", traceFile.c_str());
     }
-    else
-    {
-        // populate enough
-        for (auto i = 0; i < 1000; i++)
-        {
+
+    if (logLatency) {
+        latencies.reserve(numRequests);
+    } else {
+        for (auto i = 0; i < 1000; i++) {
             latencies.push_back(1);
         }
     }
-    opcodes.reserve(numRequests);
 
-    Notice("Loaded %lu operations (numrequests = %d) from tracefile: %s",
-     messages.size(), numRequests, traceFile.c_str());
+    Notice("Loaded %lu trace ops (numrequests = %d, cycles trace) from tracefile: %s",
+           messages.size(), numRequests, traceFile.c_str());
 }
 
 void
@@ -261,37 +229,20 @@ BenchmarkClient::CooldownDone()
 void
 BenchmarkClient::SendNext()
 {
-    if(n >= numRequests){
+    if (messages.empty()) {
+        return;
+    }
+    if (started && n >= numRequests) {
         return;
     }
 
-    /*
-    std::ostringstream msg;
-
-    msg << operations[n].first << operations[n].second;
-    auto str = msg.str();
-    bool isRead = str.c_str()[0] == 'r' || str.c_str()[0] == 'R';
-    bool isUpdate = str.c_str()[0] == 'u' || str.c_str()[0] == 'U';
-    bool isNonNilext = str.c_str()[0] == 'e' || str.c_str()[0] == 'E';
-
-    if(!isRead) {
-    	if (isUpdate || isNonNilext)
-    		msg << string(VAL_SIZE, 'x');
-    	else
-    		msg << string(VAL_SIZE, 'v');
-    }
-
-    //Latency_Start(&latency);
-    opcodes.push_back(str.c_str()[0]);
-    */
-
+    const size_t opIdx = static_cast<size_t>(n) % messages.size();
     Latency_Start(&latency);
-    //latency_time = std::chrono::high_resolution_clock::now();
-    const auto& str = messages[n]; 
-    client.Invoke(str, std::bind(&BenchmarkClient::OnReply,
-                                    this,
-                                    std::placeholders::_1,
-                                    std::placeholders::_2));    
+    client.Invoke(messages[opIdx],
+                  std::bind(&BenchmarkClient::OnReply,
+                            this,
+                            std::placeholders::_1,
+                            std::placeholders::_2));
 }
 
 void

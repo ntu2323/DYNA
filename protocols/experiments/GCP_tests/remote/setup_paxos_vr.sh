@@ -132,7 +132,14 @@ install_helpers
 echo "SSH keys and config installed for role=${ROLE} (USE_GIT=${USE_GIT})"
 
 if [[ "${SKIP_BUILD}" == "1" ]]; then
-  echo "SKIP_BUILD=1 — skipping apt/git/compile"
+  echo "SKIP_BUILD=1 — git update + incremental compile (image deps; no apt/folly)"
+  if [[ "${USE_GIT}" == "1" ]]; then
+    ensure_ionia_repo
+  elif [[ ! -d "${IONIA_DIR}" ]]; then
+    echo "Missing ${IONIA_DIR} (USE_GIT=0). Run full setup, --rsync-from, or set USE_GIT=1." >&2
+    exit 1
+  fi
+  build_paxos
 else
   install_apt_deps
   ensure_ionia_repo

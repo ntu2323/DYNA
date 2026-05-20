@@ -335,7 +335,13 @@ int main(int argc, char **argv)
             // for machine 0, traceFileNums will be between 1 and 16 
             // for machine 1, traceFileNums will be between 17 and 32
             // and so on 
-    	    string traceFile = traceFilePrefix + std::to_string(traceFileNum);
+            string traceFile;
+            if (traceFilePrefix.size() >= 6 &&
+                traceFilePrefix.compare(traceFilePrefix.size() - 6, 6, ".micro") == 0) {
+                traceFile = traceFilePrefix;
+            } else {
+                traceFile = traceFilePrefix + std::to_string(traceFileNum);
+            }
 
             specpaxos::BenchmarkClient *bench =
                     new specpaxos::BenchmarkClient(*client, transport,

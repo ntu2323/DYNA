@@ -19,6 +19,7 @@ import os
 import sys
 from typing import Dict, List, Optional, Tuple
 
+import bench_trace
 import gcp_remote_setup
 import gcp_setup_log
 
@@ -31,20 +32,6 @@ _FAIL_MARKER = "~/bench/.setup_dyna_failed"
 
 NUM_RECEIVERS = 3
 REPLICA_PORT = 31880
-
-DYNA_TRACE = """\
-I user10000000000000000001
-U user20000000000000000002
-I user30000000000000000003
-R user30000000000000000003
-U user10000000000000000001
-I user20000000000000000002
-U user30000000000000000003
-R user10000000000000000001
-I user40000000000000000004
-U user40000000000000000004
-"""
-
 
 def _load_gcp_secrets():
     if not os.path.isfile(_GCP_SECRETS_PATH):
@@ -96,7 +83,11 @@ def main() -> None:
         default=os.environ.get("IONIA_GIT_REF", ""),
         help="Git branch/tag/commit after clone (default: remote HEAD).",
     )
-    ap.add_argument("--skip-build", action="store_true")
+    ap.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip apt/folly bootstrap; git pull IONIA (or use --rsync-from) and incremental make.",
+    )
     ap.add_argument("--no-wait", action="store_true")
     ap.add_argument("--setup-timeout", type=int, default=7200)
     ap.add_argument("--poll-interval", type=int, default=30)
@@ -131,19 +122,22 @@ def main() -> None:
     all_roles = receiver_roles + sender_roles
 
     config = _replica_config([receiver_internal[r] for r in receiver_roles], REPLICA_PORT)
-    bundle_files = {"dynaconfig": config, "trace/run1": DYNA_TRACE}
+    trace = bench_trace.trace_micro_bytes()
+    bundle_files = {
+        "dynaconfig": config,
+        bench_trace.TRACE_MICRO_FILENAME: trace,
+    }
 
     ssh_key = args.ssh_key or None
     rsync_path = args.rsync_from.strip()
-    use_rsync = bool(rsync_path) and not args.skip_build
-    if use_rsync:
+    if rsync_path:
         if not os.path.isdir(rsync_path):
             sys.exit(f"--rsync-from not a directory: {rsync_path}")
         rsync_root = os.path.abspath(rsync_path)
         use_git = False
     else:
         rsync_root = None
-        use_git = not args.skip_build
+        use_git = True
     git_ref = args.git_ref.strip()
 
     print("Waiting for SSH...")
@@ -155,11 +149,18 @@ def main() -> None:
             if not fut.result():
                 sys.exit(f"SSH timeout for {futs[fut]}")
 
-    mode = (
-        "wire-only"
-        if args.skip_build
-        else (f"git clone {gcp_remote_setup.IONIA_GIT_URL}" if use_git else "rsync+nohup")
-    )
+    if args.skip_build:
+        mode = (
+            f"git pull + make ({gcp_remote_setup.IONIA_GIT_URL})"
+            if use_git
+            else "rsync + incremental make"
+        )
+    else:
+        mode = (
+            f"git clone {gcp_remote_setup.IONIA_GIT_URL}"
+            if use_git
+            else "rsync + full build"
+        )
     print(f"Launching remote setup on {len(all_roles)} VM(s) ({mode})...")
 
     def _deploy(role: str) -> Tuple[str, str]:

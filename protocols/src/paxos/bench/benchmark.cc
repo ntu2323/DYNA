@@ -30,6 +30,7 @@
 
 #include "bench/benchmark.h"
 #include "common/client.h"
+#include "lib/assert.h"
 #include "lib/latency.h"
 #include "lib/message.h"
 #include "lib/transport.h"
@@ -101,6 +102,9 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
         string key = std::string(key_ptr, KEY_SIZE);
         assert(op.length() == OPCODE_SIZE);
         assert(key.length() == KEY_SIZE);
+        if (op[0] == 'r' || op[0] == 'R') {
+            continue;
+        }
         operations.push_back(std::make_pair(op, key));
 
         // load 100 more requests from the file 
@@ -111,8 +115,12 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
 
         // Notice("op: %s key:%s", operations.back().first.c_str(), operations.back().second.c_str());
     }
-    Notice("Loaded %lu operations (numrequests = %d) from tracefile: %s",
-     operations.size(), numRequests, traceFile.c_str());
+    if (operations.empty()) {
+        Panic("No write operations in tracefile %s", traceFile.c_str());
+    }
+
+    Notice("Loaded %lu trace ops (numrequests = %d, cycles trace) from tracefile: %s",
+           operations.size(), numRequests, traceFile.c_str());
 }
 
 void

@@ -44,7 +44,7 @@ SKIP_BUILD="${SKIP_BUILD:-0}"
 
 install_config() {
   cp "${SETUP_BUNDLE}/dynaconfig" ~/bench/dynaconfig
-  cp "${SETUP_BUNDLE}/trace/run1" ~/bench/trace/run1
+  cp "${SETUP_BUNDLE}/trace.micro" ~/bench/trace.micro
 }
 
 install_helpers() {
@@ -80,16 +80,15 @@ cd "${HOME}/Ionia/protocols/src/ionia"
 mkdir -p ~/bench
 pkill -f '[b]ench/client' 2>/dev/null || true
 sleep 1
-TRACE_PREFIX=~/bench/trace/run
-if [[ ! -f "${TRACE_PREFIX}1" ]]; then
-  echo "Missing ${TRACE_PREFIX}1" >&2
+if [[ ! -f ~/bench/trace.micro ]]; then
+  echo "Missing ~/bench/trace.micro" >&2
   exit 1
 fi
 nohup ./bench/client \
   -s ~/bench/dynaconfig \
   -c ~/bench/dynaconfig \
   -m dyna \
-  -k "${TRACE_PREFIX}" \
+  -k ~/bench/trace.micro \
   -n "${NUM_OPS}" \
   -e "${EXPERIMENT_SECS}" \
   -w "${WARMUP_SECS}" \
@@ -127,13 +126,20 @@ build_dyna() {
 }
 
 install_ssh_from_bundle
-mkdir -p ~/bench/trace
+mkdir -p ~/bench
 install_config
 install_helpers
 echo "SSH keys and config installed for role=${ROLE} (USE_GIT=${USE_GIT})"
 
 if [[ "${SKIP_BUILD}" == "1" ]]; then
-  echo "SKIP_BUILD=1 — skipping apt/git/compile"
+  echo "SKIP_BUILD=1 — git update + incremental compile (image deps; no apt/folly)"
+  if [[ "${USE_GIT}" == "1" ]]; then
+    ensure_ionia_repo
+  elif [[ ! -d "${IONIA_DIR}" ]]; then
+    echo "Missing ${IONIA_DIR} (USE_GIT=0). Run full setup, --rsync-from, or set USE_GIT=1." >&2
+    exit 1
+  fi
+  build_dyna
 else
   install_apt_deps
   ensure_ionia_repo

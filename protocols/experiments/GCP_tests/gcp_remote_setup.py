@@ -331,10 +331,12 @@ def deploy_role(
     use_git: bool,
     git_ref: str = "",
 ) -> str:
-    if rsync_from and not skip_build and not use_git:
+    if rsync_from and not use_git:
         print(f"  [{role}] rsync {rsync_from} -> {host}:~/Ionia/ (USE_GIT=0)")
         rsync_ionia(rsync_from, host, ssh_user, ssh_key)
-    elif use_git and not skip_build:
+    elif use_git and skip_build:
+        print(f"  [{role}] will git pull {IONIA_GIT_URL} on VM")
+    elif use_git:
         print(f"  [{role}] will git clone {IONIA_GIT_URL} on VM")
     with tempfile.TemporaryDirectory(prefix=f"gcp_setup_{role}_") as tmp:
         bundle_dir = os.path.join(tmp, "bundle")
