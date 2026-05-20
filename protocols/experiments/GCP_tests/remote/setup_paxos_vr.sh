@@ -61,7 +61,7 @@ IDX="${1:?replica index 0|1|2}"
 BATCH="${2:-1}"
 cd "${HOME}/Ionia/protocols/src/paxos"
 mkdir -p ~/bench
-pkill -f 'bench/replica' 2>/dev/null || true
+pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
 nohup ./bench/replica -i "${IDX}" -b "${BATCH}" -c ~/bench/vrconfig -m vr \
   > ~/bench/replica-"${IDX}".log 2>&1 &
@@ -79,7 +79,7 @@ EXPERIMENT_SECS="${3:-60}"
 WARMUP_SECS="${4:-5}"
 cd "${HOME}/Ionia/protocols/src/paxos"
 mkdir -p ~/bench
-pkill -f 'bench/client' 2>/dev/null || true
+pkill -f '[b]ench/client' 2>/dev/null || true
 sleep 1
 if [[ ! -f ~/bench/trace.micro ]]; then
   echo "Missing ~/bench/trace.micro" >&2

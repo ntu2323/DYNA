@@ -27,16 +27,6 @@ SlowPathDebugEnabled()
     return enabled;
 }
 
-static bool
-ForceSlowPathEnabled()
-{
-    static const bool enabled = []() {
-        const char *v = std::getenv("DYNA_FORCE_SLOWPATH");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
-}
-
 static std::string
 WalDirFromEnv()
 {
@@ -306,11 +296,10 @@ DynaReplica::HandleRequest(const TransportAddress &remote, const proto::RequestM
     state.requestClients[KeyOf(req)] = std::shared_ptr<TransportAddress>(remote.clone());
     state.latBuffer[KeyOf(req)] = req;
 
-    const bool forceSlowPath = ForceSlowPathEnabled();
-    if (req.deadline_us() <= state.deadlineCounter || forceSlowPath) {
+    if (req.deadline_us() <= state.deadlineCounter) {
         if (AmLeader(partitionId)) {
-            if (forceSlowPath && SlowPathDebugEnabled()) {
-                Notice("DYNA slowpath forced req=(%lu,%lu) part=%u deadline=%lu counter=%lu",
+            if (SlowPathDebugEnabled()) {
+                Notice("DYNA slowpath req=(%lu,%lu) part=%u deadline=%lu counter=%lu",
                        req.client_id(),
                        req.request_id(),
                        partitionId,

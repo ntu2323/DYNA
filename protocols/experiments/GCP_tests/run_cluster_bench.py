@@ -23,9 +23,11 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from gcp_bench_common import (
+    PKILL_CLIENT,
+    PKILL_REPLICA,
+    fetch_remote_file,
     load_hosts_file,
     receiver_index,
-    scp_from_remote,
     sender_client_id,
     ssh_run,
 )
@@ -49,7 +51,20 @@ PROTOCOLS = {
 
 
 def _remote_run_dir(run_id: str) -> str:
-    return f"${{HOME}}/bench/runs/{run_id}"
+    """Path for remote bash ($HOME expanded by the shell)."""
+    return f"$HOME/bench/runs/{run_id}"
+
+
+def _remote_run_dir_scp(run_id: str) -> str:
+    """Path for scp (~ expanded by sshd on the remote)."""
+    return f"~/bench/runs/{run_id}"
+
+
+def _bash_word(word: str) -> str:
+    """Bash word for bash -lc: allow $HOME expansion; quote other values safely."""
+    if "$HOME" in word:
+        return word
+    return shlex.quote(word)
 
 
 def _build_client_cmd(
@@ -65,17 +80,17 @@ def _build_client_cmd(
 ) -> str:
     run_dir = _remote_run_dir(run_id)
     cfg = PROTOCOLS[protocol]
+    # Do not pkill here — the same ssh -c string contains bench/client and pkill would kill the shell.
     base = (
         f"mkdir -p {run_dir} && "
         f"cd {cfg['client_cwd']} && "
-        f"pkill -f 'bench/client' 2>/dev/null || true; sleep 1 && "
         f"nohup {cfg['client_bin']}"
     )
     if protocol == "vr":
         args = [
-            "-c", "~/bench/vrconfig",
+            "-c", "$HOME/bench/vrconfig",
             "-m", "vr",
-            "-k", "~/bench/trace.micro",
+            "-k", "$HOME/bench/trace.micro",
             "-n", str(num_ops),
             "-e", str(experiment_sec),
             "-w", str(warmup_sec),
@@ -85,10 +100,10 @@ def _build_client_cmd(
         ]
     else:
         args = [
-            "-s", "~/bench/dynaconfig",
-            "-c", "~/bench/dynaconfig",
+            "-s", "$HOME/bench/dynaconfig",
+            "-c", "$HOME/bench/dynaconfig",
             "-m", "dyna",
-            "-k", "~/bench/trace/run",
+            "-k", "$HOME/bench/trace/run",
             "-n", str(num_ops),
             "-e", str(experiment_sec),
             "-w", str(warmup_sec),
@@ -97,7 +112,7 @@ def _build_client_cmd(
             "-i", str(interval_ms),
             "-l", f"{run_dir}/latencies",
         ]
-    quoted = " ".join(shlex.quote(a) for a in args)
+    quoted = " ".join(_bash_word(a) for a in args)
     return (
         f"{base} {quoted} "
         f"> {run_dir}/client.log 2>&1; "
@@ -118,7 +133,7 @@ def _start_replica(
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
     parts = [
-        "pkill -f 'bench/replica' 2>/dev/null || true",
+        PKILL_REPLICA,
         "sleep 1",
     ]
     if reset_rocksdb and cfg["replica_cleanup"]:
@@ -127,7 +142,7 @@ def _start_replica(
     cmd = "; ".join(parts)
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     ok = r.returncode == 0
-    err = (r.stderr or r.stdout or "").strip()
+    err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
     return role, ok, err
 
 
@@ -141,11 +156,17 @@ def _start_client(
     client_args: dict,
 ) -> tuple[str, bool, str]:
     mid = sender_client_id(role)
+    # Separate SSH: pkill must not share a command line with ./bench/client.
+    r0 = ssh_run(host, ssh_user, ssh_key, f"{PKILL_CLIENT}; sleep 1")
+    if r0.returncode != 0:
+        err = (r0.stderr or r0.stdout or "").strip() or f"ssh exit {r0.returncode}"
+        return role, False, f"stop old client: {err}"
+
     inner = _build_client_cmd(protocol, run_id, machine_id=mid, **client_args)
     cmd = f"bash -lc {shlex.quote(inner)}"
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     ok = r.returncode == 0
-    err = (r.stderr or r.stdout or "").strip()
+    err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
     return role, ok, err
 
 
@@ -157,17 +178,17 @@ def _wait_client(
     ssh_key: Optional[str],
     timeout_sec: int,
 ) -> tuple[str, bool, str]:
-    run_dir = _remote_run_dir(run_id).replace("${HOME}", "$HOME")
+    run_dir = _remote_run_dir(run_id)
+    # Avoid pgrep in this ssh -c string (would match bench/client in argv). Use done/exit_code only.
     cmd = (
         f"for i in $(seq 1 {timeout_sec}); do "
         f"test -f {run_dir}/done && exit 0; "
-        f"pgrep -f 'bench/client' >/dev/null || "
-        f"{{ test -f {run_dir}/exit_code && exit 0; }}; "
+        f"test -f {run_dir}/exit_code && exit 0; "
         f"sleep 1; done; exit 1"
     )
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     ok = r.returncode == 0
-    err = (r.stderr or r.stdout or "").strip()
+    err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
     return role, ok, err
 
 
@@ -179,11 +200,11 @@ def _fetch_logs(
     ssh_user: str,
     ssh_key: Optional[str],
 ) -> tuple[str, bool, str]:
-    run_dir = _remote_run_dir(run_id).replace("${HOME}", "$HOME")
+    run_dir = _remote_run_dir_scp(run_id)
     local_sender = os.path.join(local_run_dir, role)
     os.makedirs(local_sender, exist_ok=True)
     try:
-        scp_from_remote(
+        fetch_remote_file(
             host,
             ssh_user,
             ssh_key,
@@ -194,12 +215,13 @@ def _fetch_logs(
             remote = f"{run_dir}/{name}"
             r = ssh_run(host, ssh_user, ssh_key, f"test -f {remote} && echo yes")
             if "yes" in (r.stdout or ""):
-                scp_from_remote(
+                fetch_remote_file(
                     host,
                     ssh_user,
                     ssh_key,
                     remote,
                     os.path.join(local_sender, name),
+                    binary=(name == "latencies"),
                 )
         return role, True, ""
     except subprocess.CalledProcessError as e:

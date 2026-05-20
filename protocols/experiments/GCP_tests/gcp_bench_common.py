@@ -10,6 +10,11 @@ from typing import Dict, List, Optional, Tuple
 
 NUM_RECEIVERS = 3
 
+# Bracket trick: avoid pkill -f matching the ssh remote command line (contains "bench/replica").
+PKILL_REPLICA = "pkill -f '[b]ench/replica' 2>/dev/null || true"
+PKILL_CLIENT = "pkill -f '[b]ench/client' 2>/dev/null || true"
+PGREP_CLIENT = "pgrep -f '[b]ench/client' >/dev/null"
+
 
 def ssh_common_opts() -> List[str]:
     return [
@@ -47,11 +52,47 @@ def scp_from_remote(
     remote_path: str,
     local_path: str,
 ) -> None:
+    """remote_path must use ~/... (scp does not expand $HOME on the remote)."""
     cmd = ["scp", *ssh_common_opts()]
     if ssh_key:
         cmd.extend(["-i", ssh_key])
     cmd.extend([f"{ssh_user}@{host}:{remote_path}", local_path])
     subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
+def fetch_remote_file(
+    host: str,
+    ssh_user: str,
+    ssh_key: Optional[str],
+    remote_path: str,
+    local_path: str,
+    *,
+    binary: bool = False,
+) -> None:
+    """Copy a remote file via scp (~ paths), falling back to ssh cat / base64."""
+    try:
+        scp_from_remote(host, ssh_user, ssh_key, remote_path, local_path)
+        return
+    except subprocess.CalledProcessError:
+        pass
+
+    if binary:
+        import base64
+
+        r = ssh_run(host, ssh_user, ssh_key, f"base64 {remote_path}")
+        if r.returncode != 0:
+            err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
+            raise subprocess.CalledProcessError(r.returncode, f"fetch {remote_path}", err)
+        with open(local_path, "wb") as f:
+            f.write(base64.b64decode("".join(r.stdout.split())))
+        return
+
+    r = ssh_run(host, ssh_user, ssh_key, f"cat {remote_path}")
+    if r.returncode != 0:
+        err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
+        raise subprocess.CalledProcessError(r.returncode, f"fetch {remote_path}", err)
+    with open(local_path, "w", encoding="utf-8") as f:
+        f.write(r.stdout)
 
 
 def load_hosts_file(path: str) -> Tuple[Dict[str, str], Dict[str, str]]:

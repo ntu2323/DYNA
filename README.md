@@ -10,9 +10,9 @@ docker build --platform linux/amd64 -f docker/Dockerfile.udp -t ionia-udp .
 SMOKE_PROTOCOL=dyna ./docker/docker-smoke.sh
 ```
 
-### Slow path forced debug
+### Slow path debug logging
 ```bash
-SMOKE_PROTOCOL=dyna DYNA_SLOWPATH_DEBUG=1 DYNA_FORCE_SLOWPATH=1 ./docker/docker-smoke.sh
+SMOKE_PROTOCOL=dyna DYNA_SLOWPATH_DEBUG=1 ./docker/docker-smoke.sh
 ```
 
 ### Disk writing
@@ -54,10 +54,10 @@ For DYNA smoke, the script also forces **`IONIA_DB_MODE=memory`** to avoid stale
 DYNA smoke also points bench-client `-c` at the replica config (`sample/config`) so client traffic targets active replica ports.
 The Docker wrapper now forwards `DYNA_*` environment variables into the container, so debug/bound overrides work as expected.
 
-Force slow-path validation:
+Slow-path debug logging (natural `deadline_us <= deadlineCounter` only; no forced slow path):
 
 ```bash
-SMOKE_PROTOCOL=dyna DYNA_SLOWPATH_DEBUG=1 DYNA_FORCE_SLOWPATH=1 ./docker/docker-smoke.sh
+SMOKE_PROTOCOL=dyna DYNA_SLOWPATH_DEBUG=1 ./docker/docker-smoke.sh
 ```
 
 Inside an interactive container (`docker run ... ionia-udp`), run `SMOKE_PROTOCOL=dyna ./docker/run_udp_smoke.sh`.

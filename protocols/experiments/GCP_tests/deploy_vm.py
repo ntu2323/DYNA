@@ -100,7 +100,7 @@ def create_vm(
 
     # Full URLs required by the API
     machine_type_url = f"zones/{zone}/machineTypes/{machine_type}"
-    source_image = f"projects/{image_project}/global/images/family/{image_family}"
+    source_image = f"projects/{image_project}/global/images/{image_family}"
 
     # Boot disk (minimal like example: boot, autoDelete, sourceImage only; size = API default)
     disk = compute_v1.AttachedDisk()

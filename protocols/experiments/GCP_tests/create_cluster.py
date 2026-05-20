@@ -39,6 +39,9 @@ _REQUIREMENTS = os.path.join(_SCRIPT_DIR, "requirements-deploy.txt")
 
 # Match create_networktp_cluster.py: replica/receiver nodes use c4-standard-2.
 RECEIVER_MACHINE_TYPE = "c4-standard-2"
+RECIEVER_FAMILY = "reciever1"
+SENDER_FAMILY = "sender1"
+IMAGE_PROJECT = "corfu-488815"
 NUM_RECEIVERS = 3
 
 
@@ -70,9 +73,15 @@ def create_cluster(machine_count: int, name_prefix: str = "ionia") -> Dict[str, 
             ip = deploy_vm.create_vm(
                 instance_name=instance_name,
                 machine_type=RECEIVER_MACHINE_TYPE,
+                image_family=RECIEVER_FAMILY,
+                image_project=IMAGE_PROJECT,
             )
         else:
-            ip = deploy_vm.create_vm(instance_name=instance_name)
+            ip = deploy_vm.create_vm(
+                instance_name=instance_name,
+                image_family=SENDER_FAMILY,
+                image_project=IMAGE_PROJECT,
+            )
         if not ip:
             raise SystemExit(
                 f"Failed to obtain external IP for role '{role}' "
