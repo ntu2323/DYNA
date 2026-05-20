@@ -322,37 +322,37 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote, const std::string_vi
     }
     if (type == syncBroadcastName) {
         ALLOCATE_MESSAGE(proto::SyncBroadcast, sb);
-        if (!sb->ParseFromString(data)) {
+        if (!sb->ParseFromArray(data.data(), data.size())) {
             return;
         }
         EnqueueCommit(sb->partition_id(), InboundKind::SYNC_BROADCAST, remote, data);
     } else if (type == syncAckName) {
         ALLOCATE_MESSAGE(proto::SyncAck, ack);
-        if (!ack->ParseFromString(data)) {
+        if (!ack->ParseFromArray(data.data(), data.size())) {
             return;
         }
         EnqueueCommit(ack->partition_id(), InboundKind::SYNC_ACK, remote, data);
     } else if (type == commitBroadcastName) {
         ALLOCATE_MESSAGE(proto::CommitBroadcast, cb);
-        if (!cb->ParseFromString(data)) {
+        if (!cb->ParseFromArray(data.data(), data.size())) {
             return;
         }
         EnqueueCommit(cb->partition_id(), InboundKind::COMMIT_BROADCAST, remote, data);
     } else if (type == lateSyncName) {
         ALLOCATE_MESSAGE(proto::LateSyncBroadcast, lsb);
-        if (!lsb->ParseFromString(data)) {
+        if (!lsb->ParseFromArray(data.data(), data.size())) {
             return;
         }
         EnqueueCommit(lsb->partition_id(), InboundKind::LATE_SYNC_BROADCAST, remote, data);
     } else if (type == fetchRequestName) {
         ALLOCATE_MESSAGE(proto::FetchRequest, fr);
-        if (!fr->ParseFromString(data)) {
+        if (!fr->ParseFromArray(data.data(), data.size())) {
             return;
         }
         EnqueueCommit(fr->partition_id(), InboundKind::FETCH_REQUEST, remote, data);
     } else if (type == fetchResponseName) {
         ALLOCATE_MESSAGE(proto::FetchResponse, fr);
-        if (!fr->ParseFromString(data)) {
+        if (!fr->ParseFromArray(data.data(), data.size())) {
             return;
         }
         EnqueueCommit(fr->partition_id(), InboundKind::FETCH_RESPONSE, remote, data);
