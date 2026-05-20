@@ -152,8 +152,7 @@ int main(int argc, char **argv)
         {
             char *strtolPtr;
             numRequests = strtoul(optarg, &strtolPtr, 10);
-            if ((*optarg == '\0') || (*strtolPtr != '\0') ||
-                (numRequests <= 0))
+            if ((*optarg == '\0') || (*strtolPtr != '\0'))
             {
                 fprintf(stderr,
                         "option -n requires a numeric arg\n");
@@ -180,8 +179,7 @@ int main(int argc, char **argv)
         {
             char *strtolPtr;
             warmupSec = strtoul(optarg, &strtolPtr, 10);
-            if ((*optarg == '\0') || (*strtolPtr != '\0') ||
-                (numRequests <= 0))
+            if ((*optarg == '\0') || (*strtolPtr != '\0'))
             {
                 fprintf(stderr,
                         "option -w requires a numeric arg\n");
@@ -240,6 +238,10 @@ int main(int argc, char **argv)
     }
     if (openLoop && delay != 0) {
         fprintf(stderr, "open-loop mode (-O) cannot be used with -d delay\n");
+        Usage(argv[0]);
+    }
+    if (!openLoop && numRequests <= 0) {
+        fprintf(stderr, "closed-loop mode requires -n <max-requests> > 0\n");
         Usage(argv[0]);
     }
 
