@@ -47,8 +47,8 @@ Skips apt, Folly, Splinter/RocksDB bootstrap. Still runs **`git pull`** (or uses
 
 ```bash
 # Push to GitHub first, then:
-SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
-SSH_USER=$SSH_USER python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=nathan python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=nathan python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
 
 # Or rsync local Ionia without push:
 IONIA_REPO_ROOT=/path/to/Ionia SSH_USER=$SSH_USER python3 setup_dyna_cluster.py \
@@ -69,11 +69,11 @@ Stop the other protocol’s replicas before switching (VR ↔ DYNA).
 
 ```bash
 # VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
-SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
+SSH_USER=nathan python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
   -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
 
 # DYNA — same defaults
-SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
+SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
   -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
 
 # Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)
