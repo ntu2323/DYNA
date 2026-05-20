@@ -1,39 +1,7 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
-/***********************************************************************
- *
- * benchmark.cpp:
- *   simple replication benchmark client
- * 
- * Copyright 2021 Aishwarya Ganesan and Ramnatthan Alagappan
- *
- * Small changes made to the code to implement Skyros
- *
- * *************************************************************
- * Copyright 2013 Dan R. K. Ports  <drkp@cs.washington.edu>
- *
- * Permission is hereby granted, free of charge, to any person
- * obtaining a copy of this software and associated documentation
- * files (the "Software"), to deal in the Software without
- * restriction, including without limitation the rights to use, copy,
- * modify, merge, publish, distribute, sublicense, and/or sell copies
- * of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
- **********************************************************************/
 
 #include "bench/benchmark.h"
+
 #include "common/client.h"
 #include "lib/assert.h"
 #include "lib/latency.h"
@@ -41,18 +9,22 @@
 #include "lib/transport.h"
 #include "lib/timeval.h"
 
-#include <sys/time.h>
-#include <string>
-#include <sstream>
-#include <chrono>
-#include <algorithm>
-#include <iomanip>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <sys/types.h>
 #include <fcntl.h>
+#include <mutex>
+#include <random>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <iomanip>
+#include <iostream>
+#include <sstream>
+#include <string>
 
 #define OPCODE_SIZE 1
 #define KEY_SIZE 24
@@ -65,19 +37,53 @@ DEFINE_LATENCY(op);
 BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
                                  int numRequests_, uint64_t delay,
                                  int warmupSec,
-				 int tputInterval,
-                 string traceFile,
-                 int experimentDuration,
-                 bool logLatency,
-                 string latencyFilename)
-    : tputInterval(tputInterval), client(client),
-    transport(transport), numRequests(numRequests_),
-    delay(delay), warmupSec(warmupSec), traceFile(traceFile),
-    experimentDuration(experimentDuration), logLatency(logLatency), latencyFilename(latencyFilename)
+                                 int tputInterval,
+                                 string traceFile,
+                                 int experimentDuration,
+                                 bool logLatency,
+                                 string latencyFilename,
+                                 bool openLoop,
+                                 int poissonRate,
+                                 uint64_t poissonSeed)
+    : tputInterval(tputInterval),
+      client(client),
+      transport(transport),
+      numRequests(numRequests_),
+      delay(delay),
+      warmupSec(warmupSec),
+      traceFile(traceFile),
+      experimentDuration(experimentDuration),
+      logLatency(logLatency),
+      latencyFilename(latencyFilename),
+      openLoop_(openLoop),
+      poissonRate_(poissonRate),
+      submitSeq_(0),
+      totalSubmitted_(0),
+      poissonIdx_(0)
 {
-    if (delay != 0) {
-        Notice("Delay between requests: %ld ms", delay);
+    if (openLoop_) {
+        if (poissonRate_ <= 0) {
+            Panic("Open-loop mode requires poisson rate > 0 (-R)");
+        }
+        poissonTrace_.resize(1000, 0);
+        std::default_random_engine generator(static_cast<uint32_t>(poissonSeed));
+        std::poisson_distribution<int> distribution(poissonRate_);
+        for (size_t i = 0; i < poissonTrace_.size(); ++i) {
+            const int reqNum = distribution(generator);
+            poissonTrace_[i] = reqNum > 0 ? static_cast<uint32_t>(reqNum) : 0;
+        }
+        const double offeredPerSec =
+            (static_cast<double>(poissonRate_) * 1000.0) / kOpenLoopIntervalMs;
+        Notice("Open-loop client: poisson rate %d reqs/%dms (~%.0f offered ops/s)",
+               poissonRate_,
+               kOpenLoopIntervalMs,
+               offeredPerSec);
+    } else if (delay != 0) {
+        Notice("Closed-loop client: delay between requests %lu ms", delay);
+    } else {
+        Notice("Closed-loop client: send next request after each completion");
     }
+
     started = false;
     done = false;
     cooldownDone = false;
@@ -89,19 +95,19 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
     struct stat stat_buf;
     int rc = 0;
     assert(!(rc = stat(traceFile.c_str(), &stat_buf)));
-    void* vaddr =  mmap(NULL, stat_buf.st_size, PROT_READ, MAP_SHARED , traceFd, 0);
+    void *vaddr = mmap(NULL, stat_buf.st_size, PROT_READ, MAP_SHARED, traceFd, 0);
 
     size_t off = 0;
-    char* curr = (char*) vaddr;
+    char *curr = (char *)vaddr;
     messages.reserve(32);
     opcodes.reserve(32);
 
-    while (off < (uint32_t) stat_buf.st_size) {
-        char* op_ptr = curr;
+    while (off < (uint32_t)stat_buf.st_size) {
+        char *op_ptr = curr;
         curr += OPCODE_SIZE + 1;
         off += OPCODE_SIZE + 1;
 
-        char* key_ptr = curr;
+        char *key_ptr = curr;
         curr += KEY_SIZE + 1;
         off += KEY_SIZE + 1;
 
@@ -136,7 +142,7 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
     }
 
     if (logLatency) {
-        latencies.reserve(numRequests);
+        latencies.reserve(openLoop_ ? 100000 : static_cast<size_t>(numRequests));
     } else {
         for (auto i = 0; i < 1000; i++) {
             latencies.push_back(1);
@@ -144,51 +150,101 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
     }
 
     Notice("Loaded %lu trace ops (numrequests = %d, cycles trace) from tracefile: %s",
-           messages.size(), numRequests, traceFile.c_str());
+           messages.size(),
+           numRequests,
+           traceFile.c_str());
+}
+
+bool
+BenchmarkClient::ExperimentElapsed() const
+{
+    if (!started) {
+        return false;
+    }
+    const auto now = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration_cast<std::chrono::seconds>(now - expStartTime).count() >=
+           experimentDuration;
+}
+
+bool
+BenchmarkClient::MaySubmitMore() const
+{
+    if (numRequests <= 0) {
+        return true;
+    }
+    return totalSubmitted_ < static_cast<uint64_t>(numRequests);
+}
+
+void
+BenchmarkClient::MaybeFinishExperiment()
+{
+    if (!started || done || cooldownDone) {
+        return;
+    }
+    if (ExperimentElapsed()) {
+        Notice("Experiment duration elapsed (submitted=%lu completed=%d).",
+               static_cast<unsigned long>(totalSubmitted_),
+               n);
+        Finish();
+    }
 }
 
 void
 BenchmarkClient::Start()
 {
     n = 0;
-    transport.Timer(warmupSec * 1000,
-                    std::bind(&BenchmarkClient::WarmupDone,
-                               this));
+    totalSubmitted_ = 0;
+    submitSeq_ = 0;
+    poissonIdx_ = 0;
+    inflightStartNs_.clear();
+
+    transport.Timer(warmupSec * 1000, std::bind(&BenchmarkClient::WarmupDone, this));
 
     if (tputInterval > 0) {
-	msSinceStart = 0;
-	opLastInterval = n;
-	transport.Timer(tputInterval, std::bind(&BenchmarkClient::TimeInterval,
-						this));
+        msSinceStart = 0;
+        opLastInterval = n;
+        transport.Timer(tputInterval, std::bind(&BenchmarkClient::TimeInterval, this));
     }
     expStartTime = std::chrono::high_resolution_clock::now();
-    SendNext();
+
+    if (openLoop_) {
+        OpenLoopTick();
+    } else {
+        SendNext();
+    }
 }
 
 void
 BenchmarkClient::TimeInterval()
 {
     if (done) {
-	return;
+        return;
     }
 
     struct timeval tv;
     gettimeofday(&tv, NULL);
     msSinceStart += tputInterval;
-    Notice("Completed %d requests at %lu ms", n-opLastInterval, (((tv.tv_sec*1000000+tv.tv_usec)/1000)/10)*10);
+    Notice("Completed %d requests at %lu ms", n - opLastInterval, (((tv.tv_sec * 1000000 + tv.tv_usec) / 1000) / 10) * 10);
     opLastInterval = n;
-    transport.Timer(tputInterval, std::bind(&BenchmarkClient::TimeInterval,
-					    this));
+    transport.Timer(tputInterval, std::bind(&BenchmarkClient::TimeInterval, this));
 }
 
 void
 BenchmarkClient::WarmupDone()
 {
     started = true;
-    Notice("Completed warmup period of %d seconds with %d requests",
-           warmupSec, n);
+    Notice("Completed warmup period of %d seconds with %d completions (%lu submitted)",
+           warmupSec,
+           n,
+           static_cast<unsigned long>(totalSubmitted_));
     gettimeofday(&startTime, NULL);
     n = 0;
+    opLastInterval = 0;
+    expStartTime = std::chrono::high_resolution_clock::now();
+
+    if (!openLoop_) {
+        SendNext();
+    }
 }
 
 void
@@ -201,7 +257,12 @@ BenchmarkClient::CooldownDone()
     std::vector<uint64_t> sorted = latencies;
     std::sort(sorted.begin(), sorted.end());
 
-    uint64_t ns = sorted[sorted.size()/2];
+    if (sorted.empty()) {
+        Notice("No latency samples recorded.");
+        return;
+    }
+
+    uint64_t ns = sorted[sorted.size() / 2];
     LatencyFmtNS(ns, buf);
     Notice("Median latency is %ld ns (%s)", ns, buf);
 
@@ -213,17 +274,73 @@ BenchmarkClient::CooldownDone()
     LatencyFmtNS(ns, buf);
     Notice("Average latency is %ld ns (%s)", ns, buf);
 
-    ns = sorted[sorted.size()*90/100];
+    ns = sorted[sorted.size() * 90 / 100];
     LatencyFmtNS(ns, buf);
     Notice("90th percentile latency is %ld ns (%s)", ns, buf);
 
-    ns = sorted[sorted.size()*95/100];
+    ns = sorted[sorted.size() * 95 / 100];
     LatencyFmtNS(ns, buf);
     Notice("95th percentile latency is %ld ns (%s)", ns, buf);
 
-    ns = sorted[sorted.size()*99/100];
+    ns = sorted[sorted.size() * 99 / 100];
     LatencyFmtNS(ns, buf);
     Notice("99th percentile latency is %ld ns (%s)", ns, buf);
+}
+
+void
+BenchmarkClient::SubmitOne()
+{
+    if (messages.empty() || !MaySubmitMore()) {
+        return;
+    }
+
+    const size_t opIdx = static_cast<size_t>(totalSubmitted_) % messages.size();
+    const uint64_t submitId = ++submitSeq_;
+    totalSubmitted_++;
+
+    if (logLatency) {
+        const auto now = std::chrono::steady_clock::now();
+        inflightStartNs_[submitId] =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
+    }
+
+    if (openLoop_) {
+        client.Invoke(messages[opIdx],
+                      [this, submitId](const string &request, const string &reply) {
+                          OnReplyOpen(submitId, request, reply);
+                      });
+    } else {
+        Latency_Start(&latency);
+        client.Invoke(messages[opIdx],
+                      std::bind(&BenchmarkClient::OnReply,
+                                this,
+                                std::placeholders::_1,
+                                std::placeholders::_2));
+    }
+}
+
+void
+BenchmarkClient::OpenLoopTick()
+{
+    if (done || cooldownDone) {
+        return;
+    }
+
+    const uint32_t reqNum = poissonTrace_[poissonIdx_ % poissonTrace_.size()];
+    poissonIdx_++;
+
+    for (uint32_t j = 0; j < reqNum; ++j) {
+        if (!MaySubmitMore()) {
+            break;
+        }
+        SubmitOne();
+    }
+
+    MaybeFinishExperiment();
+    if (!done) {
+        transport.Timer(kOpenLoopIntervalMs,
+                        std::bind(&BenchmarkClient::OpenLoopTick, this));
+    }
 }
 
 void
@@ -235,48 +352,66 @@ BenchmarkClient::SendNext()
     if (started && n >= numRequests) {
         return;
     }
+    SubmitOne();
+}
 
-    const size_t opIdx = static_cast<size_t>(n) % messages.size();
-    Latency_Start(&latency);
-    client.Invoke(messages[opIdx],
-                  std::bind(&BenchmarkClient::OnReply,
-                            this,
-                            std::placeholders::_1,
-                            std::placeholders::_2));
+void
+BenchmarkClient::OnReplyOpen(uint64_t submitId, const string &request, const string &reply)
+{
+    (void)request;
+    (void)reply;
+    if (cooldownDone) {
+        return;
+    }
+
+    if (logLatency) {
+        auto it = inflightStartNs_.find(submitId);
+        if (it != inflightStartNs_.end()) {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t endNs =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch())
+                    .count();
+            latencies.push_back(endNs - it->second);
+            inflightStartNs_.erase(it);
+        }
+    }
+
+    n++;
+    if (started && !done) {
+        MaybeFinishExperiment();
+    }
 }
 
 void
 BenchmarkClient::OnReply(const string &request, const string &reply)
 {
+    (void)request;
+    (void)reply;
     if (cooldownDone) {
         return;
     }
 
     n++;
     if ((started) && (!done) && (n != 0)) {
-    	uint64_t ns = Latency_End(&latency);
-        if (logLatency)
-        {
-        	latencies.push_back(ns);
+        uint64_t ns = Latency_End(&latency);
+        if (logLatency) {
+            latencies.push_back(ns);
         }
-    	if (n >= numRequests) {
-    	    Finish();
-    	}
-
-        auto current_time = std::chrono::high_resolution_clock::now();
-        if (std::chrono::duration_cast<std::chrono::seconds>(current_time 
-            - expStartTime).count() >= experimentDuration) {
-			Notice("Experiment duration elasped. Exiting.");
+        if (n >= numRequests) {
             Finish();
         }
+
+        MaybeFinishExperiment();
+        if (done) {
+            return;
+        }
     }
-    
+
     if (delay == 0) {
-       SendNext();
+        SendNext();
     } else {
-        uint64_t rdelay = rand() % delay*2;
-        transport.Timer(rdelay,
-                        std::bind(&BenchmarkClient::SendNext, this));
+        uint64_t rdelay = rand() % delay * 2;
+        transport.Timer(rdelay, std::bind(&BenchmarkClient::SendNext, this));
     }
 }
 
@@ -286,24 +421,25 @@ void
 BenchmarkClient::Finish()
 {
     std::lock_guard<std::mutex> l(finishLock);
+    if (done) {
+        return;
+    }
     gettimeofday(&endTime, NULL);
 
     struct timeval diff = timeval_sub(endTime, startTime);
 
-    Notice("Completed %d requests in " FMT_TIMEVAL_DIFF " seconds",
-           n, VA_TIMEVAL_DIFF(diff));
+    Notice("Completed %d requests in " FMT_TIMEVAL_DIFF " seconds (submitted=%lu)",
+           n,
+           VA_TIMEVAL_DIFF(diff),
+           static_cast<unsigned long>(totalSubmitted_));
     std::cout << std::endl;
     done = true;
 
-    transport.Timer(warmupSec * 1000,
-                    std::bind(&BenchmarkClient::CooldownDone,
-                              this));
-
+    transport.Timer(warmupSec * 1000, std::bind(&BenchmarkClient::CooldownDone, this));
 
     if (latencyFilename.size() > 0) {
         Latency_FlushTo(latencyFilename.c_str());
     }
 }
-
 
 } // namespace specpaxos

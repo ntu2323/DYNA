@@ -1,58 +1,35 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
-/***********************************************************************
- *
- * benchmark.h:
- *   simple replication benchmark client
- * 
- * Copyright 2021 Aishwarya Ganesan and Ramnatthan Alagappan
- *
- * Small changes made to the code to implement Skyros
- *
- * *************************************************************
- * Copyright 2013 Dan R. K. Ports  <drkp@cs.washington.edu>
- *
- * Permission is hereby granted, free of charge, to any person
- * obtaining a copy of this software and associated documentation
- * files (the "Software"), to deal in the Software without
- * restriction, including without limitation the rights to use, copy,
- * modify, merge, publish, distribute, sublicense, and/or sell copies
- * of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
- *
- **********************************************************************/
+
+#ifndef _BENCHMARK_H_
+#define _BENCHMARK_H_
 
 #include "common/client.h"
 #include "lib/latency.h"
 #include "lib/transport.h"
-#include <vector>
-#include <string>
 #include <chrono>
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace specpaxos {
 
 class BenchmarkClient
 {
 public:
+    static constexpr int kOpenLoopIntervalMs = 10;
+
     BenchmarkClient(Client &client, Transport &transport,
                     int numRequests, uint64_t delay,
                     int warmupSec,
-		    int tputInterval,
-            string traceFile,
-            int experimentDuration,
-            bool logLatency,
-            string latencyFilename = "");
+                    int tputInterval,
+                    string traceFile,
+                    int experimentDuration,
+                    bool logLatency,
+                    string latencyFilename = "",
+                    bool openLoop = false,
+                    int poissonRate = 0,
+                    uint64_t poissonSeed = 1);
     void Start();
     void OnReply(const string &request, const string &reply);
     struct Latency_t latency;
@@ -67,10 +44,17 @@ public:
 
 private:
     void SendNext();
+    void SubmitOne();
+    void OpenLoopTick();
+    void OnReplyOpen(uint64_t submitId, const string &request, const string &reply);
+    void MaybeFinishExperiment();
     void Finish();
     void WarmupDone();
     void CooldownDone();
     void TimeInterval();
+    bool ExperimentElapsed() const;
+    bool MaySubmitMore() const;
+
     Client &client;
     Transport &transport;
     int numRequests;
@@ -85,7 +69,16 @@ private:
     int msSinceStart;
     int opLastInterval;
     std::chrono::time_point<std::chrono::high_resolution_clock> expStartTime;
-    std::vector<std::pair<std::string, std::string>> operations;
+
+    bool openLoop_;
+    int poissonRate_;
+    uint64_t submitSeq_;
+    uint64_t totalSubmitted_;
+    size_t poissonIdx_;
+    std::vector<uint32_t> poissonTrace_;
+    std::unordered_map<uint64_t, uint64_t> inflightStartNs_;
 };
 
 } // namespace specpaxos
+
+#endif /* _BENCHMARK_H_ */

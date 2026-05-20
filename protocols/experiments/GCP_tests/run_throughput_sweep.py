@@ -25,7 +25,13 @@ def main() -> None:
     ap.add_argument("--protocol", choices=["vr", "dyna"], required=True)
     ap.add_argument("--hosts-file", default=os.path.join(_SCRIPT_DIR, "cluster_hosts.json"))
     ap.add_argument("--threads", type=int, nargs="+", default=[1, 2, 4, 8])
-    ap.add_argument("-n", "--num-ops", type=int, default=100_000)
+    ap.add_argument("-n", "--num-ops", type=int, default=0, help="0 = unlimited (open-loop default).")
+    ap.add_argument(
+        "--closed-loop",
+        action="store_true",
+        help="Pass through to run_cluster_bench.py (default there is open-loop).",
+    )
+    ap.add_argument("--poisson-rate", type=int, default=60)
     ap.add_argument("-e", "--experiment-sec", type=int, default=60)
     ap.add_argument("-w", "--warmup-sec", type=int, default=5)
     ap.add_argument("--interval-ms", type=int, default=1000)
@@ -79,6 +85,10 @@ def main() -> None:
             run_cmd.extend(["--ssh-key", ssh_key])
         if args.reset_rocksdb and t == args.threads[0]:
             run_cmd.append("--reset-rocksdb")
+        if args.closed_loop:
+            run_cmd.append("--closed-loop")
+        if args.poisson_rate != 60:
+            run_cmd.extend(["--poisson-rate", str(args.poisson_rate)])
 
         subprocess.run(run_cmd, check=True)
 

@@ -42,12 +42,18 @@
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <fstream>
 
 static void
 Usage(const char *progName)
 {
-        fprintf(stderr, "usage: %s [-n requests] [-t threads] [-w warmup-secs] [-l latency-file] [-q dscp] [-d delay-ms] -c conf-file -m {vr|dyna}\n",
+        fprintf(stderr,
+                "usage: %s [-n max-requests] [-t client-id] [-w warmup-secs] [-l latency-file] "
+                "[-q dscp] [-d delay-ms] [-O] [-R poisson-rate] -c conf-file -m {vr|dyna}\n"
+                "  default: closed-loop (next request after each completion)\n"
+                "  -O -R <rate>: open-loop Poisson load, rate = mean requests per 10ms interval\n"
+                "  open-loop: -n caps submissions (0 = unlimited); experiment ends at -e seconds\n",
                 progName);
         exit(1);
 }
@@ -72,6 +78,8 @@ int main(int argc, char **argv)
     int loadStartIndex = 0;
     int totalThreads = 0;
     bool dontLogLatency = false;
+    bool openLoop = false;
+    int poissonRate = 0;
 
     enum
     {
@@ -86,7 +94,7 @@ int main(int argc, char **argv)
 
     // Parse arguments
     int opt;
-    while ((opt = getopt(argc, argv, "c:d:e:q:k:l:m:n:t:w:i:z:j:p:s:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:d:e:q:k:l:m:n:t:w:i:z:j:p:s:OR:")) != -1) {
         switch (opt) {
         case 'c':
             configPath = optarg;
@@ -233,7 +241,7 @@ int main(int argc, char **argv)
             }
             break;
         }
-    	case 'p':
+        case 'p':
         {
             char *strtolPtr;
             dontLogLatency = strtoul(optarg, &strtolPtr, 10);
@@ -245,6 +253,23 @@ int main(int argc, char **argv)
             }
             break;
         }
+
+        case 'O':
+            openLoop = true;
+            break;
+
+        case 'R':
+        {
+            char *strtolPtr;
+            poissonRate = static_cast<int>(strtoul(optarg, &strtolPtr, 10));
+            if ((*optarg == '\0') || (*strtolPtr != '\0') || (poissonRate <= 0))
+            {
+                fprintf(stderr, "option -R requires a positive numeric arg\n");
+                Usage(argv[0]);
+            }
+            break;
+        }
+
         default:
             fprintf(stderr, "Unknown argument %s\n", argv[optind]);
             Usage(argv[0]);
@@ -262,6 +287,14 @@ int main(int argc, char **argv)
     }
     if (proto == PROTO_UNKNOWN) {
         fprintf(stderr, "option -m is required\n");
+        Usage(argv[0]);
+    }
+    if (openLoop && poissonRate <= 0) {
+        fprintf(stderr, "open-loop mode (-O) requires -R <poisson-rate>\n");
+        Usage(argv[0]);
+    }
+    if (openLoop && delay != 0) {
+        fprintf(stderr, "open-loop mode (-O) cannot be used with -d delay\n");
         Usage(argv[0]);
     }
 
@@ -343,10 +376,25 @@ int main(int argc, char **argv)
                 traceFile = traceFilePrefix + std::to_string(traceFileNum);
             }
 
-            specpaxos::BenchmarkClient *bench =
-                    new specpaxos::BenchmarkClient(*client, transport,
-                                                numRequests, delay,
-                                                warmupSec, tputInterval, traceFile, (int) experimentDuration, !dontLogLatency);
+            const int benchThreads = std::max(1, totalThreads);
+            const int perThreadPoisson =
+                openLoop ? std::max(1, (poissonRate + benchThreads - 1) / benchThreads) : 0;
+            const uint64_t poissonSeed =
+                static_cast<uint64_t>(clientId) * 1000 + static_cast<uint64_t>(thread_id);
+            specpaxos::BenchmarkClient *bench = new specpaxos::BenchmarkClient(
+                *client,
+                transport,
+                numRequests,
+                delay,
+                warmupSec,
+                tputInterval,
+                traceFile,
+                static_cast<int>(experimentDuration),
+                !dontLogLatency,
+                latencyFile,
+                openLoop,
+                perThreadPoisson,
+                poissonSeed);
 
             //transport.Timer(0, [=]() {bench->Start(); });
 

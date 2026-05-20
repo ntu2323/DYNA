@@ -40,12 +40,16 @@
 
 #include <unistd.h>
 #include <stdlib.h>
+#include <algorithm>
 #include <fstream>
 
 static void
 Usage(const char *progName)
 {
-        fprintf(stderr, "usage: %s [-n requests] [-t threads] [-w warmup-secs] [-l latency-file] [-q dscp] [-d delay-ms] -c conf-file -m vr\n",
+        fprintf(stderr,
+                "usage: %s [-n max-requests] [-t clients] [-w warmup-secs] [-l latency-file] "
+                "[-q dscp] [-d delay-ms] [-O] [-R poisson-rate] -c conf-file -m vr\n"
+                "  default: closed-loop; -O -R: open-loop (rate = mean reqs per 10ms)\n",
                 progName);
         exit(1);
 }
@@ -66,6 +70,8 @@ int main(int argc, char **argv)
     uint64_t delay = 0;
     uint64_t experimentDuration = 60; // 60 second experiments by default
     int tputInterval = 0;
+    bool openLoop = false;
+    int poissonRate = 0;
 
     enum
     {
@@ -79,7 +85,7 @@ int main(int argc, char **argv)
 
     // Parse arguments
     int opt;
-    while ((opt = getopt(argc, argv, "c:d:e:q:k:l:m:n:t:w:i:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:d:e:q:k:l:m:n:t:w:i:OR:")) != -1) {
         switch (opt) {
         case 'c':
             configPath = optarg;
@@ -197,6 +203,21 @@ int main(int argc, char **argv)
             break;
         }
 
+        case 'O':
+            openLoop = true;
+            break;
+
+        case 'R':
+        {
+            char *strtolPtr;
+            poissonRate = static_cast<int>(strtoul(optarg, &strtolPtr, 10));
+            if ((*optarg == '\0') || (*strtolPtr != '\0') || (poissonRate <= 0))
+            {
+                fprintf(stderr, "option -R requires a positive numeric arg\n");
+                Usage(argv[0]);
+            }
+            break;
+        }
 
         default:
             fprintf(stderr, "Unknown argument %s\n", argv[optind]);
@@ -213,6 +234,14 @@ int main(int argc, char **argv)
         fprintf(stderr, "option -m is required\n");
         Usage(argv[0]);
     }
+    if (openLoop && poissonRate <= 0) {
+        fprintf(stderr, "open-loop mode (-O) requires -R <poisson-rate>\n");
+        Usage(argv[0]);
+    }
+    if (openLoop && delay != 0) {
+        fprintf(stderr, "open-loop mode (-O) cannot be used with -d delay\n");
+        Usage(argv[0]);
+    }
 
     // Load configuration
     std::ifstream configStream(configPath);
@@ -227,6 +256,9 @@ int main(int argc, char **argv)
     std::vector<specpaxos::Client *> clients;
     std::vector<specpaxos::BenchmarkClient *> benchClients;
 
+    const int perClientPoisson =
+        openLoop ? std::max(1, (poissonRate + numClients - 1) / std::max(1, numClients)) : 0;
+
     for (int i = 0; i < numClients; i++) {
         specpaxos::Client *client;
         switch (proto) {
@@ -238,10 +270,20 @@ int main(int argc, char **argv)
             NOT_REACHABLE();
         }
 
-        specpaxos::BenchmarkClient *bench =
-            new specpaxos::BenchmarkClient(*client, transport,
-                                           numRequests, delay,
-                                           warmupSec, tputInterval, traceFile, (int) experimentDuration);
+        const uint64_t poissonSeed = static_cast<uint64_t>(i + 1);
+        specpaxos::BenchmarkClient *bench = new specpaxos::BenchmarkClient(
+            *client,
+            transport,
+            numRequests,
+            delay,
+            warmupSec,
+            tputInterval,
+            traceFile,
+            static_cast<int>(experimentDuration),
+            latencyFile,
+            openLoop,
+            perClientPoisson,
+            poissonSeed);
 
         transport.Timer(0, [=]() { bench->Start(); });
         clients.push_back(client);

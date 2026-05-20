@@ -77,6 +77,8 @@ def _build_client_cmd(
     interval_ms: int,
     threads: int,
     machine_id: int,
+    open_loop: bool,
+    poisson_rate: int,
 ) -> str:
     run_dir = _remote_run_dir(run_id)
     cfg = PROTOCOLS[protocol]
@@ -92,6 +94,8 @@ def _build_client_cmd(
             "-i", str(interval_ms),
             "-l", f"{run_dir}/latencies",
         ]
+        if open_loop:
+            args.extend(["-O", "-R", str(poisson_rate)])
     else:
         args = [
             "-s", "$HOME/bench/dynaconfig",
@@ -106,6 +110,8 @@ def _build_client_cmd(
             "-i", str(interval_ms),
             "-l", f"{run_dir}/latencies",
         ]
+        if open_loop:
+            args.extend(["-O", "-R", str(poisson_rate)])
     quoted = " ".join(_bash_word(a) for a in args)
     # Background subshell: SSH returns immediately; client writes done when finished.
     client_run = (
@@ -235,12 +241,29 @@ def main() -> None:
     ap.add_argument("--ssh-key", default=os.environ.get("SSH_KEY_FILE", ""))
     ap.add_argument("--run-id", default="", help="Run id (default: UTC timestamp).")
     ap.add_argument("--results-dir", default="", help="Local dir (default: results/<run_id>).")
-    ap.add_argument("-n", "--num-ops", type=int, default=100_000)
+    ap.add_argument(
+        "-n",
+        "--num-ops",
+        type=int,
+        default=0,
+        help="Max submissions (0 = unlimited). Open-loop default uses 0; use with --closed-loop to cap.",
+    )
     ap.add_argument("-e", "--experiment-sec", type=int, default=60)
     ap.add_argument("-w", "--warmup-sec", type=int, default=5)
     ap.add_argument("--interval-ms", type=int, default=1000, help="bench/client -i (throughput samples).")
     ap.add_argument("--trim-pad-sec", type=float, default=3.0, help="Stored in meta for aggregator.")
     ap.add_argument("-j", "--threads", type=int, default=1, help="VR: -t threads; DYNA: -j threads per sender.")
+    ap.add_argument(
+        "--closed-loop",
+        action="store_true",
+        help="Closed-loop: send next request only after each completion (legacy bench).",
+    )
+    ap.add_argument(
+        "--poisson-rate",
+        type=int,
+        default=60,
+        help="Open-loop (default): mean requests per 10ms per sender (~rate*100 offered ops/s). Nezha-style.",
+    )
     ap.add_argument("--replica-wait-sec", type=int, default=8)
     ap.add_argument("--client-timeout-sec", type=int, default=7200)
     ap.add_argument("--reset-rocksdb", action="store_true", help="VR only: rm /dev/shm/rocks{idx} before start.")
@@ -264,12 +287,19 @@ def main() -> None:
     os.makedirs(local_run_dir, exist_ok=True)
 
     ssh_key = args.ssh_key or None
+    open_loop = not args.closed_loop
+    if open_loop:
+        num_ops = args.num_ops
+    else:
+        num_ops = args.num_ops if args.num_ops > 0 else 100_000
     client_args = {
-        "num_ops": args.num_ops,
+        "num_ops": num_ops,
         "experiment_sec": args.experiment_sec,
         "warmup_sec": args.warmup_sec,
         "interval_ms": args.interval_ms,
         "threads": args.threads,
+        "open_loop": open_loop,
+        "poisson_rate": args.poisson_rate,
     }
 
     senders_meta = [
@@ -286,7 +316,10 @@ def main() -> None:
         "run_id": run_id,
         "protocol": args.protocol,
         "hosts_file": hosts_path,
-        "num_ops": args.num_ops,
+        "num_ops": num_ops,
+        "open_loop": open_loop,
+        "poisson_rate": args.poisson_rate if open_loop else None,
+        "offered_ops_per_sec": (args.poisson_rate * 100) if open_loop else None,
         "experiment_sec": args.experiment_sec,
         "warmup_sec": args.warmup_sec,
         "interval_ms": args.interval_ms,

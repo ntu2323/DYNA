@@ -59,6 +59,11 @@ Environment (optional overrides):
   - Partition leader commits on quorum (`f+1` acks), applies committed entries, and broadcasts `CommitBroadcast`.
   - Followers apply committed entries on `CommitBroadcast`.
 
+### Bench client load modes (ionia + paxos `bench/client`)
+
+- **Closed-loop (default):** each thread sends the next request only after the previous one completes (`-d` optional delay). Matches legacy SpecPaxos bench behavior.
+- **Open-loop (`-O -R <rate>`):** Poisson submissions every 10ms (Nezha-style); `rate` is the mean number of requests per 10ms interval (~`rate × 100` offered ops/s per bench instance). Offered load does not slow down when the server stalls. `-n 0` means no submission cap; the measured run ends at `-e` seconds after warmup. Aggregate `-R` is split across DYNA `-j` / VR `-t` client threads.
+
 ### Client quorum behavior
 
 - Client waits for `f+1` matching `FastReply` responses including leader reply.

@@ -1,138 +1,139 @@
-# GCP bench cluster (NOPaxos VR & DYNA)
+# GCP bench cluster (VR & DYNA)
 
-3 receivers + 1+ senders. Run commands from this directory.
+3 receivers + 1+ senders. Commands run from this directory.
 
-**Prereqs:** `pip install -r requirements-deploy.txt`, copy `secrets/gcp_secrets.py.example` → `secrets/gcp_secrets.py` (GCP service account + GitHub deploy key for `ntu2323/IONIA`), GCP firewall **UDP 31880** between VMs.
+**Prereqs:** `pip install -r requirements-deploy.txt`, `secrets/gcp_secrets.py` (GCP service account + GitHub deploy key for [ntu2323/IONIA](https://github.com/ntu2323/IONIA)), firewall **UDP 31880** between VMs.
 
 ```bash
-export SSH_USER=nathan          # your VM login user
+export SSH_USER=nathan
 export SSH_KEY_FILE=~/.ssh/id_ed25519   # optional
 cd Ionia/protocols/experiments/GCP_tests
 ```
 
-`cluster_hosts.json` and `secrets/` are gitignored (see `.gitignore`).
+`cluster_hosts.json` and `secrets/` are gitignored.
+
+**Trace:** write-only `trace.micro` (Insert/Update; cycles for `-n`). **Load:** open-loop Poisson by default (Nezha-style, ~`--poisson-rate × 100` offered ops/s per sender). Use `--closed-loop` for legacy send-after-ack behavior.
 
 ---
 
 ## 1. Create cluster (once)
 
 ```bash
-# Install local Python deps
 pip install -r requirements-deploy.txt
-
-# 3 replicas + 1 sender (use 7 for 3 replicas + 4 senders, etc.)
 python3 create_cluster.py 4 --hosts-file cluster_hosts.json
 ```
 
 ---
 
-Bench traces are **write-only** (Insert/Update; no reads) in `trace.micro`, shared by VR and DYNA. Both clients **cycle** the trace for `-n` (e.g. 100000).
+## 2. Setup VMs
 
-## 2. Setup VR (all VMs)
+Run **one protocol at a time** (same UDP port 31880). First install on all VMs uses full deps; day-to-day use **`--skip-build`** after pushing to GitHub.
+
+### First time (full build)
 
 ```bash
-# Git clone + build on every VM (nohup; log ~/paxos_vr_setup.log)
+# VR
 SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
 
-# Optional: rsync local tree instead of git clone
-# IONIA_REPO_ROOT=/path/to/Ionia SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py \
-#   --hosts-file cluster_hosts.json --rsync-from "$IONIA_REPO_ROOT"
-```
-
-# Image already has deps: refresh IONIA from GitHub + incremental make (push code first)
-SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
-# Optional branch: IONIA_GIT_REF=my-branch SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py ... --skip-build
-# Or sync local tree: IONIA_REPO_ROOT=/path/to/Ionia python3 setup_paxos_vr_cluster.py ... --skip-build --rsync-from "$IONIA_REPO_ROOT"
-
----
-
-## 3. Setup DYNA (all VMs, same cluster OK)
-
-Run after VR setup (or first). Do **not** run both setup scripts at the same time.
-
-```bash
+# DYNA (after VR or instead of VR — not in parallel)
 SSH_USER=$SSH_USER python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
 ```
 
+Optional: `IONIA_GIT_REF=my-branch` for a non-default branch. Local tree without push: `--rsync-from /path/to/Ionia` (skips git clone).
+
+### After code changes (`--skip-build`)
+
+Skips apt, Folly, Splinter/RocksDB bootstrap. Still runs **`git pull`** (or uses rsync tree) and **`make bench/replica bench/client`** so edits like `replica.cc` are recompiled.
+
+```bash
+# Push to GitHub first, then:
+SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
 SSH_USER=$SSH_USER python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
 
-(Same as VR: `--skip-build` runs `git pull` on `git@github.com:ntu2323/IONIA.git` then incremental `make`; skips apt/folly.)
+# Or rsync local Ionia without push:
+IONIA_REPO_ROOT=/path/to/Ionia SSH_USER=$SSH_USER python3 setup_dyna_cluster.py \
+  --hosts-file cluster_hosts.json --skip-build --rsync-from "$IONIA_REPO_ROOT"
+```
 
+Logs: `~/paxos_vr_setup.log` / `~/dyna_setup.log` on each VM. Success markers: `~/bench/.setup_paxos_done` / `.setup_dyna_done`.
 
 ---
 
-## 4. Run benchmarks (from laptop)
+## 3. Run benchmarks (from laptop)
 
-Do **not** run VR and DYNA replicas at the same time (same UDP port 31880). Stop the other protocol before switching.
+Stop the other protocol’s replicas before switching (VR ↔ DYNA).
 
 ### Orchestrated (recommended)
 
-Starts replicas on all receivers, waits, launches all senders in parallel, fetches logs, aggregates cluster throughput (trimmed window) + per-sender latency.
+`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs.
 
 ```bash
-# VR
-SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json
+# VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
+SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
+  -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
 
-# DYNA
+# DYNA — same defaults
 SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
-  -n 100000 -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
+  -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
 
-# Re-aggregate an existing run
+# Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)
+SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
+  --poisson-rate 100 -e 90 -w 5 --interval-ms 1000
+
+# Legacy closed-loop (send after each completion; -n caps total ops)
+SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
+  --closed-loop -n 100000 -e 90 -w 5 --interval-ms 1000
+
+# Aggregate
 python3 aggregate_bench_results.py results/<run_id>
 
-# Latency vs throughput sweep (vary threads: VR -t, DYNA -j)
-SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol vr --threads 1 2 4 8
+# Thread sweep
 SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4 8 -e 120
 ```
 
-Results layout:
+| Flag | Meaning |
+|------|---------|
+| `-e` | Measured experiment seconds (after warmup) |
+| `-w` | Warmup seconds |
+| `-n` | Submission cap (`0` = unlimited; default for open-loop) |
+| `--poisson-rate` | Open-loop offered load (default `60`) |
+| `--closed-loop` | Disable Poisson; wait for ack before next send |
+| `--interval-ms` | Throughput log interval (`bench/client -i`) |
+
+Results:
 
 ```text
 results/<run_id>/
-  run_meta.json       # t0, protocol, flags, hosts
-  sender1/client.log  # -i interval lines for throughput
-  summary.json        # cluster ops/s + per-sender latency
+  run_meta.json
+  sender1/client.log
+  summary.json
 ```
 
-### Manual (SSH per VM)
+### Manual (SSH)
 
-**Receivers** — start replica `0` / `1` / `2` on receiver1 / receiver2 / receiver3:
+**Receivers:**
 
 ```bash
-# VR
-~/bench/start_paxos_vr_replica.sh 0
-# optional: rm -rf /dev/shm/rocks0   # rocks1 / rocks2 on other hosts
-
-# DYNA
-pkill -f '[b]ench/replica' 2>/dev/null || true
-~/bench/start_dyna_replica.sh 0
-tail -f ~/bench/replica-0.log
+~/bench/start_paxos_vr_replica.sh 0    # VR on receiver1 (index 0)
+~/bench/start_dyna_replica.sh 0        # DYNA
 ```
 
-**Sender** — example matched run:
+**Sender (open-loop example):**
 
 ```bash
-# VR
-cd ~/Ionia/protocols/src/paxos
-./bench/client -c ~/bench/vrconfig -m vr -k ~/bench/trace.micro \
-  -n 100 -e 30 -w 3 -t 1 -i 1000 -l ~/bench/latencies 2>&1 | tee ~/bench/client-fg.log
-
-# DYNA
 cd ~/Ionia/protocols/src/ionia
 ./bench/client -s ~/bench/dynaconfig -c ~/bench/dynaconfig -m dyna \
-  -k ~/bench/trace.micro -n 100 -e 30 -w 3 -t 1 -j 1 -i 1000 \
-  -l ~/bench/latencies 2>&1 | tee ~/bench/client-fg.log
+  -k ~/bench/trace.micro -O -R 60 -n 0 -e 90 -w 5 -t 1 -j 1 -i 1000 -l ~/bench/latencies
 ```
 
-Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh`.
+Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (update these if you want open-loop flags baked in).
 
 ---
 
-## Reference: files on VMs
+## Reference
 
 | Path | Purpose |
 |------|---------|
-| `~/bench/vrconfig` / `~/bench/dynaconfig` | Replica addresses (internal IPs, port 31880) |
-| `~/bench/trace.micro` | Write-only micro trace (VR & DYNA; cycles for `-n`) |
-| `~/bench/.setup_paxos_done` / `.setup_dyna_done` | Remote setup success |
-| `~/paxos_vr_setup.log` / `~/dyna_setup.log` | Remote setup build log |
+| `~/bench/vrconfig` / `~/bench/dynaconfig` | Replicas (internal IPs, port 31880) |
+| `~/bench/trace.micro` | Shared write-only trace |
+| `~/paxos_vr_setup.log` / `~/dyna_setup.log` | Remote setup logs |
