@@ -80,12 +80,6 @@ def _build_client_cmd(
 ) -> str:
     run_dir = _remote_run_dir(run_id)
     cfg = PROTOCOLS[protocol]
-    # Do not pkill here — the same ssh -c string contains bench/client and pkill would kill the shell.
-    base = (
-        f"mkdir -p {run_dir} && "
-        f"cd {cfg['client_cwd']} && "
-        f"nohup {cfg['client_bin']}"
-    )
     if protocol == "vr":
         args = [
             "-c", "$HOME/bench/vrconfig",
@@ -113,11 +107,17 @@ def _build_client_cmd(
             "-l", f"{run_dir}/latencies",
         ]
     quoted = " ".join(_bash_word(a) for a in args)
-    return (
-        f"{base} {quoted} "
+    # Background subshell: SSH returns immediately; client writes done when finished.
+    client_run = (
+        f"{cfg['client_bin']} {quoted} "
         f"> {run_dir}/client.log 2>&1; "
         f"echo $? > {run_dir}/exit_code; "
         f"touch {run_dir}/done"
+    )
+    return (
+        f"mkdir -p {run_dir} && rm -f {run_dir}/done {run_dir}/exit_code && "
+        f"cd {cfg['client_cwd']} && "
+        f"nohup bash -c {shlex.quote(client_run)} >/dev/null 2>&1 &"
     )
 
 
@@ -183,7 +183,6 @@ def _wait_client(
     cmd = (
         f"for i in $(seq 1 {timeout_sec}); do "
         f"test -f {run_dir}/done && exit 0; "
-        f"test -f {run_dir}/exit_code && exit 0; "
         f"sleep 1; done; exit 1"
     )
     r = ssh_run(host, ssh_user, ssh_key, cmd)
