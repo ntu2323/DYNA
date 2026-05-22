@@ -18,8 +18,14 @@
 namespace specpaxos {
 namespace dyna {
 
-/** Max log-append/sync steps per commit-loop iteration (FastReply release is not capped). */
-static constexpr size_t kPendingLogAppendBudgetPerLoop = 128;
+/** Log-append/sync budget when caught up on admission + FastReply release. */
+static constexpr size_t kPendingLogAppendBudgetNormal = 32;
+/** Tighter budget while client requests are still in incomingQu_ or due in earlyBuffer. */
+static constexpr size_t kPendingLogAppendBudgetBackpressure = 8;
+/** Max replication control messages per commit-loop iteration. */
+static constexpr size_t kCommitInboundBudgetPerLoop = 64;
+/** Extra drain/release spins before doing append/sync work. */
+static constexpr int kAdmissionPrioritySpins = 8;
 
 static bool
 SlowPathDebugEnabled()
@@ -194,21 +200,41 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
 
     while (workersRunning_.load()) {
         bool handledWork = false;
-        DrainIncomingBuffered(partitionId);
-        handledWork = true;
-
         PartitionState &state = StateFor(partitionId);
-        do {
-            ProcessDueFastReplies(partitionId);
-        } while (!state.earlyBuffer.empty() &&
-                 state.earlyBuffer.top().request.deadline_us() <= NowMicros());
 
-        if (ProcessPendingLogAppends(partitionId, kPendingLogAppendBudgetPerLoop)) {
+        // Admission + FastReply at deadline must run ahead of append/sync (open-loop
+        // latency is submit→FastReply; holding in incomingQu_ past deadline adds full
+        // queue wait even though deadline_us is already in the past).
+        for (int spin = 0; spin < kAdmissionPrioritySpins; ++spin) {
+            const size_t incomingBefore = incomingQu_[partitionId].size_approx();
+            DrainIncomingBuffered(partitionId);
+            const uint64_t nowUs = NowMicros();
+            while (EarlyBufferHasDue(state, nowUs)) {
+                ProcessDueFastReplies(partitionId);
+            }
+            if (incomingQu_[partitionId].size_approx() == 0 && !EarlyBufferHasDue(state, NowMicros())) {
+                if (incomingBefore == 0) {
+                    break;
+                }
+            }
             handledWork = true;
         }
 
-        InboundWork work;
-        while (commitQu_[partitionId].try_dequeue(work)) {
+        const bool backpressure =
+            incomingQu_[partitionId].size_approx() > 0 || EarlyBufferHasDue(state, NowMicros());
+        const size_t appendBudget =
+            backpressure ? kPendingLogAppendBudgetBackpressure : kPendingLogAppendBudgetNormal;
+
+        if (ProcessPendingLogAppends(partitionId, appendBudget)) {
+            handledWork = true;
+        }
+        ProcessDueFastReplies(partitionId);
+
+        for (size_t i = 0; i < kCommitInboundBudgetPerLoop; ++i) {
+            InboundWork work;
+            if (!commitQu_[partitionId].try_dequeue(work)) {
+                break;
+            }
             if (work.kind == InboundKind::SHUTDOWN) {
                 return;
             }
@@ -219,9 +245,10 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
         const auto now = clock::now();
         if (now - lastTick >= tickInterval) {
             lastTick = now;
-            if (ProcessPendingLogAppends(partitionId, kPendingLogAppendBudgetPerLoop)) {
+            if (ProcessPendingLogAppends(partitionId, appendBudget)) {
                 handledWork = true;
             }
+            ProcessDueFastReplies(partitionId);
         }
 
         if (!handledWork && state.pendingLogAppend.empty() && state.earlyBuffer.empty()) {
@@ -236,6 +263,7 @@ DynaReplica::DrainIncomingBuffered(uint32_t partitionId)
     BufferedRequest buffered;
     while (incomingQu_[partitionId].try_dequeue(buffered)) {
         AdmitInboundClientRequest(partitionId, buffered);
+        ProcessDueFastReplies(partitionId);
     }
 }
 
@@ -457,6 +485,13 @@ uint32_t
 DynaReplica::PartitionLeader(uint32_t partitionId) const
 {
     return partitionId % numPartitions;
+}
+
+bool
+DynaReplica::EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs)
+{
+    return !state.earlyBuffer.empty() &&
+           state.earlyBuffer.top().request.deadline_us() <= nowUs;
 }
 
 void

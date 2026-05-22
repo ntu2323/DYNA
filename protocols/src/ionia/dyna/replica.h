@@ -175,6 +175,7 @@ private:
     PartitionState &StateFor(uint32_t partitionId);
     const PartitionState &StateFor(uint32_t partitionId) const;
     void ProcessDueFastReplies(uint32_t partitionId);
+    static bool EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs);
     bool ProcessPendingLogAppends(uint32_t partitionId, size_t maxEntries);
     void AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released);
     void BufferRequestUntilDeadline(uint32_t partitionId,
