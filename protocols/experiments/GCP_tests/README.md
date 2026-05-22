@@ -157,6 +157,8 @@ Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (update 
 
 Replica lines: `grep "DYNA stats" ~/bench/replica-0.log`. Client lines are in `runs/<id>/client.log`; `aggregate_bench_results.py` pulls `per_sender_diagnostics` (max inflight, client phase p50s) into `summary.json`. Disable any flag with `=0`.
 
+**Replication tuning (defaults in `start_dyna_replica.sh`):** `DYNA_REPLICATION_BUDGET` (normal dequeue batch, default 256), `DYNA_REPLICATION_BURST_BUDGET` (batch when `replQ` ≥ threshold, default 8192), `DYNA_REPLICATION_BACKLOG_THRESHOLD` (default 1000). Sync/fsync/`SendMessageToAll` run **outside** `partitionMu_` so the process thread can release FastReplies while replication catches up.
+
 **DYNA vs VR latency (same open-loop bench):** VR replies as soon as the leader path completes (no hold-until-`deadline_us`); DYNA intentionally waits until **`now >= send_us + bound_us`** before `FastReply`. With correct OWD on GCP, **`bound_us` should be ~100–500 μs** (`DYNA_INITIAL_BOUND_US` / `DYNA_MAX_OWD_US` on replicas and senders via `start_dyna_replica.sh` / `run_dyna_client.sh`). Closed-loop sanity: `--closed-loop` with one sender should land near **bound + quorum RTT** (sub–few ms), not tens of ms. Open-loop at high offered load on a **small keyspace** adds per-key queueing on top of that floor; the default trace uses **1000 keys** so `-R 30` is closer to a defensible paper setup. If closed-loop is fast but open-loop median is still very high, look at pipeline/threading before deadline math.
 
 **Deadline env (GCP defaults in setup helpers):** `DYNA_INITIAL_BOUND_US=500`, `DYNA_MAX_OWD_US=10000`, `DYNA_BOUND_RECOMPUTE_K=1`, `DYNA_FAST_REPLY_SHARDS=16` (UDP send parallelism for FastReply).

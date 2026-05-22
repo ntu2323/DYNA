@@ -221,10 +221,12 @@ private:
     void SendFastReplyFromJob(const FastReplySendJob &job);
     static uint32_t FastReplyShardFor(const proto::RequestMessage &req, uint32_t numShards);
     static bool EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs);
-    void AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released);
     void BufferRequestUntilDeadline(uint32_t partitionId,
                                     const TransportAddress &remote,
                                     const proto::RequestMessage &req);
+    void BufferRequestUntilDeadlineLocked(uint32_t partitionId,
+                                          const TransportAddress &remote,
+                                          const proto::RequestMessage &req);
     void HandleLateRequest(const TransportAddress &remote, const proto::RequestMessage &req, uint32_t partitionId);
     void HandleLateSyncBroadcast(const TransportAddress &remote, const proto::LateSyncBroadcast &lsb);
     void HandleSyncBroadcast(const TransportAddress &remote, const proto::SyncBroadcast &sb);
@@ -232,9 +234,11 @@ private:
     void HandleCommitBroadcast(const TransportAddress &remote, const proto::CommitBroadcast &cb);
     void HandleFetchRequest(const TransportAddress &remote, const proto::FetchRequest &fr);
     void HandleFetchResponse(const TransportAddress &remote, const proto::FetchResponse &fr);
-    void AppendToLog(uint32_t partitionId, const proto::RequestMessage &req);
-    void BroadcastSyncForLogEntry(uint32_t partitionId, const LogEntry &entry);
+    /** Appends under partitionMu_; returns entry for leader SyncBroadcast after unlock. */
+    bool AppendToLogLocked(uint32_t partitionId, const proto::RequestMessage &req, LogEntry &outEntry);
+    void BroadcastSyncForLogEntry(uint32_t partitionId, uint64_t viewId, const LogEntry &entry);
     void BroadcastLateSyncForLogEntry(uint32_t partitionId,
+                                      uint64_t viewId,
                                       const LogEntry &entry,
                                       uint64_t oldDeadlineUs,
                                       uint64_t newDeadlineUs);
@@ -242,7 +246,7 @@ private:
     void TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack);
     bool LeaderCommitToDiskAndBroadcast(uint32_t partitionId, uint64_t upToLogIndex);
     void ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex);
-    void BroadcastCommit(uint32_t partitionId, uint64_t upToLogIndex);
+    void BroadcastCommit(uint32_t partitionId, uint64_t viewId, uint64_t upToLogIndex);
     bool EntryMatchesSync(const LogEntry &entry, const proto::SyncBroadcast &sb) const;
     void SendFastReply(uint32_t partitionId,
                        const TransportAddress &remote,

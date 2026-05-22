@@ -21,9 +21,34 @@ namespace dyna {
 
 /** Max log-append/sync steps per durability-loop iteration. */
 static constexpr size_t kDurabilityBudgetPerLoop = 256;
-/** Max replication messages handled per replication-loop iteration. */
-static constexpr size_t kReplicationBudgetPerLoop = 256;
+static constexpr size_t kDefaultReplicationBudget = 256;
+static constexpr size_t kDefaultReplicationBurstBudget = 8192;
+static constexpr size_t kDefaultReplicationBacklogThreshold = 1000;
 static constexpr uint32_t kDefaultFastReplyShards = 16;
+
+static size_t
+ReplicationBudgetNormal()
+{
+    static const size_t budget = static_cast<size_t>(
+        EnvUint64OrDefault("DYNA_REPLICATION_BUDGET", kDefaultReplicationBudget));
+    return std::max<size_t>(1, budget);
+}
+
+static size_t
+ReplicationBudgetBurst()
+{
+    static const size_t burst = static_cast<size_t>(
+        EnvUint64OrDefault("DYNA_REPLICATION_BURST_BUDGET", kDefaultReplicationBurstBudget));
+    return std::max(ReplicationBudgetNormal(), burst);
+}
+
+static size_t
+ReplicationBacklogThreshold()
+{
+    static const size_t threshold = static_cast<size_t>(
+        EnvUint64OrDefault("DYNA_REPLICATION_BACKLOG_THRESHOLD", kDefaultReplicationBacklogThreshold));
+    return threshold;
+}
 
 static uint32_t
 FastReplyShardCountFromEnv()
@@ -311,9 +336,15 @@ DynaReplica::ProcessPartitionLoop(uint32_t partitionId)
 void
 DynaReplica::ReplicationPartitionLoop(uint32_t partitionId)
 {
+    const size_t normalBudget = ReplicationBudgetNormal();
+    const size_t burstBudget = ReplicationBudgetBurst();
+    const size_t backlogThreshold = ReplicationBacklogThreshold();
+
     while (workersRunning_.load()) {
+        const size_t backlog = replicationQu_[partitionId].size_approx();
+        const size_t budget = backlog >= backlogThreshold ? burstBudget : normalBudget;
         bool didWork = false;
-        for (size_t i = 0; i < kReplicationBudgetPerLoop; ++i) {
+        for (size_t i = 0; i < budget; ++i) {
             InboundWork work;
             if (!replicationQu_[partitionId].try_dequeue(work)) {
                 break;
@@ -321,10 +352,7 @@ DynaReplica::ReplicationPartitionLoop(uint32_t partitionId)
             if (work.kind == InboundKind::SHUTDOWN) {
                 return;
             }
-            {
-                std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
-                DispatchCommitInbound(partitionId, work);
-            }
+            DispatchCommitInbound(partitionId, work);
             didWork = true;
         }
         if (!didWork) {
@@ -462,9 +490,69 @@ DynaReplica::DurabilityPartitionLoop(uint32_t partitionId)
             if (!durabilityQu_[partitionId].try_dequeue(released)) {
                 break;
             }
+
+            LogEntry syncEntry;
+            bool sendSync = false;
+            LogEntry lateEntry;
+            uint64_t lateOldDeadline = 0;
+            uint64_t lateNewDeadline = 0;
+            bool sendLateSync = false;
+            uint64_t viewId = 0;
+
             {
                 std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
-                AppendPendingLogEntry(partitionId, released);
+                PartitionState &state = StateFor(partitionId);
+                const RequestKey keyReq = KeyOf(released.request);
+
+                char op = '\0';
+                std::string key;
+                std::string value;
+                if (!ParseCommand(released.request.command(), op, key, value)) {
+                    continue;
+                }
+                if (state.requestToLogIndex.find(keyReq) != state.requestToLogIndex.end()) {
+                    continue;
+                }
+
+                viewId = state.viewId.load(std::memory_order_relaxed);
+                sendSync = AppendToLogLocked(partitionId, released.request, syncEntry);
+
+                if (!AmLeader(partitionId)) {
+                    didWork = true;
+                    continue;
+                }
+
+                auto lateIt = state.pendingLateSyncByReq.find(keyReq);
+                if (lateIt == state.pendingLateSyncByReq.end()) {
+                    didWork = true;
+                    continue;
+                }
+
+                auto logIt = state.requestToLogIndex.find(keyReq);
+                if (logIt == state.requestToLogIndex.end() ||
+                    logIt->second >= state.logEntries.size() ||
+                    !state.logEntries[logIt->second].valid) {
+                    state.pendingLateSyncByReq.erase(lateIt);
+                    didWork = true;
+                    continue;
+                }
+
+                lateEntry = state.logEntries[logIt->second];
+                lateOldDeadline = lateIt->second.first;
+                lateNewDeadline = lateIt->second.second;
+                state.pendingLateSyncByReq.erase(lateIt);
+                sendLateSync = true;
+            }
+
+            if (sendSync) {
+                BroadcastSyncForLogEntry(partitionId, viewId, syncEntry);
+            }
+            if (sendLateSync) {
+                BroadcastLateSyncForLogEntry(partitionId,
+                                             viewId,
+                                             lateEntry,
+                                             lateOldDeadline,
+                                             lateNewDeadline);
             }
             didWork = true;
         }
@@ -817,51 +905,9 @@ DynaReplica::SendFastReplyFromJob(const FastReplySendJob &job)
 }
 
 void
-DynaReplica::AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released)
-{
-    PartitionState &state = StateFor(partitionId);
-    const RequestKey keyReq = KeyOf(released.request);
-
-    char op = '\0';
-    std::string key;
-    std::string value;
-    if (!ParseCommand(released.request.command(), op, key, value)) {
-        return;
-    }
-
-    if (state.requestToLogIndex.find(keyReq) != state.requestToLogIndex.end()) {
-        return;
-    }
-
-    AppendToLog(partitionId, released.request);
-    if (!AmLeader(partitionId)) {
-        return;
-    }
-
-    auto lateIt = state.pendingLateSyncByReq.find(keyReq);
-    if (lateIt == state.pendingLateSyncByReq.end()) {
-        return;
-    }
-
-    auto logIt = state.requestToLogIndex.find(keyReq);
-    if (logIt == state.requestToLogIndex.end() ||
-        logIt->second >= state.logEntries.size() ||
-        !state.logEntries[logIt->second].valid) {
-        state.pendingLateSyncByReq.erase(lateIt);
-        return;
-    }
-
-    BroadcastLateSyncForLogEntry(partitionId,
-                                 state.logEntries[logIt->second],
-                                 lateIt->second.first,
-                                 lateIt->second.second);
-    state.pendingLateSyncByReq.erase(lateIt);
-}
-
-void
-DynaReplica::BufferRequestUntilDeadline(uint32_t partitionId,
-                                        const TransportAddress &remote,
-                                        const proto::RequestMessage &req)
+DynaReplica::BufferRequestUntilDeadlineLocked(uint32_t partitionId,
+                                                const TransportAddress &remote,
+                                                const proto::RequestMessage &req)
 {
     PartitionState &state = StateFor(partitionId);
     const RequestKey key = KeyOf(req);
@@ -873,6 +919,16 @@ DynaReplica::BufferRequestUntilDeadline(uint32_t partitionId,
     buffered.clientAddress = state.requestClients[key];
     buffered.sequence = state.nextSequence++;
     state.earlyBuffer.push(std::move(buffered));
+}
+
+void
+DynaReplica::BufferRequestUntilDeadline(uint32_t partitionId,
+                                        const TransportAddress &remote,
+                                        const proto::RequestMessage &req)
+{
+    const uint32_t pid = partitionId % numPartitions;
+    std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+    BufferRequestUntilDeadlineLocked(partitionId, remote, req);
 }
 
 void
@@ -911,71 +967,70 @@ DynaReplica::HandleLateRequest(const TransportAddress &remote, const proto::Requ
     }
 
     state.pendingLateSyncByReq[key] = std::make_pair(oldDeadline, newDeadline);
-    BufferRequestUntilDeadline(partitionId, remote, revised);
+    BufferRequestUntilDeadlineLocked(partitionId, remote, revised);
+}
+
+bool
+DynaReplica::AppendToLogLocked(uint32_t partitionId, const proto::RequestMessage &req, LogEntry &outEntry)
+{
+    PartitionState &state = StateFor(partitionId);
+    outEntry.valid = true;
+    outEntry.committed = false;
+    outEntry.applied = false;
+    outEntry.logIndex = state.nextLogIndex++;
+    outEntry.clientId = req.client_id();
+    outEntry.requestId = req.request_id();
+    outEntry.command = req.command();
+    outEntry.sendTimeUs = req.send_time_us();
+    outEntry.deadlineUs = req.deadline_us();
+    outEntry.isRead = req.is_read();
+
+    if (state.logEntries.size() <= outEntry.logIndex) {
+        state.logEntries.resize(outEntry.logIndex + 1);
+    }
+    state.logEntries[outEntry.logIndex] = outEntry;
+    state.requestToLogIndex[RequestKey{outEntry.clientId, outEntry.requestId}] = outEntry.logIndex;
+
+    if (!AmLeader(partitionId)) {
+        return false;
+    }
+
+    const uint64_t viewId = state.viewId.load(std::memory_order_relaxed);
+    proto::SyncAck selfAck;
+    selfAck.set_partition_id(partitionId);
+    selfAck.set_view_id(viewId);
+    selfAck.set_replica_id(static_cast<uint32_t>(replicaIdx));
+    selfAck.set_log_index(outEntry.logIndex);
+    selfAck.set_client_id(outEntry.clientId);
+    selfAck.set_request_id(outEntry.requestId);
+    selfAck.set_deadline_us(outEntry.deadlineUs);
+    state.ackMap[outEntry.logIndex][static_cast<uint32_t>(replicaIdx)] = selfAck;
+    return true;
 }
 
 void
-DynaReplica::AppendToLog(uint32_t partitionId, const proto::RequestMessage &req)
+DynaReplica::BroadcastSyncForLogEntry(uint32_t partitionId, uint64_t viewId, const LogEntry &entry)
 {
-    PartitionState &state = StateFor(partitionId);
-    LogEntry entry;
-    entry.valid = true;
-    entry.committed = false;
-    entry.applied = false;
-    entry.logIndex = state.nextLogIndex++;
-    entry.clientId = req.client_id();
-    entry.requestId = req.request_id();
-    entry.command = req.command();
-    entry.sendTimeUs = req.send_time_us();
-    entry.deadlineUs = req.deadline_us();
-    entry.isRead = req.is_read();
-
-    if (state.logEntries.size() <= entry.logIndex) {
-        state.logEntries.resize(entry.logIndex + 1);
-    }
-    state.logEntries[entry.logIndex] = entry;
-    state.requestToLogIndex[RequestKey{entry.clientId, entry.requestId}] = entry.logIndex;
-
-    if (AmLeader(partitionId)) {
-        BroadcastSyncForLogEntry(partitionId, entry);
-    }
-}
-
-void
-DynaReplica::BroadcastSyncForLogEntry(uint32_t partitionId, const LogEntry &entry)
-{
-    PartitionState &state = StateFor(partitionId);
     proto::SyncBroadcast sb;
     sb.set_partition_id(partitionId);
-    sb.set_view_id(state.viewId.load(std::memory_order_relaxed));
+    sb.set_view_id(viewId);
     sb.set_log_index(entry.logIndex);
     sb.set_client_id(entry.clientId);
     sb.set_request_id(entry.requestId);
     sb.set_deadline_us(entry.deadlineUs);
-
-    proto::SyncAck selfAck;
-    selfAck.set_partition_id(partitionId);
-    selfAck.set_view_id(state.viewId.load(std::memory_order_relaxed));
-    selfAck.set_replica_id(static_cast<uint32_t>(replicaIdx));
-    selfAck.set_log_index(entry.logIndex);
-    selfAck.set_client_id(entry.clientId);
-    selfAck.set_request_id(entry.requestId);
-    selfAck.set_deadline_us(entry.deadlineUs);
-    state.ackMap[entry.logIndex][static_cast<uint32_t>(replicaIdx)] = selfAck;
-
     transport->SendMessageToAll(this, sb);
 }
 
 void
 DynaReplica::BroadcastLateSyncForLogEntry(uint32_t partitionId,
+                                          uint64_t viewId,
                                           const LogEntry &entry,
                                           uint64_t oldDeadlineUs,
                                           uint64_t newDeadlineUs)
 {
-    PartitionState &state = StateFor(partitionId);
     proto::LateSyncBroadcast lsb;
     lsb.set_partition_id(partitionId);
-    lsb.set_view_id(state.viewId.load(std::memory_order_relaxed));
+    lsb.set_view_id(viewId);
     lsb.set_log_index(entry.logIndex);
     lsb.set_client_id(entry.clientId);
     lsb.set_request_id(entry.requestId);
@@ -988,22 +1043,31 @@ void
 DynaReplica::HandleSyncBroadcast(const TransportAddress &remote, const proto::SyncBroadcast &sb)
 {
     const uint32_t partitionId = sb.partition_id() % numPartitions;
-    PartitionState &state = StateFor(partitionId);
-    if (sb.view_id() != state.viewId.load(std::memory_order_relaxed) || AmLeader(partitionId) || !IsValidSyncBroadcast(partitionId, sb)) {
-        return;
-    }
-
-    EnsureFollowerEntryFromSync(partitionId, sb);
-
+    const uint32_t pid = partitionId % numPartitions;
     proto::SyncAck ack;
-    ack.set_partition_id(partitionId);
-    ack.set_view_id(state.viewId.load(std::memory_order_relaxed));
-    ack.set_replica_id(static_cast<uint32_t>(replicaIdx));
-    ack.set_log_index(sb.log_index());
-    ack.set_client_id(sb.client_id());
-    ack.set_request_id(sb.request_id());
-    ack.set_deadline_us(sb.deadline_us());
-    transport->SendMessage(this, remote, ack);
+    bool sendAck = false;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        if (sb.view_id() != state.viewId.load(std::memory_order_relaxed) || AmLeader(partitionId) ||
+            !IsValidSyncBroadcast(partitionId, sb)) {
+            return;
+        }
+
+        EnsureFollowerEntryFromSync(partitionId, sb);
+
+        ack.set_partition_id(partitionId);
+        ack.set_view_id(state.viewId.load(std::memory_order_relaxed));
+        ack.set_replica_id(static_cast<uint32_t>(replicaIdx));
+        ack.set_log_index(sb.log_index());
+        ack.set_client_id(sb.client_id());
+        ack.set_request_id(sb.request_id());
+        ack.set_deadline_us(sb.deadline_us());
+        sendAck = true;
+    }
+    if (sendAck) {
+        transport->SendMessage(this, remote, ack);
+    }
 }
 
 void
@@ -1011,9 +1075,14 @@ DynaReplica::HandleSyncAck(const TransportAddress &remote, const proto::SyncAck 
 {
     (void)remote;
     const uint32_t partitionId = ack.partition_id() % numPartitions;
-    const PartitionState &state = StateFor(partitionId);
-    if (!AmLeader(partitionId) || ack.view_id() != state.viewId.load(std::memory_order_relaxed) || !IsValidSyncAck(partitionId, ack)) {
-        return;
+    const uint32_t pid = partitionId % numPartitions;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        const PartitionState &state = StateFor(partitionId);
+        if (!AmLeader(partitionId) || ack.view_id() != state.viewId.load(std::memory_order_relaxed) ||
+            !IsValidSyncAck(partitionId, ack)) {
+            return;
+        }
     }
     TryCommitFromAck(partitionId, ack);
 }
@@ -1023,17 +1092,26 @@ DynaReplica::HandleCommitBroadcast(const TransportAddress &remote, const proto::
 {
     (void)remote;
     const uint32_t partitionId = cb.partition_id() % numPartitions;
-    const PartitionState &state = StateFor(partitionId);
-    if (cb.view_id() != state.viewId.load(std::memory_order_relaxed)) {
+    const uint32_t pid = partitionId % numPartitions;
+    uint64_t upToLogIndex = 0;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        const PartitionState &state = StateFor(partitionId);
+        if (cb.view_id() != state.viewId.load(std::memory_order_relaxed)) {
+            return;
+        }
+        if (cb.up_to_log_index() <= state.commitPoint) {
+            return;
+        }
+        upToLogIndex = cb.up_to_log_index();
+    }
+    if (!PersistCommittedRange(partitionId, upToLogIndex)) {
         return;
     }
-    if (cb.up_to_log_index() <= state.commitPoint) {
-        return;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        ApplyCommittedUpTo(partitionId, upToLogIndex);
     }
-    if (!PersistCommittedRange(partitionId, cb.up_to_log_index())) {
-        return;
-    }
-    ApplyCommittedUpTo(partitionId, cb.up_to_log_index());
 }
 
 void
@@ -1041,45 +1119,52 @@ DynaReplica::HandleLateSyncBroadcast(const TransportAddress &remote, const proto
 {
     (void)remote;
     const uint32_t partitionId = lsb.partition_id() % numPartitions;
-    PartitionState &state = StateFor(partitionId);
-    if (lsb.view_id() != state.viewId.load(std::memory_order_relaxed) || AmLeader(partitionId) || lsb.log_index() < state.commitPoint) {
-        return;
-    }
-
-    proto::SyncBroadcast sb;
-    sb.set_partition_id(partitionId);
-    sb.set_view_id(lsb.view_id());
-    sb.set_log_index(lsb.log_index());
-    sb.set_client_id(lsb.client_id());
-    sb.set_request_id(lsb.request_id());
-    sb.set_deadline_us(lsb.new_deadline_us());
-    EnsureFollowerEntryFromSync(partitionId, sb);
-    if (SlowPathDebugEnabled()) {
-        Notice("DYNA slowpath follower sync req=(%lu,%lu) part=%u log=%lu old_deadline=%lu new_deadline=%lu",
-               lsb.client_id(),
-               lsb.request_id(),
-               partitionId,
-               lsb.log_index(),
-               lsb.old_deadline_us(),
-               lsb.new_deadline_us());
-    }
-
-    const RequestKey key{lsb.client_id(), lsb.request_id()};
-    auto addrIt = state.requestClients.find(key);
-    if (addrIt == state.requestClients.end() || !addrIt->second) {
-        return;
-    }
-
+    const uint32_t pid = partitionId % numPartitions;
+    std::shared_ptr<TransportAddress> clientAddr;
     proto::RequestMessage req;
-    if (!TryGetRequestMessage(partitionId, key, req)) {
-        req.set_partition_id(partitionId);
-        req.set_client_id(lsb.client_id());
-        req.set_request_id(lsb.request_id());
-        req.set_deadline_us(lsb.new_deadline_us());
-    } else {
-        req.set_deadline_us(lsb.new_deadline_us());
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        if (lsb.view_id() != state.viewId.load(std::memory_order_relaxed) || AmLeader(partitionId) ||
+            lsb.log_index() < state.commitPoint) {
+            return;
+        }
+
+        proto::SyncBroadcast sb;
+        sb.set_partition_id(partitionId);
+        sb.set_view_id(lsb.view_id());
+        sb.set_log_index(lsb.log_index());
+        sb.set_client_id(lsb.client_id());
+        sb.set_request_id(lsb.request_id());
+        sb.set_deadline_us(lsb.new_deadline_us());
+        EnsureFollowerEntryFromSync(partitionId, sb);
+        if (SlowPathDebugEnabled()) {
+            Notice("DYNA slowpath follower sync req=(%lu,%lu) part=%u log=%lu old_deadline=%lu new_deadline=%lu",
+                   lsb.client_id(),
+                   lsb.request_id(),
+                   partitionId,
+                   lsb.log_index(),
+                   lsb.old_deadline_us(),
+                   lsb.new_deadline_us());
+        }
+
+        const RequestKey key{lsb.client_id(), lsb.request_id()};
+        auto addrIt = state.requestClients.find(key);
+        if (addrIt == state.requestClients.end() || !addrIt->second) {
+            return;
+        }
+        clientAddr = addrIt->second;
+
+        if (!TryGetRequestMessage(partitionId, key, req)) {
+            req.set_partition_id(partitionId);
+            req.set_client_id(lsb.client_id());
+            req.set_request_id(lsb.request_id());
+            req.set_deadline_us(lsb.new_deadline_us());
+        } else {
+            req.set_deadline_us(lsb.new_deadline_us());
+        }
+        BufferRequestUntilDeadlineLocked(partitionId, *clientAddr, req);
     }
-    BufferRequestUntilDeadline(partitionId, *addrIt->second, req);
 }
 
 void
@@ -1129,24 +1214,32 @@ void
 DynaReplica::HandleFetchRequest(const TransportAddress &remote, const proto::FetchRequest &fr)
 {
     const uint32_t partitionId = fr.partition_id() % numPartitions;
-    if (!AmLeader(partitionId)) {
-        return;
-    }
-    const RequestKey key{fr.client_id(), fr.request_id()};
-
-    proto::RequestMessage req;
-    if (!TryGetRequestMessage(partitionId, key, req)) {
-        return;
-    }
-
+    const uint32_t pid = partitionId % numPartitions;
     proto::FetchResponse resp;
-    resp.set_partition_id(partitionId);
-    resp.set_client_id(fr.client_id());
-    resp.set_request_id(fr.request_id());
-    resp.set_command(req.command());
-    resp.set_send_time_us(req.send_time_us());
-    resp.set_is_read(req.is_read());
-    transport->SendMessage(this, remote, resp);
+    bool sendResp = false;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        if (!AmLeader(partitionId)) {
+            return;
+        }
+        const RequestKey key{fr.client_id(), fr.request_id()};
+
+        proto::RequestMessage req;
+        if (!TryGetRequestMessage(partitionId, key, req)) {
+            return;
+        }
+
+        resp.set_partition_id(partitionId);
+        resp.set_client_id(fr.client_id());
+        resp.set_request_id(fr.request_id());
+        resp.set_command(req.command());
+        resp.set_send_time_us(req.send_time_us());
+        resp.set_is_read(req.is_read());
+        sendResp = true;
+    }
+    if (sendResp) {
+        transport->SendMessage(this, remote, resp);
+    }
 }
 
 void
@@ -1154,32 +1247,36 @@ DynaReplica::HandleFetchResponse(const TransportAddress &remote, const proto::Fe
 {
     (void)remote;
     const uint32_t partitionId = fr.partition_id() % numPartitions;
-    PartitionState &state = StateFor(partitionId);
-    RequestKey key{fr.client_id(), fr.request_id()};
-    if (state.latBuffer.find(key) != state.latBuffer.end()) {
-        return;
-    }
+    const uint32_t pid = partitionId % numPartitions;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        RequestKey key{fr.client_id(), fr.request_id()};
+        if (state.latBuffer.find(key) != state.latBuffer.end()) {
+            return;
+        }
 
-    proto::RequestMessage req;
-    req.set_partition_id(partitionId);
-    req.set_client_id(fr.client_id());
-    req.set_request_id(fr.request_id());
-    req.set_command(fr.command());
-    req.set_send_time_us(fr.send_time_us());
-    req.set_is_read(fr.is_read());
-    req.set_deadline_us(0);
-    state.latBuffer[key] = req;
+        proto::RequestMessage req;
+        req.set_partition_id(partitionId);
+        req.set_client_id(fr.client_id());
+        req.set_request_id(fr.request_id());
+        req.set_command(fr.command());
+        req.set_send_time_us(fr.send_time_us());
+        req.set_is_read(fr.is_read());
+        req.set_deadline_us(0);
+        state.latBuffer[key] = req;
 
-    auto ps = state.pendingSyncByReq.find(key);
-    if (ps != state.pendingSyncByReq.end()) {
-        proto::SyncBroadcast sb;
-        sb.set_partition_id(partitionId);
-        sb.set_view_id(state.viewId.load(std::memory_order_relaxed));
-        sb.set_log_index(ps->second.first);
-        sb.set_client_id(fr.client_id());
-        sb.set_request_id(fr.request_id());
-        sb.set_deadline_us(ps->second.second);
-        EnsureFollowerEntryFromSync(partitionId, sb);
+        auto ps = state.pendingSyncByReq.find(key);
+        if (ps != state.pendingSyncByReq.end()) {
+            proto::SyncBroadcast sb;
+            sb.set_partition_id(partitionId);
+            sb.set_view_id(state.viewId.load(std::memory_order_relaxed));
+            sb.set_log_index(ps->second.first);
+            sb.set_client_id(fr.client_id());
+            sb.set_request_id(fr.request_id());
+            sb.set_deadline_us(ps->second.second);
+            EnsureFollowerEntryFromSync(partitionId, sb);
+        }
     }
 }
 
@@ -1285,38 +1382,67 @@ DynaReplica::WalPath(uint32_t partitionId) const
 bool
 DynaReplica::PersistCommittedRange(uint32_t partitionId, uint64_t upToLogIndex)
 {
-    PartitionState &state = StateFor(partitionId);
-    if (state.logEntries.empty()) {
-        return true;
+    const uint32_t pid = partitionId % numPartitions;
+    const std::string path = WalPath(pid);
+    std::vector<std::string> walLines;
+    int64_t targetSynced = -1;
+
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        if (state.logEntries.empty()) {
+            return true;
+        }
+        const uint64_t maxIndex = std::min<uint64_t>(upToLogIndex, state.logEntries.size() - 1);
+        const uint64_t start = static_cast<uint64_t>(state.walSyncedUpTo + 1);
+        if (start > maxIndex) {
+            return true;
+        }
+
+        walLines.reserve(static_cast<size_t>(maxIndex - start + 1));
+        for (uint64_t i = start; i <= maxIndex; ++i) {
+            const LogEntry &entry = state.logEntries[i];
+            if (!entry.valid) {
+                continue;
+            }
+            const std::string commandHex = HexEncode(entry.command);
+            char lineBuf[4096];
+            const int n = std::snprintf(lineBuf,
+                                        sizeof(lineBuf),
+                                        "%u|%lu|%lu|%lu|%lu|%u|%s\n",
+                                        pid,
+                                        static_cast<unsigned long>(entry.logIndex),
+                                        static_cast<unsigned long>(entry.clientId),
+                                        static_cast<unsigned long>(entry.requestId),
+                                        static_cast<unsigned long>(entry.deadlineUs),
+                                        entry.isRead ? 1u : 0u,
+                                        commandHex.c_str());
+            if (n < 0 || static_cast<size_t>(n) >= sizeof(lineBuf)) {
+                Warning("Failed formatting DYNA WAL line for %s", path.c_str());
+                return false;
+            }
+            walLines.emplace_back(lineBuf, static_cast<size_t>(n));
+        }
+        targetSynced = static_cast<int64_t>(maxIndex);
     }
-    const uint64_t maxIndex = std::min<uint64_t>(upToLogIndex, state.logEntries.size() - 1);
-    const uint64_t start = static_cast<uint64_t>(state.walSyncedUpTo + 1);
-    if (start > maxIndex) {
+
+    if (walLines.empty()) {
+        if (targetSynced >= 0) {
+            std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+            PartitionState &state = StateFor(partitionId);
+            state.walSyncedUpTo = std::max(state.walSyncedUpTo, targetSynced);
+        }
         return true;
     }
 
-    const std::string path = WalPath(partitionId);
     FILE *fp = std::fopen(path.c_str(), "a");
     if (fp == nullptr) {
         Warning("Failed opening DYNA WAL %s: %s", path.c_str(), std::strerror(errno));
         return false;
     }
 
-    for (uint64_t i = start; i <= maxIndex; ++i) {
-        const LogEntry &entry = state.logEntries[i];
-        if (!entry.valid) {
-            continue;
-        }
-        const std::string commandHex = HexEncode(entry.command);
-        if (std::fprintf(fp,
-                         "%u|%lu|%lu|%lu|%lu|%u|%s\n",
-                         partitionId,
-                         static_cast<unsigned long>(entry.logIndex),
-                         static_cast<unsigned long>(entry.clientId),
-                         static_cast<unsigned long>(entry.requestId),
-                         static_cast<unsigned long>(entry.deadlineUs),
-                         entry.isRead ? 1u : 0u,
-                         commandHex.c_str()) < 0) {
+    for (const std::string &line : walLines) {
+        if (std::fwrite(line.data(), 1, line.size(), fp) != line.size()) {
             Warning("Failed writing DYNA WAL %s", path.c_str());
             std::fclose(fp);
             return false;
@@ -1335,59 +1461,78 @@ DynaReplica::PersistCommittedRange(uint32_t partitionId, uint64_t upToLogIndex)
     }
     std::fclose(fp);
 
-    state.walSyncedUpTo = static_cast<int64_t>(maxIndex);
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        state.walSyncedUpTo = std::max(state.walSyncedUpTo, targetSynced);
+    }
     return true;
 }
 
 bool
 DynaReplica::LeaderCommitToDiskAndBroadcast(uint32_t partitionId, uint64_t upToLogIndex)
 {
+    const uint32_t pid = partitionId % numPartitions;
     if (!PersistCommittedRange(partitionId, upToLogIndex)) {
         return false;
     }
-    PartitionState &state = StateFor(partitionId);
-    state.commitPoint = std::max(state.commitPoint, upToLogIndex);
-    BroadcastCommit(partitionId, upToLogIndex);
+
+    uint64_t viewId = 0;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        state.commitPoint = std::max(state.commitPoint, upToLogIndex);
+        viewId = state.viewId.load(std::memory_order_relaxed);
+        ApplyCommittedUpTo(partitionId, upToLogIndex);
+    }
+    BroadcastCommit(partitionId, viewId, upToLogIndex);
     return true;
 }
 
 void
 DynaReplica::TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack)
 {
-    PartitionState &state = StateFor(partitionId);
-    if (state.logEntries.size() <= ack.log_index()) {
-        return;
-    }
-    LogEntry &entry = state.logEntries[ack.log_index()];
-    if (!entry.valid) {
-        return;
-    }
-    if (entry.clientId != ack.client_id() || entry.requestId != ack.request_id()) {
-        return;
-    }
-    if (entry.deadlineUs != ack.deadline_us()) {
-        return;
-    }
-    if (entry.committed) {
-        return;
+    const uint32_t pid = partitionId % numPartitions;
+    uint64_t upToCommitPoint = 0;
+    bool shouldCommit = false;
+    {
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+        PartitionState &state = StateFor(partitionId);
+        if (state.logEntries.size() <= ack.log_index()) {
+            return;
+        }
+        LogEntry &entry = state.logEntries[ack.log_index()];
+        if (!entry.valid) {
+            return;
+        }
+        if (entry.clientId != ack.client_id() || entry.requestId != ack.request_id()) {
+            return;
+        }
+        if (entry.deadlineUs != ack.deadline_us()) {
+            return;
+        }
+        if (entry.committed) {
+            return;
+        }
+
+        state.ackMap[ack.log_index()][ack.replica_id()] = ack;
+        const size_t quorum = static_cast<size_t>(config.f + 1);
+        if (state.ackMap[ack.log_index()].size() < quorum) {
+            return;
+        }
+
+        upToCommitPoint = std::max(state.commitPoint, ack.log_index());
+        if (upToCommitPoint <= state.commitPoint &&
+            state.walSyncedUpTo >= static_cast<int64_t>(upToCommitPoint)) {
+            return;
+        }
+        shouldCommit = true;
     }
 
-    state.ackMap[ack.log_index()][ack.replica_id()] = ack;
-    const size_t quorum = static_cast<size_t>(config.f + 1);
-    if (state.ackMap[ack.log_index()].size() < quorum) {
+    if (!shouldCommit) {
         return;
     }
-
-    const uint64_t upToCommitPoint = std::max(state.commitPoint, ack.log_index());
-    if (upToCommitPoint <= state.commitPoint &&
-        state.walSyncedUpTo >= static_cast<int64_t>(upToCommitPoint)) {
-        return;
-    }
-
-    if (!LeaderCommitToDiskAndBroadcast(partitionId, upToCommitPoint)) {
-        return;
-    }
-    ApplyCommittedUpTo(partitionId, upToCommitPoint);
+    LeaderCommitToDiskAndBroadcast(partitionId, upToCommitPoint);
 }
 
 void
@@ -1444,12 +1589,11 @@ DynaReplica::ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex)
 }
 
 void
-DynaReplica::BroadcastCommit(uint32_t partitionId, uint64_t upToLogIndex)
+DynaReplica::BroadcastCommit(uint32_t partitionId, uint64_t viewId, uint64_t upToLogIndex)
 {
-    PartitionState &state = StateFor(partitionId);
     proto::CommitBroadcast cb;
     cb.set_partition_id(partitionId);
-    cb.set_view_id(state.viewId.load(std::memory_order_relaxed));
+    cb.set_view_id(viewId);
     cb.set_up_to_log_index(upToLogIndex);
     transport->SendMessageToAll(this, cb);
 }

@@ -46,9 +46,9 @@ Environment (optional overrides):
 - **Transport thread:** parse client `RequestMessage` once; enqueue OWD sample to `owdQu_`; enqueue request to `incomingQu_[partition]`.
 - **OWD worker (`OwdThreadLoop`):** drains `owdQu_`, updates `ReplicaOwdEstimator` under `owdMutex_` (not on receive hot path).
 - **Process worker (one thread per partition):** under `partitionMu_[partition]`: drain `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** at deadline in global order (enqueue `FastReplySendJob` + `durabilityQu_`, no UDP). Does **not** handle replication messages.
-- **Replication worker (one thread per partition):** drains `replicationQu_` (sync/ack/commit/fetch) under `partitionMu_`, separate from client fast path.
+- **Replication worker (one thread per partition):** drains `replicationQu_` with adaptive batching (`DYNA_REPLICATION_BUDGET` / `DYNA_REPLICATION_BURST_BUDGET` when `replQ` ≥ `DYNA_REPLICATION_BACKLOG_THRESHOLD`). Handlers take short `partitionMu_` locks; **follower `SyncAck`, leader `CommitBroadcast`, and WAL `fsync` are outside the lock**.
 - **Fast-reply workers (`DYNA_FAST_REPLY_SHARDS`, default 16):** `reqKey % numFastReplyShards`; drain `fastReplyQu_`, **`SendFastReplyFromJob`** only (UDP isolated from process thread).
-- **Durability worker (one thread per partition):** under `partitionMu_`, drain `durabilityQu_` → **`AppendPendingLogEntry`** (log + `SyncBroadcast` + WAL).
+- **Durability worker (one thread per partition):** short `partitionMu_` hold to append log + leader self-ack; **`SyncBroadcast` / `LateSyncBroadcast` UDP outside the lock**.
 - **Shared state:** fast-path admission uses **`lastReleasedByOpKey`** with **`reqKey = (client_id<<32)|request_id`**. `deadlineCounter` updated on apply for read visibility.
 
 ### Performance diagnostics (`DYNA_STATS`, `DYNA_CLIENT_STATS`)
@@ -153,7 +153,7 @@ All protocol messages include `partition_id` now so one replica process can host
 - Early follower-only `FastReply` bursts do **not** complete the client (`leaderAcked` required); duplicate-completion from those alone is not expected.
 - Read results are sent by the leader through `ReadResult` (not via `FastReply` payload).
 - Leader and followers both apply committed entries when commit threshold/broadcast conditions are met.
-- **Leader commit step:** on `f+1` `SyncAck`s, `LeaderCommitToDiskAndBroadcast` runs **WAL `fsync` then `CommitBroadcast`** (same logical commit); **`ApplyCommittedUpTo`** updates memory and **`deadlineCounter`**. Assumes normal-operation disk success; recovery may refine failure handling later.
+- **Leader commit step:** on `f+1` `SyncAck`s, `LeaderCommitToDiskAndBroadcast` copies WAL records under `partitionMu_`, **`fsync` outside the lock**, then **`ApplyCommittedUpTo`** and **`CommitBroadcast`** (UDP outside lock). Assumes normal-operation disk success; recovery may refine failure handling later.
 - **`SyncAck` today goes follower → leader only**, not to the client; slow path explicitly adds **client-visible** follower acks after late sync (see slow-path section).
 
 ## Next Suggested Work
