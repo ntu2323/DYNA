@@ -40,12 +40,13 @@ Environment (optional overrides):
 | `DYNA_BOUND_RECOMPUTE_K` | Recompute aggregated bound after this many inbound **`owd_us > 0`** samples; default `4` (GCP helpers use `1`). |
 | `DYNA_OWD_WINDOW_LEN` | Replica sliding window length; default `100`. |
 | `DYNA_OWD_PERCENTILE` | Percentile in `[0,100]` over sorted window; default `50`. |
+| `DYNA_EAGER_FAST_REPLY` | When `1`, on-time on-key requests bypass `earlyBuffer` and `ProcessDueFastReplies` and are released on admit. Lower mean/p99 under load; relies on `lastReleasedByOpKey` + `HandleLateRequest` + client epoch reset for safety. Default `0` (Nezha-style deadline-ordered release). |
 
 ### Replica threading (Nezha-style pipeline)
 
 - **Transport thread:** parse client `RequestMessage` once; enqueue OWD sample to `owdQu_`; enqueue request to `incomingQu_[partition]`.
 - **OWD worker (`OwdThreadLoop`):** drains `owdQu_`, updates `ReplicaOwdEstimator` under `owdMutex_` (not on receive hot path).
-- **Process worker (one thread per partition):** under `partitionMu_[partition]`: drain `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** at deadline in global order (enqueue `FastReplySendJob` + `durabilityQu_`, no UDP). Does **not** handle replication messages.
+- **Process worker (one thread per partition):** under `partitionMu_[partition]`: drain `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`** (default) or direct **`ReleaseBufferedRequest`** (when `DYNA_EAGER_FAST_REPLY=1`); **`ProcessDueFastReplies`** at deadline in global order (enqueue `FastReplySendJob` + `durabilityQu_`, no UDP). Does **not** handle replication messages.
 - **Replication worker (one thread per partition):** drains `replicationQu_` with adaptive batching (`DYNA_REPLICATION_BUDGET` / `DYNA_REPLICATION_BURST_BUDGET` when `replQ` ≥ `DYNA_REPLICATION_BACKLOG_THRESHOLD`). Handlers take short `partitionMu_` locks; **follower `SyncAck`, leader `CommitBroadcast`, and WAL `fsync` are outside the lock**.
 - **Fast-reply workers (`DYNA_FAST_REPLY_SHARDS`, default 16):** `reqKey % numFastReplyShards`; drain `fastReplyQu_`, **`SendFastReplyFromJob`** only (UDP isolated from process thread).
 - **Durability worker (one thread per partition):** short `partitionMu_` hold to append log + leader self-ack; **`SyncBroadcast` / `LateSyncBroadcast` UDP outside the lock**.

@@ -64,6 +64,10 @@ export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
 export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
 export DYNA_BOUND_RECOMPUTE_K="${DYNA_BOUND_RECOMPUTE_K:-1}"
 export DYNA_FAST_REPLY_SHARDS="${DYNA_FAST_REPLY_SHARDS:-16}"
+# Set DYNA_EAGER_FAST_REPLY=1 to bypass the earlyBuffer deadline hold and
+# fast-reply on admit (lower mean/p99 under load, at the cost of more
+# slow-path events under high same-key contention). Default OFF.
+export DYNA_EAGER_FAST_REPLY="${DYNA_EAGER_FAST_REPLY:-0}"
 export DYNA_SLOWPATH_DEBUG="${DYNA_SLOWPATH_DEBUG:-1}"
 export DYNA_STATS="${DYNA_STATS:-1}"
 export DYNA_STATS_INTERVAL_SEC="${DYNA_STATS_INTERVAL_SEC:-1}"

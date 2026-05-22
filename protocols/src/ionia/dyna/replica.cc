@@ -96,6 +96,25 @@ SlowPathDebugEnabled()
     return enabled;
 }
 
+/**
+ * When DYNA_EAGER_FAST_REPLY=1, on-time client requests bypass the
+ * earlyBuffer/ProcessDueFastReplies deadline hold and are released
+ * immediately on admit. Slow-path detection (lastReleasedByOpKey +
+ * HandleLateRequest + client epoch reset) still catches out-of-order
+ * same-key arrivals, so safety is preserved at the cost of more slow-path
+ * events under high same-key contention. Default OFF (canonical Nezha-style
+ * deadline-ordered release).
+ */
+static bool
+EagerFastReplyEnabled()
+{
+    static const bool enabled = []() {
+        const char *v = std::getenv("DYNA_EAGER_FAST_REPLY");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 static std::string
 WalDirFromEnv()
 {
@@ -636,9 +655,19 @@ DynaReplica::AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &bu
 
     if (IsOnTimeForOpKey(state, req)) {
         buffered.sequence = state.nextSequence++;
-        // Always buffer; ProcessDueFastReplies releases in global deadline order.
-        // Releasing here when past deadline would violate ordering (incoming FIFO
-        // vs Nezha rank) and spuriously triggers slow-path on same-key ops.
+        if (EagerFastReplyEnabled()) {
+            // Bypass the per-op deadline hold: release immediately on admit so
+            // the fast reply does not wait for ProcessDueFastReplies. Order is
+            // still enforced per-opKey via lastReleasedByOpKey, and any
+            // out-of-order arrival on the same key will fall into the slow path
+            // below (HandleLateRequest) and trigger a client epoch reset.
+            ReleaseBufferedRequest(state, partitionId, buffered);
+            return;
+        }
+        // Default (Nezha): buffer; ProcessDueFastReplies releases in global
+        // deadline order. Releasing here when past deadline would violate
+        // ordering (incoming FIFO vs Nezha rank) and spuriously trigger
+        // slow-path on same-key ops.
         state.earlyBuffer.push(std::move(buffered));
         return;
     }
