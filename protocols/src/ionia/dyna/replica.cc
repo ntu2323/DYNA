@@ -71,23 +71,6 @@ DynaReplica::UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t valu
     }
 }
 
-void
-DynaReplica::AdvanceDeadlineCounterUpTo(uint32_t partitionId, uint64_t upToLogIndex)
-{
-    PartitionState &state = StateFor(partitionId);
-    if (state.logEntries.empty()) {
-        return;
-    }
-    const uint64_t maxIndex = std::min<uint64_t>(upToLogIndex, state.logEntries.size() - 1);
-    for (uint64_t i = 0; i <= maxIndex; ++i) {
-        const LogEntry &entry = state.logEntries[i];
-        if (!entry.valid) {
-            continue;
-        }
-        UpdateDeadlineCounter(state.deadlineCounter, entry.deadlineUs);
-    }
-}
-
 bool
 DynaReplica::EnqueueFast(uint32_t partitionId,
                          InboundKind kind,
@@ -678,7 +661,6 @@ DynaReplica::HandleCommitBroadcast(const TransportAddress &remote, const proto::
     if (cb.up_to_log_index() <= state.commitPoint) {
         return;
     }
-    AdvanceDeadlineCounterUpTo(partitionId, cb.up_to_log_index());
     if (!PersistCommittedRange(partitionId, cb.up_to_log_index())) {
         return;
     }
@@ -1022,7 +1004,6 @@ DynaReplica::TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack)
         return;
     }
 
-    AdvanceDeadlineCounterUpTo(partitionId, upToCommitPoint);
     if (!LeaderCommitToDiskAndBroadcast(partitionId, upToCommitPoint)) {
         return;
     }
@@ -1061,6 +1042,7 @@ DynaReplica::ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex)
                 req.set_is_read(true);
                 MaybeSendReadResult(partitionId, *addrIt->second, req);
             }
+            UpdateDeadlineCounter(state.deadlineCounter, entry.deadlineUs);
             entry.applied = true;
             continue;
         }
@@ -1076,6 +1058,7 @@ DynaReplica::ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex)
             kvStore[key] = value;
             appliedWrites.push_back(StoredWrite{partitionId, entry.logIndex, key, value});
         }
+        UpdateDeadlineCounter(state.deadlineCounter, entry.deadlineUs);
         entry.applied = true;
     }
 }

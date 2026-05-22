@@ -158,8 +158,6 @@ private:
     void HandleRequestFast(const TransportAddress &remote, const proto::RequestMessage &req);
     void HandleRequestSlow(const TransportAddress &remote, const proto::RequestMessage &req);
     static void UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t value);
-    /** Advance ordering watermark for fast-path gate; runs before WAL fsync on commit. */
-    void AdvanceDeadlineCounterUpTo(uint32_t partitionId, uint64_t upToLogIndex);
 
     uint64_t NowMicros() const;
     uint32_t PartitionLeader(uint32_t partitionId) const;

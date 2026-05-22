@@ -143,7 +143,7 @@ All protocol messages include `partition_id` now so one replica process can host
 - Early follower-only `FastReply` bursts do **not** complete the client (`leaderAcked` required); duplicate-completion from those alone is not expected.
 - Read results are sent by the leader through `ReadResult` (not via `FastReply` payload).
 - Leader and followers both apply committed entries when commit threshold/broadcast conditions are met.
-- **Leader commit step:** on `f+1` `SyncAck`s, **`deadlineCounter` advances through `upToLogIndex` before WAL `fsync`** (`AdvanceDeadlineCounterUpTo`), then `LeaderCommitToDiskAndBroadcast` runs **WAL `fsync` then `CommitBroadcast`**; followers advance the counter on `CommitBroadcast` before their WAL `fsync`, then **`ApplyCommittedUpTo`** (memory only). Assumes normal-operation fsync success; recovery may refine failure handling later.
+- **Leader commit step:** on `f+1` `SyncAck`s, `LeaderCommitToDiskAndBroadcast` runs **WAL `fsync` then `CommitBroadcast`** (same logical commit); **`ApplyCommittedUpTo`** updates memory and **`deadlineCounter`**. Assumes normal-operation disk success; recovery may refine failure handling later.
 - **`SyncAck` today goes follower → leader only**, not to the client; slow path explicitly adds **client-visible** follower acks after late sync (see slow-path section).
 
 ## Next Suggested Work
