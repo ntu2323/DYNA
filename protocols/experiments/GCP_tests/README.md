@@ -146,6 +146,10 @@ Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (update 
 
 **DYNA slow-path logs:** `~/bench/start_dyna_replica.sh` sets `DYNA_SLOWPATH_DEBUG=1` by default (logging only; does not force slow path). After a bench run, on each receiver: `grep "DYNA slowpath" ~/bench/replica-*.log`. Disable with `DYNA_SLOWPATH_DEBUG=0` before starting a replica. Re-run `setup_dyna_cluster.py --skip-build` to refresh the helper on existing VMs. Deadlines use **`system_clock`** (Nezha-style), not per-VM `steady_clock`, so senders and replicas should agree under GCP NTP.
 
+**DYNA vs VR latency (same open-loop bench):** VR replies as soon as the leader path completes (no hold-until-`deadline_us`); DYNA intentionally waits until **`now >= send_us + bound_us`** before `FastReply`. With correct OWD on GCP, **`bound_us` should be ~100–500 μs** (`DYNA_INITIAL_BOUND_US` / `DYNA_MAX_OWD_US` on replicas and senders via `start_dyna_replica.sh` / `run_dyna_client.sh`). Closed-loop sanity: `--closed-loop` with one sender should land near **bound + quorum RTT** (sub–few ms), not tens of ms. Open-loop at ~6k offered ops/s on **10 hot keys** adds queueing on top of that floor; if closed-loop is fast but open-loop median is ~40 ms, the bottleneck is load/per-key pacing, not deadline math.
+
+**Deadline env (GCP defaults in setup helpers):** `DYNA_INITIAL_BOUND_US=500`, `DYNA_MAX_OWD_US=10000`, `DYNA_BOUND_RECOMPUTE_K=1`.
+
 ---
 
 ## Reference

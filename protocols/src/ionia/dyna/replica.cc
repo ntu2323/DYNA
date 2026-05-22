@@ -293,6 +293,10 @@ DynaReplica::AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &bu
 
     if (IsOnTimeForOpKey(state, req)) {
         buffered.sequence = state.nextSequence++;
+        if (NowMicros() >= req.deadline_us()) {
+            ReleaseBufferedRequest(partitionId, buffered);
+            return;
+        }
         state.earlyBuffer.push(std::move(buffered));
         return;
     }
@@ -510,6 +514,21 @@ DynaReplica::EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs)
 }
 
 void
+DynaReplica::ReleaseBufferedRequest(uint32_t partitionId, BufferedRequest &buffered)
+{
+    PartitionState &state = StateFor(partitionId);
+    if (buffered.clientAddress) {
+        SendFastReply(partitionId,
+                      *buffered.clientAddress,
+                      buffered.request.client_id(),
+                      buffered.request.request_id(),
+                      buffered.request.deadline_us());
+    }
+    RecordReleasedRank(state, buffered.request);
+    state.pendingLogAppend.push_back(std::move(buffered));
+}
+
+void
 DynaReplica::ProcessDueFastReplies(uint32_t partitionId)
 {
     PartitionState &state = StateFor(partitionId);
@@ -522,16 +541,7 @@ DynaReplica::ProcessDueFastReplies(uint32_t partitionId)
 
         BufferedRequest current = top;
         state.earlyBuffer.pop();
-
-        if (current.clientAddress) {
-            SendFastReply(partitionId,
-                          *current.clientAddress,
-                          current.request.client_id(),
-                          current.request.request_id(),
-                          current.request.deadline_us());
-        }
-        RecordReleasedRank(state, current.request);
-        state.pendingLogAppend.push_back(std::move(current));
+        ReleaseBufferedRequest(partitionId, current);
     }
 }
 

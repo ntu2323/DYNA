@@ -10,9 +10,9 @@ namespace dyna {
 
 struct DeadlineConfig {
     /** Bound used until replicas publish usable OWD (microseconds). */
-    uint64_t initial_bound_us = 2000;
+    uint64_t initial_bound_us = 500;
     /** Clamp per-replica OWD and aggregated bound (microseconds). */
-    uint64_t max_owd_us = 500000;
+    uint64_t max_owd_us = 10000;
     /** Recompute client bound after this many inbound replies carrying OWD > 0. */
     uint32_t recompute_every_k = 4;
     /** Sliding-window length per client_id on each replica. */

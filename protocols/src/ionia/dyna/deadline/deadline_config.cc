@@ -38,13 +38,13 @@ DeadlineConfig::FromEnvironment()
     if (initial_env && *initial_env) {
         c.initial_bound_us = ParseU64(initial_env, c.initial_bound_us);
         if (c.initial_bound_us == 0) {
-            c.initial_bound_us = 2000;
+            c.initial_bound_us = 500;
         }
     }
     if (const char *v = std::getenv("DYNA_MAX_OWD_US"); v && *v) {
         c.max_owd_us = ParseU64(v, c.max_owd_us);
         if (c.max_owd_us == 0) {
-            c.max_owd_us = 500000;
+            c.max_owd_us = 10000;
         }
     }
     if (const char *v = std::getenv("DYNA_BOUND_RECOMPUTE_K"); v && *v) {

@@ -34,10 +34,10 @@ Environment (optional overrides):
 
 | Variable | Role |
 |----------|------|
-| `DYNA_INITIAL_BOUND_US` | Cold-start bound per replica slot (μs); default `2000`. |
+| `DYNA_INITIAL_BOUND_US` | Cold-start bound per replica slot (μs); default `500`. |
 | `DYNA_DEADLINE_SLACK_US` | Legacy alias for initial bound if `DYNA_INITIAL_BOUND_US` unset. |
-| `DYNA_MAX_OWD_US` | Clamp for OWD and bound (μs); default `500000`. |
-| `DYNA_BOUND_RECOMPUTE_K` | Recompute aggregated bound after this many inbound **`owd_us > 0`** samples; default `4`. |
+| `DYNA_MAX_OWD_US` | Clamp for OWD and bound (μs); default `10000`. |
+| `DYNA_BOUND_RECOMPUTE_K` | Recompute aggregated bound after this many inbound **`owd_us > 0`** samples; default `4` (GCP helpers use `1`). |
 | `DYNA_OWD_WINDOW_LEN` | Replica sliding window length; default `100`. |
 | `DYNA_OWD_PERCENTILE` | Percentile in `[0,100]` over sorted window; default `50`. |
 
