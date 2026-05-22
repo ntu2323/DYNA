@@ -18,10 +18,8 @@
 namespace specpaxos {
 namespace dyna {
 
-/** Log-append/sync budget when caught up on admission + FastReply release. */
-static constexpr size_t kPendingLogAppendBudgetNormal = 32;
-/** Tighter budget while client requests are still in incomingQu_ or due in earlyBuffer. */
-static constexpr size_t kPendingLogAppendBudgetBackpressure = 8;
+/** Max log-append/sync steps per durability-loop iteration. */
+static constexpr size_t kDurabilityBudgetPerLoop = 256;
 /** Max replication control messages per commit-loop iteration. */
 static constexpr size_t kCommitInboundBudgetPerLoop = 64;
 /** Extra drain/release spins before doing append/sync work. */
@@ -54,6 +52,7 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
       partitions(numPartitions),
       commitQu_(numPartitions),
       incomingQu_(numPartitions),
+      durabilityQu_(numPartitions),
       owdEstimator_(DeadlineConfig::FromEnvironment()),
       walDir_(WalDirFromEnv())
 {
@@ -174,8 +173,10 @@ DynaReplica::StartWorkers()
 {
     workersRunning_.store(true);
     commitThreads_.reserve(numPartitions);
+    durabilityThreads_.reserve(numPartitions);
     for (uint32_t partitionId = 0; partitionId < numPartitions; ++partitionId) {
         commitThreads_.emplace_back(&DynaReplica::CommitPartitionLoop, this, partitionId);
+        durabilityThreads_.emplace_back(&DynaReplica::DurabilityPartitionLoop, this, partitionId);
     }
 }
 
@@ -196,6 +197,12 @@ DynaReplica::StopWorkers()
         }
     }
     commitThreads_.clear();
+    for (auto &thread : durabilityThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    durabilityThreads_.clear();
 }
 
 void
@@ -227,14 +234,6 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
             handledWork = true;
         }
 
-        const bool backpressure =
-            incomingQu_[partitionId].size_approx() > 0 || EarlyBufferHasDue(state, NowMicros());
-        const size_t appendBudget =
-            backpressure ? kPendingLogAppendBudgetBackpressure : kPendingLogAppendBudgetNormal;
-
-        if (ProcessPendingLogAppends(partitionId, appendBudget)) {
-            handledWork = true;
-        }
         ProcessDueFastReplies(partitionId);
 
         for (size_t i = 0; i < kCommitInboundBudgetPerLoop; ++i) {
@@ -252,14 +251,32 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
         const auto now = clock::now();
         if (now - lastTick >= tickInterval) {
             lastTick = now;
-            if (ProcessPendingLogAppends(partitionId, appendBudget)) {
-                handledWork = true;
-            }
             ProcessDueFastReplies(partitionId);
         }
 
-        if (!handledWork && state.pendingLogAppend.empty() && state.earlyBuffer.empty()) {
+        if (!handledWork && state.earlyBuffer.empty() &&
+            incomingQu_[partitionId].size_approx() == 0 &&
+            durabilityQu_[partitionId].size_approx() == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
+}
+
+void
+DynaReplica::DurabilityPartitionLoop(uint32_t partitionId)
+{
+    while (workersRunning_.load()) {
+        bool didWork = false;
+        for (size_t i = 0; i < kDurabilityBudgetPerLoop; ++i) {
+            BufferedRequest released;
+            if (!durabilityQu_[partitionId].try_dequeue(released)) {
+                break;
+            }
+            AppendPendingLogEntry(partitionId, released);
+            didWork = true;
+        }
+        if (!didWork) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
 }
@@ -267,18 +284,9 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
 void
 DynaReplica::DrainIncomingBuffered(uint32_t partitionId)
 {
-    static constexpr size_t kDrainBatchBeforeRelease = 64;
     BufferedRequest buffered;
-    size_t admitted = 0;
     while (incomingQu_[partitionId].try_dequeue(buffered)) {
         AdmitInboundClientRequest(partitionId, buffered);
-        if (++admitted >= kDrainBatchBeforeRelease) {
-            ProcessDueFastReplies(partitionId);
-            admitted = 0;
-        }
-    }
-    if (admitted > 0) {
-        ProcessDueFastReplies(partitionId);
     }
 }
 
@@ -293,10 +301,9 @@ DynaReplica::AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &bu
 
     if (IsOnTimeForOpKey(state, req)) {
         buffered.sequence = state.nextSequence++;
-        if (NowMicros() >= req.deadline_us()) {
-            ReleaseBufferedRequest(partitionId, buffered);
-            return;
-        }
+        // Always buffer; ProcessDueFastReplies releases in global deadline order.
+        // Releasing here when past deadline would violate ordering (incoming FIFO
+        // vs Nezha rank) and spuriously triggers slow-path on same-key ops.
         state.earlyBuffer.push(std::move(buffered));
         return;
     }
@@ -525,7 +532,9 @@ DynaReplica::ReleaseBufferedRequest(uint32_t partitionId, BufferedRequest &buffe
                       buffered.request.deadline_us());
     }
     RecordReleasedRank(state, buffered.request);
-    state.pendingLogAppend.push_back(std::move(buffered));
+    if (!durabilityQu_[partitionId].enqueue(std::move(buffered))) {
+        Warning("DYNA durability queue full part=%u", partitionId);
+    }
 }
 
 void
@@ -585,26 +594,6 @@ DynaReplica::AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &
                                  lateIt->second.first,
                                  lateIt->second.second);
     state.pendingLateSyncByReq.erase(lateIt);
-}
-
-bool
-DynaReplica::ProcessPendingLogAppends(uint32_t partitionId, size_t maxEntries)
-{
-    if (maxEntries == 0) {
-        return false;
-    }
-
-    PartitionState &state = StateFor(partitionId);
-    size_t processed = 0;
-    bool didWork = false;
-    while (processed < maxEntries && !state.pendingLogAppend.empty()) {
-        BufferedRequest released = std::move(state.pendingLogAppend.front());
-        state.pendingLogAppend.pop_front();
-        AppendPendingLogEntry(partitionId, released);
-        ++processed;
-        didWork = true;
-    }
-    return didWork;
 }
 
 void

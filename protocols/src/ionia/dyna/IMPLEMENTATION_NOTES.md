@@ -44,14 +44,15 @@ Environment (optional overrides):
 ### Replica threading (Nezha-style pipeline)
 
 - **Transport thread:** `ReceiveMessage` parses client `RequestMessage`, samples OWD at **receive** (`recv_us − send_time_us`, Nezha-style), and enqueues to `incomingQu_[partition]` (single parse).
-- **Commit worker (one thread per partition):** owns `PartitionState[partition]`. Drains `incomingQu_` via **`AdmitInboundClientRequest`** (Nezha-style per-key `lastReleasedByOpKey` watermark `(deadline_us, reqKey)` with **`reqKey = (client_id<<32)|request_id`** — required for multi-sender benches on the same KV keys; using `request_id` alone causes false slow-path storms). Not global `deadlineCounter` on the fast path. Runs **`ProcessDueFastReplies`** after each admitted request and in priority spins before append/sync (send `FastReply` at deadline; if admission is late, deadline is already past and replies go out immediately). **`ProcessPendingLogAppends`** uses a smaller budget while `incomingQu_` or due `earlyBuffer` entries remain (append/sync must not starve admission — open-loop bench latency is dominated by time until `FastReply`, not by `deadline_us` magnitude). `commitQu_` drain is capped per loop. Drains `commitQu_` for replication control messages.
+- **Commit worker (one thread per partition):** drains `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** sends `FastReply` at deadline in **global deadline order** (never release out of order on admit — that breaks per-key rank and causes slow-path storms). Drains `commitQu_` for replication control (capped per loop). Does **not** run log append/sync on the hot path.
+- **Durability worker (one thread per partition):** drains `durabilityQu_` after each `FastReply` and runs **`AppendPendingLogEntry`** (log + `SyncBroadcast` + WAL). Keeps multicast sync off the commit thread that releases client-visible replies.
 - **Shared state:** `deadlineCounter` per partition is updated on **apply** (read visibility / commit ordering). Fast-path admission uses **`lastReleasedByOpKey`** `(deadline_us, request_id)` per KV op-key. `ReplicaOwdEstimator` is sampled on the transport thread; `owdMutex_` guards the estimator map.
 
 ### Fast path (single-shard network partition)
 
 - Step 3: Replica buffers on-time requests in `earlyBuffer` until deadline `d`.
 - Step 4: When `now >= d`, replica sends `FastReply` to the client (`ProcessDueFastReplies`).
-- Step 5: After that reply, `ProcessPendingLogAppends` appends to the ordered log and runs sync/commit (budgeted so replies are not blocked by WAL/sync).
+- Step 5: After that reply, the durability worker appends to the ordered log and runs sync/commit (off the FastReply commit thread).
 - Step 6: Partition leader sends `SyncBroadcast` with partition ID, log position, and deadline.
 - Step 7:
   - Followers reconcile log position/deadline with leader broadcast.

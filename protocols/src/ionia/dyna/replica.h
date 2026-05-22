@@ -127,7 +127,6 @@ private:
         std::unordered_set<uint64_t> repliedReads;
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingSyncByReq;
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingLateSyncByReq;
-        std::deque<BufferedRequest> pendingLogAppend;
         std::unordered_map<uint64_t, ReleasedRank> lastReleasedByOpKey;
     };
 
@@ -145,12 +144,16 @@ private:
 
     std::vector<moodycamel::ConcurrentQueue<InboundWork>> commitQu_;
     std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> incomingQu_;
+    /** Post-FastReply log append / sync (off hot commit thread). */
+    std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> durabilityQu_;
     std::vector<std::thread> commitThreads_;
+    std::vector<std::thread> durabilityThreads_;
     std::atomic<bool> workersRunning_{false};
 
     void StartWorkers();
     void StopWorkers();
     void CommitPartitionLoop(uint32_t partitionId);
+    void DurabilityPartitionLoop(uint32_t partitionId);
     void DispatchCommitInbound(uint32_t partitionId, InboundWork &work);
     void DrainIncomingBuffered(uint32_t partitionId);
     void AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &buffered);
@@ -177,7 +180,6 @@ private:
     void ProcessDueFastReplies(uint32_t partitionId);
     void ReleaseBufferedRequest(uint32_t partitionId, BufferedRequest &buffered);
     static bool EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs);
-    bool ProcessPendingLogAppends(uint32_t partitionId, size_t maxEntries);
     void AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released);
     void BufferRequestUntilDeadline(uint32_t partitionId,
                                     const TransportAddress &remote,

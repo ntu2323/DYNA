@@ -150,7 +150,8 @@ def main() -> None:
     all_roles = receiver_roles + sender_roles
 
     vrconfig = _vr_config([receiver_internal[r] for r in receiver_roles], VR_PORT)
-    trace = bench_trace.trace_micro_bytes()
+    num_keys = int(os.environ.get("BENCH_TRACE_NUM_KEYS", bench_trace.DEFAULT_TRACE_NUM_KEYS))
+    trace = bench_trace.trace_micro_bytes(bench_trace.build_write_trace_spec(num_keys))
     bundle_files = {"vrconfig": vrconfig, bench_trace.TRACE_MICRO_FILENAME: trace}
 
     ssh_key = args.ssh_key or None
