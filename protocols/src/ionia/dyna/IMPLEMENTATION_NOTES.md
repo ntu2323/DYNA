@@ -44,15 +44,15 @@ Environment (optional overrides):
 ### Replica threading (Nezha-style pipeline)
 
 - **Transport thread:** `ReceiveMessage` parses `partition_id` on client requests and enqueues to `fastInboundQu_[partition]` (no other protocol logic).
-- **Fast worker (one thread per partition):** drains `fastInboundQu_[partition]` for client `RequestMessage` only. On the fast path it sends `FastReply` immediately, then enqueues a `BufferedRequest` on `incomingQu_[partition]` for replication. Slow-path leader requests are forwarded to `commitQu_[partition]` without a fast reply on this thread.
+- **Fast worker (one thread per partition):** drains `fastInboundQu_[partition]` for client `RequestMessage` only. On the fast path it **buffers** on-time requests on `incomingQu_[partition]` (no immediate `FastReply`). Slow-path leader requests are forwarded to `commitQu_[partition]`; late followers are recorded in `latBuffer` on the fast worker.
 - **Commit worker (one thread per partition):** exclusively owns `PartitionState[partition]`. Drains `incomingQu_` into `earlyBuffer` / `latBuffer`, drains `commitQu_` for sync/commit/fetch/late-sync and slow-path requests, and runs `ProcessDueRequests` every 1 ms. WAL `fsync`, `CommitBroadcast`, and `ApplyCommittedUpTo` run here only.
 - **Shared state:** `deadlineCounter` per partition is `std::atomic` (fast worker reads for slow-path gate; commit worker updates on apply). `kvStore` / `appliedWrites` updates are guarded by `kvMutex_` because multiple commit threads may apply concurrently. `ReplicaOwdEstimator` is guarded by `owdMutex_` (fast worker samples; commit/slow path may read estimates).
 
 ### Fast path (single-shard network partition)
 
-- Step 3: Replica buffers on-time requests in `earlyBuffer` until deadline.
-- Step 4: Replica sends immediate `FastReply` to client.
-- Step 5: Background tick releases due requests into an internal ordered log.
+- Step 3: Replica buffers on-time requests in `earlyBuffer` until deadline `d`.
+- Step 4: When `now >= d`, replica sends `FastReply` to the client (commit worker / `ProcessDueRequests`).
+- Step 5: After that reply, background processing appends to the ordered log and runs sync/commit.
 - Step 6: Partition leader sends `SyncBroadcast` with partition ID, log position, and deadline.
 - Step 7:
   - Followers reconcile log position/deadline with leader broadcast.

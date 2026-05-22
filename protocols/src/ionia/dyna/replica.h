@@ -119,6 +119,8 @@ private:
         std::unordered_map<uint64_t, std::unordered_map<uint32_t, proto::SyncAck>> ackMap;
         std::unordered_set<uint64_t> repliedReads;
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingSyncByReq;
+        /** Slow-path leader: (old_deadline, new_deadline) for LateSyncBroadcast after append. */
+        std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingLateSyncByReq;
     };
 
     Configuration config;
@@ -166,6 +168,9 @@ private:
     PartitionState &StateFor(uint32_t partitionId);
     const PartitionState &StateFor(uint32_t partitionId) const;
     void ProcessDueRequestsTick(uint32_t partitionId);
+    void BufferRequestUntilDeadline(uint32_t partitionId,
+                                    const TransportAddress &remote,
+                                    const proto::RequestMessage &req);
     void HandleLateRequest(const TransportAddress &remote, const proto::RequestMessage &req, uint32_t partitionId);
     void HandleLateSyncBroadcast(const TransportAddress &remote, const proto::LateSyncBroadcast &lsb);
     void HandleSyncBroadcast(const TransportAddress &remote, const proto::SyncBroadcast &sb);

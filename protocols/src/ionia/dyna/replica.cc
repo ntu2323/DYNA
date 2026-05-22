@@ -433,7 +433,7 @@ DynaReplica::HandleRequestFast(const TransportAddress &remote, const proto::Requ
         owdEstimator_.sample(req.client_id(), recv_us - req.send_time_us());
     }
 
-    const PartitionState &state = StateFor(partitionId);
+    PartitionState &state = StateFor(partitionId);
     if (req.deadline_us() <= state.deadlineCounter.load(std::memory_order_acquire)) {
         if (AmLeader(partitionId)) {
             if (SlowPathDebugEnabled()) {
@@ -446,11 +446,13 @@ DynaReplica::HandleRequestFast(const TransportAddress &remote, const proto::Requ
             }
             const std::string payload = req.SerializeAsString();
             EnqueueCommit(partitionId, InboundKind::REQUEST, remote, payload);
+        } else {
+            const RequestKey key = KeyOf(req);
+            state.requestClients[key] = std::shared_ptr<TransportAddress>(remote.clone());
+            state.latBuffer[key] = req;
         }
         return;
     }
-
-    SendFastReply(partitionId, remote, req.client_id(), req.request_id(), req.deadline_us());
 
     BufferedRequest buffered;
     buffered.request = req;
@@ -471,6 +473,23 @@ DynaReplica::HandleRequestSlow(const TransportAddress &remote, const proto::Requ
 }
 
 void
+DynaReplica::BufferRequestUntilDeadline(uint32_t partitionId,
+                                        const TransportAddress &remote,
+                                        const proto::RequestMessage &req)
+{
+    PartitionState &state = StateFor(partitionId);
+    const RequestKey key = KeyOf(req);
+    state.requestClients[key] = std::shared_ptr<TransportAddress>(remote.clone());
+    state.latBuffer[key] = req;
+
+    BufferedRequest buffered;
+    buffered.request = req;
+    buffered.clientAddress = state.requestClients[key];
+    buffered.sequence = state.nextSequence++;
+    state.earlyBuffer.push(std::move(buffered));
+}
+
+void
 DynaReplica::HandleLateRequest(const TransportAddress &remote, const proto::RequestMessage &req, uint32_t partitionId)
 {
     PartitionState &state = StateFor(partitionId);
@@ -481,39 +500,27 @@ DynaReplica::HandleLateRequest(const TransportAddress &remote, const proto::Requ
 
     proto::RequestMessage revised = req;
     revised.set_deadline_us(newDeadline);
-    state.latBuffer[key] = revised;
-    state.requestClients[key] = std::shared_ptr<TransportAddress>(remote.clone());
 
-    uint64_t logIndex = 0;
     auto logIt = state.requestToLogIndex.find(key);
-    if (logIt == state.requestToLogIndex.end()) {
-        AppendToLog(partitionId, revised);
-        logIt = state.requestToLogIndex.find(key);
-        if (logIt == state.requestToLogIndex.end()) {
-            return;
-        }
-    } else {
-        if (logIt->second < state.logEntries.size()) {
-            LogEntry &entry = state.logEntries[logIt->second];
-            if (entry.valid && entry.clientId == req.client_id() && entry.requestId == req.request_id()) {
-                entry.deadlineUs = newDeadline;
-            }
+    if (logIt != state.requestToLogIndex.end() &&
+        logIt->second < state.logEntries.size()) {
+        LogEntry &entry = state.logEntries[logIt->second];
+        if (entry.valid && entry.clientId == req.client_id() && entry.requestId == req.request_id()) {
+            entry.deadlineUs = newDeadline;
         }
     }
-    logIndex = logIt->second;
-    if (logIndex < state.logEntries.size() && state.logEntries[logIndex].valid) {
-        if (SlowPathDebugEnabled()) {
-            Notice("DYNA slowpath leader rewrite req=(%lu,%lu) part=%u log=%lu old_deadline=%lu new_deadline=%lu",
-                   req.client_id(),
-                   req.request_id(),
-                   partitionId,
-                   logIndex,
-                   oldDeadline,
-                   newDeadline);
-        }
-        BroadcastLateSyncForLogEntry(partitionId, state.logEntries[logIndex], oldDeadline, newDeadline);
+
+    if (SlowPathDebugEnabled()) {
+        Notice("DYNA slowpath leader buffer req=(%lu,%lu) part=%u old_deadline=%lu new_deadline=%lu",
+               req.client_id(),
+               req.request_id(),
+               partitionId,
+               oldDeadline,
+               newDeadline);
     }
-    SendFastReply(partitionId, remote, req.client_id(), req.request_id(), newDeadline);
+
+    state.pendingLateSyncByReq[key] = std::make_pair(oldDeadline, newDeadline);
+    BufferRequestUntilDeadline(partitionId, remote, revised);
 }
 
 //pops requests on timer
@@ -531,6 +538,15 @@ DynaReplica::ProcessDueRequests(uint32_t partitionId)
         BufferedRequest current = top;
         state.earlyBuffer.pop();
 
+        const RequestKey keyReq = KeyOf(current.request);
+        if (current.clientAddress) {
+            SendFastReply(partitionId,
+                          *current.clientAddress,
+                          current.request.client_id(),
+                          current.request.request_id(),
+                          current.request.deadline_us());
+        }
+
         char op = '\0';
         std::string key;
         std::string value;
@@ -538,9 +554,23 @@ DynaReplica::ProcessDueRequests(uint32_t partitionId)
             continue;
         }
 
-        const auto keyReq = KeyOf(current.request);
         if (state.requestToLogIndex.find(keyReq) == state.requestToLogIndex.end()) {
             AppendToLog(partitionId, current.request);
+            if (AmLeader(partitionId)) {
+                auto lateIt = state.pendingLateSyncByReq.find(keyReq);
+                if (lateIt != state.pendingLateSyncByReq.end()) {
+                    auto logIt = state.requestToLogIndex.find(keyReq);
+                    if (logIt != state.requestToLogIndex.end() &&
+                        logIt->second < state.logEntries.size() &&
+                        state.logEntries[logIt->second].valid) {
+                        BroadcastLateSyncForLogEntry(partitionId,
+                                                     state.logEntries[logIt->second],
+                                                     lateIt->second.first,
+                                                     lateIt->second.second);
+                    }
+                    state.pendingLateSyncByReq.erase(lateIt);
+                }
+            }
         }
     }
 }
@@ -697,9 +727,20 @@ DynaReplica::HandleLateSyncBroadcast(const TransportAddress &remote, const proto
 
     const RequestKey key{lsb.client_id(), lsb.request_id()};
     auto addrIt = state.requestClients.find(key);
-    if (addrIt != state.requestClients.end() && addrIt->second) {
-        SendFastReply(partitionId, *addrIt->second, lsb.client_id(), lsb.request_id(), lsb.new_deadline_us());
+    if (addrIt == state.requestClients.end() || !addrIt->second) {
+        return;
     }
+
+    proto::RequestMessage req;
+    if (!TryGetRequestMessage(partitionId, key, req)) {
+        req.set_partition_id(partitionId);
+        req.set_client_id(lsb.client_id());
+        req.set_request_id(lsb.request_id());
+        req.set_deadline_us(lsb.new_deadline_us());
+    } else {
+        req.set_deadline_us(lsb.new_deadline_us());
+    }
+    BufferRequestUntilDeadline(partitionId, *addrIt->second, req);
 }
 
 void
