@@ -135,6 +135,8 @@ private:
     int replicaIdx;
     Transport *transport;
     std::vector<PartitionState> partitions;
+    /** Guards PartitionState for each index (commit + durability threads). */
+    std::vector<std::mutex> partitionMu_;
     std::deque<StoredWrite> appliedWrites;
     std::unordered_map<std::string, std::string> kvStore;
     ReplicaOwdEstimator owdEstimator_;

@@ -50,6 +50,7 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
       replicaIdx(replicaIdx),
       transport(transport),
       partitions(numPartitions),
+      partitionMu_(numPartitions),
       commitQu_(numPartitions),
       incomingQu_(numPartitions),
       durabilityQu_(numPartitions),
@@ -214,6 +215,7 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
 
     while (workersRunning_.load()) {
         bool handledWork = false;
+        std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
         PartitionState &state = StateFor(partitionId);
 
         // Admission + FastReply at deadline must run ahead of append/sync (open-loop
@@ -272,7 +274,10 @@ DynaReplica::DurabilityPartitionLoop(uint32_t partitionId)
             if (!durabilityQu_[partitionId].try_dequeue(released)) {
                 break;
             }
-            AppendPendingLogEntry(partitionId, released);
+            {
+                std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
+                AppendPendingLogEntry(partitionId, released);
+            }
             didWork = true;
         }
         if (!didWork) {
