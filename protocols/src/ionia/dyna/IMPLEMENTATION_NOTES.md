@@ -26,8 +26,9 @@ This document tracks implementation progress, behavior choices, and known concer
 - Modular code under `dyna/deadline/`:
   - `deadline_config.{h,cc}` — `DeadlineConfig::FromEnvironment()` (`DYNA_*` knobs below).
   - `client_bound_tracker.{h,cc}` — event-driven bound = **max** of last known per-replica OWD (after **every K** samples), clamped by **`DYNA_MAX_OWD_US`**.
-  - `replica_owd_estimator.{h,cc}` — per **`client_id`** sliding-window **percentile** over **`recv_us − send_time_us`** samples (requires clocks comparable to Nezha).
-- Wire: optional **`owd_us`** on **`FastReply`** and **`ReadResult`**; **`deadline_us = send_time_us + bound_us`** on new requests (`Invoke` snapshots **`send_us`** once, then adds current bound).
+  - `replica_owd_estimator.{h,cc}` — per **`client_id`** sliding-window **percentile** over **`recv_us − send_time_us`** samples.
+  - `wall_clock.h` — **`std::chrono::system_clock`** microsecond epoch (Nezha-style; comparable across GCP VMs with NTP).
+- Wire: optional **`owd_us`** on **`FastReply`** and **`ReadResult`**; **`deadline_us = send_time_us + bound_us`** on new requests (`Invoke` snapshots **`send_us`** via wall clock, then adds current bound).
 
 Environment (optional overrides):
 

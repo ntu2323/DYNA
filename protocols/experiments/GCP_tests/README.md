@@ -85,11 +85,11 @@ SSH_USER=nathan python3 run_cluster_bench.py \
 ```bash
 # VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
 SSH_USER=nathan python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
-  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 70
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
 # DYNA — same defaults
 SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
-  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 70
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
 # Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)
 SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
@@ -143,6 +143,8 @@ cd ~/Ionia/protocols/src/ionia
 ```
 
 Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (update these if you want open-loop flags baked in).
+
+**DYNA slow-path logs:** `~/bench/start_dyna_replica.sh` sets `DYNA_SLOWPATH_DEBUG=1` by default (logging only; does not force slow path). After a bench run, on each receiver: `grep "DYNA slowpath" ~/bench/replica-*.log`. Disable with `DYNA_SLOWPATH_DEBUG=0` before starting a replica. Re-run `setup_dyna_cluster.py --skip-build` to refresh the helper on existing VMs. Deadlines use **`system_clock`** (Nezha-style), not per-VM `steady_clock`, so senders and replicas should agree under GCP NTP.
 
 ---
 

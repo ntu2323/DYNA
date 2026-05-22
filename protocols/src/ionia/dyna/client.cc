@@ -4,12 +4,12 @@
 
 
 #include "dyna/client.h"
+#include "dyna/wall_clock.h"
 
 #include "lib/assert.h"
 #include "lib/message.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <cstring>
 
@@ -167,8 +167,7 @@ DynaClient::ReceiveMessage(const TransportAddress &remote, const std::string_vie
 uint64_t
 DynaClient::NowMicros() const
 {
-    using namespace std::chrono;
-    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+    return WallClockMicros();
 }
 
 uint64_t

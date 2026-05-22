@@ -1,6 +1,7 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
 
 #include "dyna/replica.h"
+#include "dyna/wall_clock.h"
 
 #include "lib/assert.h"
 #include "lib/message.h"
@@ -383,8 +384,7 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote, const std::string_vi
 uint64_t
 DynaReplica::NowMicros() const
 {
-    using namespace std::chrono;
-    return duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
+    return WallClockMicros();
 }
 
 bool
