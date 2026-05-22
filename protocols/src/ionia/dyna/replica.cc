@@ -26,6 +26,25 @@ static constexpr size_t kDefaultReplicationBurstBudget = 8192;
 static constexpr size_t kDefaultReplicationBacklogThreshold = 1000;
 static constexpr uint32_t kDefaultFastReplyShards = 16;
 
+/** Yield this many times before falling back to a short OS sleep. */
+static constexpr int kIdleSpinIterations = 32;
+/** Short OS sleep used after yield-spin exhausts; far below the prior 50us floor. */
+static constexpr std::chrono::microseconds kIdleSleep{5};
+/** Cap on time we wait for the next earlyBuffer deadline before re-checking. */
+static constexpr uint64_t kReleaseSleepCapUs = 20;
+
+/** Hybrid yield-then-short-sleep used by worker idle paths to avoid 50us floors. */
+static inline void
+IdleBackoff(int &spinCount)
+{
+    if (spinCount < kIdleSpinIterations) {
+        std::this_thread::yield();
+        ++spinCount;
+    } else {
+        std::this_thread::sleep_for(kIdleSleep);
+    }
+}
+
 static size_t
 ReplicationBudgetNormal()
 {
@@ -309,26 +328,46 @@ DynaReplica::StopWorkers()
 void
 DynaReplica::ProcessPartitionLoop(uint32_t partitionId)
 {
+    int spinCount = 0;
     while (workersRunning_.load()) {
-        bool handledWork = false;
+        bool didWork = false;
+        bool incomingPending = false;
+        bool earlyPending = false;
+        uint64_t nextDeadlineUs = 0;
+        uint64_t nowUs = 0;
         {
             std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
             PartitionState &state = StateFor(partitionId);
 
             DrainIncomingBuffered(partitionId);
-            uint64_t nowUs = NowMicros();
+            nowUs = NowMicros();
             while (EarlyBufferHasDue(state, nowUs)) {
                 ProcessDueFastReplies(partitionId);
                 nowUs = NowMicros();
+                didWork = true;
             }
 
-            if (!state.earlyBuffer.empty() || incomingQu_[partitionId].size_approx() > 0) {
-                handledWork = true;
+            if (!state.earlyBuffer.empty()) {
+                earlyPending = true;
+                nextDeadlineUs = state.earlyBuffer.top().request.deadline_us();
+            }
+            if (incomingQu_[partitionId].size_approx() > 0) {
+                incomingPending = true;
             }
         }
 
-        if (!handledWork) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (didWork || incomingPending) {
+            spinCount = 0;
+            continue;
+        }
+
+        if (earlyPending && nextDeadlineUs > nowUs) {
+            const uint64_t deltaUs = nextDeadlineUs - nowUs;
+            const uint64_t sleepUs = deltaUs < kReleaseSleepCapUs ? deltaUs : kReleaseSleepCapUs;
+            std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+            spinCount = 0;
+        } else {
+            IdleBackoff(spinCount);
         }
     }
 }
@@ -339,6 +378,7 @@ DynaReplica::ReplicationPartitionLoop(uint32_t partitionId)
     const size_t normalBudget = ReplicationBudgetNormal();
     const size_t burstBudget = ReplicationBudgetBurst();
     const size_t backlogThreshold = ReplicationBacklogThreshold();
+    int spinCount = 0;
 
     while (workersRunning_.load()) {
         const size_t backlog = replicationQu_[partitionId].size_approx();
@@ -355,15 +395,18 @@ DynaReplica::ReplicationPartitionLoop(uint32_t partitionId)
             DispatchCommitInbound(partitionId, work);
             didWork = true;
         }
-        if (!didWork) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (didWork) {
+            spinCount = 0;
+            continue;
         }
+        IdleBackoff(spinCount);
     }
 }
 
 void
 DynaReplica::FastReplyThreadLoop(uint32_t shardId)
 {
+    int spinCount = 0;
     while (workersRunning_.load()) {
         FastReplySendJob job;
         if (fastReplyQu_[shardId].try_dequeue(job)) {
@@ -374,9 +417,10 @@ DynaReplica::FastReplyThreadLoop(uint32_t shardId)
                 }
             }
             SendFastReplyFromJob(job);
+            spinCount = 0;
             continue;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        IdleBackoff(spinCount);
     }
 }
 
@@ -469,20 +513,23 @@ DynaReplica::EmitReplicaStats()
 void
 DynaReplica::OwdThreadLoop()
 {
+    int spinCount = 0;
     while (workersRunning_.load()) {
         OwdSample sample;
         if (owdQu_.try_dequeue(sample)) {
             std::lock_guard<std::mutex> lock(owdMutex_);
             owdEstimator_.sample(sample.clientId, sample.delayUs);
+            spinCount = 0;
             continue;
         }
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
+        IdleBackoff(spinCount);
     }
 }
 
 void
 DynaReplica::DurabilityPartitionLoop(uint32_t partitionId)
 {
+    int spinCount = 0;
     while (workersRunning_.load()) {
         bool didWork = false;
         for (size_t i = 0; i < kDurabilityBudgetPerLoop; ++i) {
@@ -556,9 +603,11 @@ DynaReplica::DurabilityPartitionLoop(uint32_t partitionId)
             }
             didWork = true;
         }
-        if (!didWork) {
-            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        if (didWork) {
+            spinCount = 0;
+            continue;
         }
+        IdleBackoff(spinCount);
     }
 }
 

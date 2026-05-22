@@ -267,6 +267,11 @@ BenchmarkClient::WarmupDone()
     opLastInterval = 0;
     expStartTime = std::chrono::high_resolution_clock::now();
 
+    if (logLatency) {
+        latencies.clear();
+        inflightStartNs_.clear();
+    }
+
     if (!openLoop_) {
         SendNext();
     }
@@ -323,7 +328,7 @@ BenchmarkClient::SubmitOne()
     const uint64_t submitId = ++submitSeq_;
     totalSubmitted_++;
 
-    if (logLatency) {
+    if (logLatency && started) {
         const auto now = std::chrono::steady_clock::now();
         inflightStartNs_[submitId] =
             std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
@@ -389,7 +394,7 @@ BenchmarkClient::OnReplyOpen(uint64_t submitId, const string &request, const str
         return;
     }
 
-    if (logLatency) {
+    if (logLatency && started && !done) {
         auto it = inflightStartNs_.find(submitId);
         if (it != inflightStartNs_.end()) {
             const auto now = std::chrono::steady_clock::now();

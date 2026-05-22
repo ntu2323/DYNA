@@ -23,6 +23,16 @@ pip install -r requirements-deploy.txt
 python3 create_cluster.py 4 --hosts-file cluster_hosts.json
 ```
 
+**Default (no flags):** all VMs use `deploy_vm.ZONE` (`us-east4-c`) — no zone overrides passed to `create_vm`.
+
+**Wide-area (1 RTT DYNA vs 2 RTT VR):** `--spread-replica-zones` places receivers in `EXTRA_REPLICA_ZONES` and senders in `EXTRA_CLIENT_ZONE` (edit both at the top of `create_cluster.py`):
+
+```bash
+python3 create_cluster.py 4 --hosts-file cluster_hosts.json --spread-replica-zones
+```
+
+`cluster_hosts.json` records `receiver_zones`, `extra_client_zone` (when spread), and `spread_replica_zones`. Ensure firewall **UDP 31880** allows replica traffic between those zones (and from senders).
+
 ---
 
 ## 2. Setup VMs
