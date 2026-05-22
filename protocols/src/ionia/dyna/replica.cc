@@ -26,23 +26,28 @@ static constexpr size_t kDefaultReplicationBurstBudget = 8192;
 static constexpr size_t kDefaultReplicationBacklogThreshold = 1000;
 static constexpr uint32_t kDefaultFastReplyShards = 16;
 
-/** Yield this many times before falling back to a short OS sleep. */
-static constexpr int kIdleSpinIterations = 32;
-/** Short OS sleep used after yield-spin exhausts; far below the prior 50us floor. */
+/** Short OS sleep used on idle paths to drop the prior 50us floor without yield-spinning. */
 static constexpr std::chrono::microseconds kIdleSleep{5};
 /** Cap on time we wait for the next earlyBuffer deadline before re-checking. */
 static constexpr uint64_t kReleaseSleepCapUs = 20;
 
-/** Hybrid yield-then-short-sleep used by worker idle paths to avoid 50us floors. */
+/**
+ * Idle wait used by worker loops with no work.
+ *
+ * Earlier versions of this helper yield-spun before sleeping to react quickly to
+ * new work. With ~42 worker threads on a small GCP VM that strategy starved the
+ * UDP receive thread and inflated p99 to ~14ms. A clean sleep parks the thread
+ * so network handlers get CPU promptly; 5us is short enough to keep the median
+ * floor low.
+ *
+ * The `spinCount` parameter is unused; kept for caller-side simplicity so the
+ * call sites do not need to be touched when we revisit (e.g. condvars).
+ */
 static inline void
 IdleBackoff(int &spinCount)
 {
-    if (spinCount < kIdleSpinIterations) {
-        std::this_thread::yield();
-        ++spinCount;
-    } else {
-        std::this_thread::sleep_for(kIdleSleep);
-    }
+    (void)spinCount;
+    std::this_thread::sleep_for(kIdleSleep);
 }
 
 static size_t
