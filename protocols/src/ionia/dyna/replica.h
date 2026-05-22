@@ -69,10 +69,10 @@ private:
         }
     };
 
-    /** Nezha-style (deadline, request_id) watermark per KV op-key for fast-path admission. */
+    /** Nezha-style (deadline, reqKey) watermark per KV op-key; reqKey = (client_id<<32)|request_id. */
     struct ReleasedRank {
         uint64_t deadlineUs = 0;
-        uint64_t requestId = 0;
+        uint64_t reqKey = 0;
     };
 
     struct BufferedRequest {

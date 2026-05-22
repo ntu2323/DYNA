@@ -91,11 +91,18 @@ DynaReplica::OpKeyFromCommand(const std::string &command)
 }
 
 DynaReplica::ReleasedRank
+static uint64_t
+ReqKeyFromMessage(const proto::RequestMessage &req)
+{
+    return (static_cast<uint64_t>(req.client_id()) << 32) |
+           static_cast<uint64_t>(static_cast<uint32_t>(req.request_id()));
+}
+
 DynaReplica::RankOf(const proto::RequestMessage &req)
 {
     ReleasedRank rank;
     rank.deadlineUs = req.deadline_us();
-    rank.requestId = req.request_id();
+    rank.reqKey = ReqKeyFromMessage(req);
     return rank;
 }
 
@@ -105,7 +112,7 @@ DynaReplica::RankAfter(const ReleasedRank &incoming, const ReleasedRank &release
     if (incoming.deadlineUs != released.deadlineUs) {
         return incoming.deadlineUs > released.deadlineUs;
     }
-    return incoming.requestId > released.requestId;
+    return incoming.reqKey > released.reqKey;
 }
 
 bool
@@ -260,9 +267,17 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
 void
 DynaReplica::DrainIncomingBuffered(uint32_t partitionId)
 {
+    static constexpr size_t kDrainBatchBeforeRelease = 64;
     BufferedRequest buffered;
+    size_t admitted = 0;
     while (incomingQu_[partitionId].try_dequeue(buffered)) {
         AdmitInboundClientRequest(partitionId, buffered);
+        if (++admitted >= kDrainBatchBeforeRelease) {
+            ProcessDueFastReplies(partitionId);
+            admitted = 0;
+        }
+    }
+    if (admitted > 0) {
         ProcessDueFastReplies(partitionId);
     }
 }
@@ -296,7 +311,7 @@ DynaReplica::AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &bu
                    partitionId,
                    req.deadline_us(),
                    released.deadlineUs,
-                   released.requestId);
+                   released.reqKey);
         }
         if (!buffered.clientAddress) {
             Warning("DYNA slowpath leader missing client address part=%u", partitionId);
