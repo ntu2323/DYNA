@@ -63,7 +63,11 @@ export DYNA_WAL_DIR="${DYNA_WAL_DIR:-$HOME/bench/wal}"
 export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
 export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
 export DYNA_BOUND_RECOMPUTE_K="${DYNA_BOUND_RECOMPUTE_K:-1}"
-export DYNA_FAST_REPLY_SHARDS="${DYNA_FAST_REPLY_SHARDS:-16}"
+# Default fast-reply shard count is tuned for small (2 vCPU) replica VMs:
+# more shards mean more worker threads, which on a 2-vCPU box leads to CPU
+# oversubscription and ms-scale OS scheduling stalls on the reply path.
+# Bump back to 8-16 on >=4 vCPU machines if fastreply_full ever shows up.
+export DYNA_FAST_REPLY_SHARDS="${DYNA_FAST_REPLY_SHARDS:-2}"
 # Set DYNA_EAGER_FAST_REPLY=1 to bypass the earlyBuffer deadline hold and
 # fast-reply on admit (lower mean/p99 under load, at the cost of more
 # slow-path events under high same-key contention). Default OFF.
