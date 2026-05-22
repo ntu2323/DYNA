@@ -43,10 +43,9 @@ Environment (optional overrides):
 
 ### Replica threading (Nezha-style pipeline)
 
-- **Transport thread:** `ReceiveMessage` parses `partition_id` on client requests and enqueues to `fastInboundQu_[partition]` (no other protocol logic).
-- **Fast worker (one thread per partition):** drains `fastInboundQu_[partition]` for client `RequestMessage` only. On the fast path it **buffers** on-time requests on `incomingQu_[partition]` (no immediate `FastReply`). Slow-path leader requests are forwarded to `commitQu_[partition]`; late followers are recorded in `latBuffer` on the fast worker.
-- **Commit worker (one thread per partition):** exclusively owns `PartitionState[partition]`. Drains `incomingQu_` into `earlyBuffer` / `latBuffer`, runs **`ProcessDueFastReplies`** every loop iteration (send `FastReply` at deadline, enqueue `pendingLogAppend`), then **`ProcessPendingLogAppends`** with a per-loop budget (log append / sync / WAL). Also drains `commitQu_` for sync/commit/fetch/late-sync and slow-path requests.
-- **Shared state:** `deadlineCounter` per partition is `std::atomic` (fast worker reads for slow-path gate; commit worker updates on apply). `kvStore` / `appliedWrites` updates are guarded by `kvMutex_` because multiple commit threads may apply concurrently. `ReplicaOwdEstimator` is guarded by `owdMutex_` (fast worker samples; commit/slow path may read estimates).
+- **Transport thread:** `ReceiveMessage` parses client `RequestMessage`, samples OWD at **receive** (`recv_us − send_time_us`, Nezha-style), and enqueues to `incomingQu_[partition]` (single parse).
+- **Commit worker (one thread per partition):** owns `PartitionState[partition]`. Drains `incomingQu_` via **`AdmitInboundClientRequest`** (Nezha-style per-key `lastReleasedByOpKey` watermark for on-time vs slow; not global `deadlineCounter` on the fast path). Runs **`ProcessDueFastReplies`** in a tight loop when due (send `FastReply` at deadline, record released rank for writes, enqueue `pendingLogAppend`), then **`ProcessPendingLogAppends`** with a per-loop budget (log append / sync / WAL). Drains `commitQu_` for replication control messages.
+- **Shared state:** `deadlineCounter` per partition is updated on **apply** (read visibility / commit ordering). Fast-path admission uses **`lastReleasedByOpKey`** `(deadline_us, request_id)` per KV op-key. `ReplicaOwdEstimator` is sampled on the transport thread; `owdMutex_` guards the estimator map.
 
 ### Fast path (single-shard network partition)
 

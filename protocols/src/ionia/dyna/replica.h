@@ -69,6 +69,12 @@ private:
         }
     };
 
+    /** Nezha-style (deadline, request_id) watermark per KV op-key for fast-path admission. */
+    struct ReleasedRank {
+        uint64_t deadlineUs = 0;
+        uint64_t requestId = 0;
+    };
+
     struct BufferedRequest {
         proto::RequestMessage request;
         std::shared_ptr<TransportAddress> clientAddress;
@@ -106,6 +112,7 @@ private:
 
     struct PartitionState {
         std::atomic<uint64_t> viewId{0};
+        /** Max applied deadline (read visibility / legacy); not used for fast-path admission. */
         std::atomic<uint64_t> deadlineCounter{0};
         uint64_t nextSequence = 0;
         uint64_t nextLogIndex = 0;
@@ -119,10 +126,9 @@ private:
         std::unordered_map<uint64_t, std::unordered_map<uint32_t, proto::SyncAck>> ackMap;
         std::unordered_set<uint64_t> repliedReads;
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingSyncByReq;
-        /** Slow-path leader: (old_deadline, new_deadline) for LateSyncBroadcast after append. */
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingLateSyncByReq;
-        /** FastReply already sent; waiting for log append / sync (commit thread only). */
         std::deque<BufferedRequest> pendingLogAppend;
+        std::unordered_map<uint64_t, ReleasedRank> lastReleasedByOpKey;
     };
 
     Configuration config;
@@ -137,31 +143,30 @@ private:
     mutable std::mutex owdMutex_;
     mutable std::mutex kvMutex_;
 
-    std::vector<moodycamel::ConcurrentQueue<InboundWork>> fastInboundQu_;
     std::vector<moodycamel::ConcurrentQueue<InboundWork>> commitQu_;
     std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> incomingQu_;
-    std::vector<std::thread> fastWorkerThreads_;
     std::vector<std::thread> commitThreads_;
     std::atomic<bool> workersRunning_{false};
 
     void StartWorkers();
     void StopWorkers();
-    void FastPartitionLoop(uint32_t partitionId);
     void CommitPartitionLoop(uint32_t partitionId);
-    void DispatchFastInbound(uint32_t partitionId, InboundWork &work);
     void DispatchCommitInbound(uint32_t partitionId, InboundWork &work);
     void DrainIncomingBuffered(uint32_t partitionId);
-    bool EnqueueFast(uint32_t partitionId,
-                     InboundKind kind,
-                     const TransportAddress &remote,
-                     const std::string_view data);
+    void AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &buffered);
+    bool EnqueueClientRequest(uint32_t partitionId,
+                              const TransportAddress &remote,
+                              const proto::RequestMessage &req);
     bool EnqueueCommit(uint32_t partitionId,
                        InboundKind kind,
                        const TransportAddress &remote,
                        const std::string_view data);
-    void HandleRequestFast(const TransportAddress &remote, const proto::RequestMessage &req);
-    void HandleRequestSlow(const TransportAddress &remote, const proto::RequestMessage &req);
     static void UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t value);
+    static uint64_t OpKeyFromCommand(const std::string &command);
+    static ReleasedRank RankOf(const proto::RequestMessage &req);
+    static bool RankAfter(const ReleasedRank &incoming, const ReleasedRank &released);
+    static bool IsOnTimeForOpKey(const PartitionState &state, const proto::RequestMessage &req);
+    static void RecordReleasedRank(PartitionState &state, const proto::RequestMessage &req);
 
     uint64_t NowMicros() const;
     uint32_t PartitionLeader(uint32_t partitionId) const;
@@ -190,7 +195,6 @@ private:
                                       uint64_t newDeadlineUs);
     void EnsureFollowerEntryFromSync(uint32_t partitionId, const proto::SyncBroadcast &sb);
     void TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack);
-    /** Leader: WAL fsync through upToLogIndex, then CommitBroadcast (same commit step). */
     bool LeaderCommitToDiskAndBroadcast(uint32_t partitionId, uint64_t upToLogIndex);
     void ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex);
     void BroadcastCommit(uint32_t partitionId, uint64_t upToLogIndex);
