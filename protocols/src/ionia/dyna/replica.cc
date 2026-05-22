@@ -90,7 +90,6 @@ DynaReplica::OpKeyFromCommand(const std::string &command)
     return static_cast<uint64_t>(std::hash<std::string>()(key));
 }
 
-DynaReplica::ReleasedRank
 static uint64_t
 ReqKeyFromMessage(const proto::RequestMessage &req)
 {
@@ -98,6 +97,7 @@ ReqKeyFromMessage(const proto::RequestMessage &req)
            static_cast<uint64_t>(static_cast<uint32_t>(req.request_id()));
 }
 
+DynaReplica::ReleasedRank
 DynaReplica::RankOf(const proto::RequestMessage &req)
 {
     ReleasedRank rank;
