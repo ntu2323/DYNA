@@ -28,6 +28,8 @@ from gcp_bench_common import (
     fetch_remote_file,
     load_hosts_file,
     receiver_index,
+    remote_receiver_cleanup_cmd,
+    remote_sender_cleanup_cmd,
     sender_client_id,
     ssh_run,
 )
@@ -37,13 +39,11 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROTOCOLS = {
     "vr": {
         "replica_start": "~/bench/start_paxos_vr_replica.sh {idx}",
-        "replica_cleanup": "rm -rf /dev/shm/rocks{idx}",
         "client_cwd": "${HOME}/Ionia/protocols/src/paxos",
         "client_bin": "./bench/client",
     },
     "dyna": {
         "replica_start": "~/bench/start_dyna_replica.sh {idx}",
-        "replica_cleanup": "",
         "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
         "client_bin": "./bench/client",
     },
@@ -134,22 +134,32 @@ def _start_replica(
     ssh_user: str,
     ssh_key: Optional[str],
     *,
-    reset_rocksdb: bool,
+    clean_remote: bool,
 ) -> tuple[str, bool, str]:
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
-    parts = [
-        PKILL_REPLICA,
-        "sleep 1",
-    ]
-    if reset_rocksdb and cfg["replica_cleanup"]:
-        parts.append(cfg["replica_cleanup"].format(idx=idx))
+    parts = []
+    if clean_remote:
+        parts.append(remote_receiver_cleanup_cmd(protocol, idx))
+    else:
+        parts.extend([PKILL_REPLICA, "sleep 1"])
     parts.append(cfg["replica_start"].format(idx=idx))
     cmd = "; ".join(parts)
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     ok = r.returncode == 0
-    err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
+    err = _ssh_error_message(r)
     return role, ok, err
+
+
+def _ssh_error_message(r: subprocess.CompletedProcess) -> str:
+    parts = []
+    if (r.stderr or "").strip():
+        parts.append(r.stderr.strip())
+    if (r.stdout or "").strip():
+        parts.append(r.stdout.strip())
+    if not parts:
+        parts.append(f"ssh exit {r.returncode}")
+    return ": ".join(parts)
 
 
 def _start_client(
@@ -160,19 +170,23 @@ def _start_client(
     ssh_user: str,
     ssh_key: Optional[str],
     client_args: dict,
+    *,
+    clean_remote: bool,
 ) -> tuple[str, bool, str]:
     mid = sender_client_id(role)
     # Separate SSH: pkill must not share a command line with ./bench/client.
-    r0 = ssh_run(host, ssh_user, ssh_key, f"{PKILL_CLIENT}; sleep 1")
+    if clean_remote:
+        r0 = ssh_run(host, ssh_user, ssh_key, remote_sender_cleanup_cmd())
+    else:
+        r0 = ssh_run(host, ssh_user, ssh_key, f"{PKILL_CLIENT}; sleep 1")
     if r0.returncode != 0:
-        err = (r0.stderr or r0.stdout or "").strip() or f"ssh exit {r0.returncode}"
-        return role, False, f"stop old client: {err}"
+        return role, False, f"stop old client: {_ssh_error_message(r0)}"
 
     inner = _build_client_cmd(protocol, run_id, machine_id=mid, **client_args)
     cmd = f"bash -lc {shlex.quote(inner)}"
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     ok = r.returncode == 0
-    err = (r.stderr or r.stdout or "").strip() or f"ssh exit {r.returncode}"
+    err = _ssh_error_message(r)
     return role, ok, err
 
 
@@ -266,7 +280,11 @@ def main() -> None:
     )
     ap.add_argument("--replica-wait-sec", type=int, default=8)
     ap.add_argument("--client-timeout-sec", type=int, default=7200)
-    ap.add_argument("--reset-rocksdb", action="store_true", help="VR only: rm /dev/shm/rocks{idx} before start.")
+    ap.add_argument(
+        "--no-clean-remote",
+        action="store_true",
+        help="Do not wipe remote bench state (default: pkill, rm runs/*, VR rocks, DYNA WAL).",
+    )
     ap.add_argument("--skip-replicas", action="store_true")
     ap.add_argument("--skip-clients", action="store_true", help="Only (re)start replicas.")
     args = ap.parse_args()
@@ -287,6 +305,7 @@ def main() -> None:
     os.makedirs(local_run_dir, exist_ok=True)
 
     ssh_key = args.ssh_key or None
+    clean_remote = not args.no_clean_remote
     open_loop = not args.closed_loop
     if open_loop:
         num_ops = args.num_ops
@@ -324,6 +343,7 @@ def main() -> None:
         "warmup_sec": args.warmup_sec,
         "interval_ms": args.interval_ms,
         "trim_pad_sec": args.trim_pad_sec,
+        "clean_remote": clean_remote,
         "threads": args.threads,
         "receivers": [{"role": r, "host": hosts[r], "index": receiver_index(r)} for r in receiver_roles],
         "senders": senders_meta,
@@ -332,6 +352,8 @@ def main() -> None:
     }
 
     if not args.skip_replicas:
+        if clean_remote:
+            print(f"Cleaning remote replica state ({args.protocol})...")
         print(f"Starting {args.protocol} replicas on {len(receiver_roles)} hosts...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:
             futs = [
@@ -342,7 +364,7 @@ def main() -> None:
                     args.protocol,
                     args.ssh_user,
                     ssh_key,
-                    reset_rocksdb=args.reset_rocksdb,
+                    clean_remote=clean_remote,
                 )
                 for r in receiver_roles
             ]
@@ -362,6 +384,8 @@ def main() -> None:
         print(f"Wrote {meta_path} (clients skipped)")
         return
 
+    if clean_remote:
+        print("Cleaning remote sender run dirs...")
     print(f"Starting clients on {len(sender_roles)} senders (run_id={run_id})...")
     t0 = time.time()
     meta["t0_unix"] = t0
@@ -378,6 +402,7 @@ def main() -> None:
                 args.ssh_user,
                 ssh_key,
                 client_args,
+                clean_remote=clean_remote,
             )
             for r in sender_roles
         ]

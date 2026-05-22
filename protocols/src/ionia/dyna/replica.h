@@ -133,21 +133,22 @@ private:
     mutable std::mutex owdMutex_;
     mutable std::mutex kvMutex_;
 
-    moodycamel::ConcurrentQueue<InboundWork> fastInboundQu_;
+    std::vector<moodycamel::ConcurrentQueue<InboundWork>> fastInboundQu_;
     std::vector<moodycamel::ConcurrentQueue<InboundWork>> commitQu_;
     std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> incomingQu_;
-    std::thread fastWorkerThread_;
+    std::vector<std::thread> fastWorkerThreads_;
     std::vector<std::thread> commitThreads_;
     std::atomic<bool> workersRunning_{false};
 
     void StartWorkers();
     void StopWorkers();
-    void FastWorkerLoop();
+    void FastPartitionLoop(uint32_t partitionId);
     void CommitPartitionLoop(uint32_t partitionId);
-    void DispatchFastInbound(InboundWork &work);
+    void DispatchFastInbound(uint32_t partitionId, InboundWork &work);
     void DispatchCommitInbound(uint32_t partitionId, InboundWork &work);
     void DrainIncomingBuffered(uint32_t partitionId);
-    bool EnqueueFast(InboundKind kind,
+    bool EnqueueFast(uint32_t partitionId,
+                     InboundKind kind,
                      const TransportAddress &remote,
                      const std::string_view data);
     bool EnqueueCommit(uint32_t partitionId,
@@ -157,6 +158,8 @@ private:
     void HandleRequestFast(const TransportAddress &remote, const proto::RequestMessage &req);
     void HandleRequestSlow(const TransportAddress &remote, const proto::RequestMessage &req);
     static void UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t value);
+    /** Advance ordering watermark for fast-path gate; runs before WAL fsync on commit. */
+    void AdvanceDeadlineCounterUpTo(uint32_t partitionId, uint64_t upToLogIndex);
 
     uint64_t NowMicros() const;
     uint32_t PartitionLeader(uint32_t partitionId) const;

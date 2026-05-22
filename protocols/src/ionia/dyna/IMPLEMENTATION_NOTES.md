@@ -42,8 +42,8 @@ Environment (optional overrides):
 
 ### Replica threading (Nezha-style pipeline)
 
-- **Transport thread:** `ReceiveMessage` copies inbound UDP payloads and enqueues work (no protocol logic).
-- **Fast worker (one thread):** drains `fastInboundQu_` for client `RequestMessage` only. On the fast path it sends `FastReply` immediately, then enqueues a `BufferedRequest` on `incomingQu_[partition]` for replication. Slow-path leader requests are forwarded to `commitQu_[partition]` without a fast reply on this thread.
+- **Transport thread:** `ReceiveMessage` parses `partition_id` on client requests and enqueues to `fastInboundQu_[partition]` (no other protocol logic).
+- **Fast worker (one thread per partition):** drains `fastInboundQu_[partition]` for client `RequestMessage` only. On the fast path it sends `FastReply` immediately, then enqueues a `BufferedRequest` on `incomingQu_[partition]` for replication. Slow-path leader requests are forwarded to `commitQu_[partition]` without a fast reply on this thread.
 - **Commit worker (one thread per partition):** exclusively owns `PartitionState[partition]`. Drains `incomingQu_` into `earlyBuffer` / `latBuffer`, drains `commitQu_` for sync/commit/fetch/late-sync and slow-path requests, and runs `ProcessDueRequests` every 1 ms. WAL `fsync`, `CommitBroadcast`, and `ApplyCommittedUpTo` run here only.
 - **Shared state:** `deadlineCounter` per partition is `std::atomic` (fast worker reads for slow-path gate; commit worker updates on apply). `kvStore` / `appliedWrites` updates are guarded by `kvMutex_` because multiple commit threads may apply concurrently. `ReplicaOwdEstimator` is guarded by `owdMutex_` (fast worker samples; commit/slow path may read estimates).
 
@@ -143,7 +143,7 @@ All protocol messages include `partition_id` now so one replica process can host
 - Early follower-only `FastReply` bursts do **not** complete the client (`leaderAcked` required); duplicate-completion from those alone is not expected.
 - Read results are sent by the leader through `ReadResult` (not via `FastReply` payload).
 - Leader and followers both apply committed entries when commit threshold/broadcast conditions are met.
-- **Leader commit step:** on `f+1` `SyncAck`s, `LeaderCommitToDiskAndBroadcast` runs **WAL `fsync` then `CommitBroadcast`** (same logical commit); **`ApplyCommittedUpTo`** (memory / `deadlineCounter`) runs only after that. Assumes normal-operation disk success; recovery may refine failure handling later.
+- **Leader commit step:** on `f+1` `SyncAck`s, **`deadlineCounter` advances through `upToLogIndex` before WAL `fsync`** (`AdvanceDeadlineCounterUpTo`), then `LeaderCommitToDiskAndBroadcast` runs **WAL `fsync` then `CommitBroadcast`**; followers advance the counter on `CommitBroadcast` before their WAL `fsync`, then **`ApplyCommittedUpTo`** (memory only). Assumes normal-operation fsync success; recovery may refine failure handling later.
 - **`SyncAck` today goes follower → leader only**, not to the client; slow path explicitly adds **client-visible** follower acks after late sync (see slow-path section).
 
 ## Next Suggested Work

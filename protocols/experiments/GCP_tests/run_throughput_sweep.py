@@ -37,7 +37,11 @@ def main() -> None:
     ap.add_argument("--interval-ms", type=int, default=1000)
     ap.add_argument("--trim-pad-sec", type=float, default=3.0)
     ap.add_argument("--sweep-id", default="")
-    ap.add_argument("--reset-rocksdb", action="store_true")
+    ap.add_argument(
+        "--no-clean-remote",
+        action="store_true",
+        help="Pass through to run_cluster_bench.py (default wipes remote state each run).",
+    )
     args = ap.parse_args()
 
     sweep_id = args.sweep_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -83,8 +87,8 @@ def main() -> None:
         ]
         if ssh_key:
             run_cmd.extend(["--ssh-key", ssh_key])
-        if args.reset_rocksdb and t == args.threads[0]:
-            run_cmd.append("--reset-rocksdb")
+        if args.no_clean_remote:
+            run_cmd.append("--no-clean-remote")
         if args.closed_loop:
             run_cmd.append("--closed-loop")
         if args.poisson_rate != 60:

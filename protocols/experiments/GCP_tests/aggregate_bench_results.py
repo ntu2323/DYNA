@@ -130,6 +130,28 @@ def _aggregate_throughput(
     }
 
 
+def _latency_across_senders(per_sender_latency: Dict[str, dict]) -> dict:
+    """Mean of per-sender medians and means (senders with valid percentile lines only)."""
+    medians: List[int] = []
+    averages: List[int] = []
+    for lats in per_sender_latency.values():
+        if "error" in lats:
+            continue
+        if "median" in lats:
+            medians.append(lats["median"])
+        if "average" in lats:
+            averages.append(lats["average"])
+
+    out: dict = {"sender_count_with_latency": len(medians)}
+    if medians:
+        out["mean_of_medians_ns"] = sum(medians) / len(medians)
+    if averages:
+        out["mean_of_averages_ns"] = sum(averages) / len(averages)
+    if not medians and not averages:
+        out["note"] = "no per-sender percentile lines"
+    return out
+
+
 def _fallback_finish_throughput(
     senders: List[dict],
     run_dir: str,
@@ -219,12 +241,15 @@ def aggregate_run(run_dir: str, trim_pad_sec: Optional[float]) -> dict:
         if fb:
             throughput["fallback"] = fb
 
+    latency_across_senders = _latency_across_senders(per_sender_latency)
+
     summary = {
         "run_id": meta.get("run_id"),
         "protocol": meta.get("protocol"),
         "trim_pad_sec": pad,
         "throughput": throughput,
         "per_sender_latency_ns": per_sender_latency,
+        "latency_across_senders_ns": latency_across_senders,
         "per_sender_finish": per_sender_finish,
         "meta": {
             "num_ops": meta.get("num_ops"),
@@ -262,6 +287,19 @@ def _print_summary(summary: dict) -> None:
             print(f"    {role}: median={med} avg={avg} p99={p99}")
         else:
             print(f"    {role}: (no percentile lines in log)")
+    cross = summary.get("latency_across_senders_ns") or {}
+    mean_med = cross.get("mean_of_medians_ns")
+    mean_avg = cross.get("mean_of_averages_ns")
+    n_lat = cross.get("sender_count_with_latency", 0)
+    if mean_med is not None or mean_avg is not None:
+        parts = []
+        if mean_med is not None:
+            parts.append(f"mean_of_medians={mean_med:.0f}")
+        if mean_avg is not None:
+            parts.append(f"mean_of_averages={mean_avg:.0f}")
+        print(f"    Across {n_lat} sender(s): " + "  ".join(parts))
+    elif cross.get("note"):
+        print(f"    Across senders: ({cross['note']})")
     print("  Per-sender finish line:")
     for role, fin in summary["per_sender_finish"].items():
         print(f"    {role}: {fin['ops']} ops in {fin['seconds']:.2f}s => {fin['ops_per_sec']:.1f} ops/s")

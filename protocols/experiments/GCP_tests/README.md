@@ -65,16 +65,31 @@ Stop the other protocol’s replicas before switching (VR ↔ DYNA).
 
 ### Orchestrated (recommended)
 
-`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs.
+SSH_USER=nathan python3 run_cluster_bench.py \
+  --protocol dyna \
+  --hosts-file cluster_hosts.json \
+  --ssh-user nathan \
+  -e 90 \
+  -w 10 \
+  --interval-ms 1000 \
+  --trim-pad-sec 3 \
+  -j 1 \
+  -n 0 \
+  --poisson-rate 40 \
+  --replica-wait-sec 8
+
+
+
+`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`, DYNA `rm ~/bench/wal`). Use `--no-clean-remote` only if you need to preserve state for debugging.
 
 ```bash
 # VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
 SSH_USER=nathan python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
-  -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 70
 
 # DYNA — same defaults
 SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
-  -e 90 -w 5 --interval-ms 1000 --trim-pad-sec 3
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 70
 
 # Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)
 SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
@@ -99,6 +114,7 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--poisson-rate` | Open-loop offered load (default `60`) |
 | `--closed-loop` | Disable Poisson; wait for ack before next send |
 | `--interval-ms` | Throughput log interval (`bench/client -i`) |
+| `--no-clean-remote` | Skip wiping remote runs / RocksDB / WAL (default is clean) |
 
 Results:
 

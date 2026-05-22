@@ -15,6 +15,34 @@ PKILL_REPLICA = "pkill -f '[b]ench/replica' 2>/dev/null || true"
 PKILL_CLIENT = "pkill -f '[b]ench/client' 2>/dev/null || true"
 PGREP_CLIENT = "pgrep -f '[b]ench/client' >/dev/null"
 
+# Default DYNA WAL path from remote/setup_dyna.sh (DYNA_WAL_DIR).
+DYNA_WAL_DIR = "$HOME/bench/wal"
+
+
+def remote_sender_cleanup_cmd() -> str:
+    """Stop clients and remove prior run artifacts (logs, latencies) on a sender VM."""
+    # Avoid bare glob (fails when runs/ is empty). Do not combine with pkill on one ssh -c
+    # line that also mentions bench/client paths (same self-match issue as receivers).
+    return (
+        f"{PKILL_CLIENT}; sleep 1; "
+        "find $HOME/bench/runs -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true"
+    )
+
+
+def remote_receiver_cleanup_cmd(protocol: str, replica_idx: int) -> str:
+    """Stop replicas and wipe durable bench state for a clean run.
+
+    Must not embed ``bench/replica`` in the same remote shell command as PKILL_REPLICA:
+    pkill -f matches the ssh -c argv and kills the session (ssh exit 255).
+    Replica logs are truncated by start_*_replica.sh on start.
+    """
+    parts = [PKILL_REPLICA, "sleep 1"]
+    if protocol == "vr":
+        parts.append(f"rm -rf /dev/shm/rocks{replica_idx}")
+    elif protocol == "dyna":
+        parts.append(f"rm -rf {DYNA_WAL_DIR}")
+    return "; ".join(parts)
+
 
 def ssh_common_opts() -> List[str]:
     return [

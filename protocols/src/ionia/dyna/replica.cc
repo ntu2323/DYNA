@@ -42,6 +42,7 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
       replicaIdx(replicaIdx),
       transport(transport),
       partitions(numPartitions),
+      fastInboundQu_(numPartitions),
       commitQu_(numPartitions),
       incomingQu_(numPartitions),
       owdEstimator_(DeadlineConfig::FromEnvironment()),
@@ -70,17 +71,36 @@ DynaReplica::UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t valu
     }
 }
 
+void
+DynaReplica::AdvanceDeadlineCounterUpTo(uint32_t partitionId, uint64_t upToLogIndex)
+{
+    PartitionState &state = StateFor(partitionId);
+    if (state.logEntries.empty()) {
+        return;
+    }
+    const uint64_t maxIndex = std::min<uint64_t>(upToLogIndex, state.logEntries.size() - 1);
+    for (uint64_t i = 0; i <= maxIndex; ++i) {
+        const LogEntry &entry = state.logEntries[i];
+        if (!entry.valid) {
+            continue;
+        }
+        UpdateDeadlineCounter(state.deadlineCounter, entry.deadlineUs);
+    }
+}
+
 bool
-DynaReplica::EnqueueFast(InboundKind kind,
+DynaReplica::EnqueueFast(uint32_t partitionId,
+                         InboundKind kind,
                          const TransportAddress &remote,
                          const std::string_view data)
 {
+    const uint32_t pid = partitionId % numPartitions;
     InboundWork work;
     work.kind = kind;
     work.remote.reset(remote.clone());
     work.payload.assign(data.data(), data.length());
-    if (!fastInboundQu_.enqueue(std::move(work))) {
-        Warning("DYNA fast inbound queue full; dropping message kind=%d", static_cast<int>(kind));
+    if (!fastInboundQu_[pid].enqueue(std::move(work))) {
+        Warning("DYNA fast inbound queue full part=%u kind=%d", pid, static_cast<int>(kind));
         return false;
     }
     return true;
@@ -108,9 +128,10 @@ void
 DynaReplica::StartWorkers()
 {
     workersRunning_.store(true);
-    fastWorkerThread_ = std::thread(&DynaReplica::FastWorkerLoop, this);
+    fastWorkerThreads_.reserve(numPartitions);
     commitThreads_.reserve(numPartitions);
     for (uint32_t partitionId = 0; partitionId < numPartitions; ++partitionId) {
+        fastWorkerThreads_.emplace_back(&DynaReplica::FastPartitionLoop, this, partitionId);
         commitThreads_.emplace_back(&DynaReplica::CommitPartitionLoop, this, partitionId);
     }
 }
@@ -121,17 +142,22 @@ DynaReplica::StopWorkers()
     if (!workersRunning_.exchange(false)) {
         return;
     }
-    InboundWork fastShutdown;
-    fastShutdown.kind = InboundKind::SHUTDOWN;
-    fastInboundQu_.enqueue(std::move(fastShutdown));
+    for (auto &qu : fastInboundQu_) {
+        InboundWork fastShutdown;
+        fastShutdown.kind = InboundKind::SHUTDOWN;
+        qu.enqueue(std::move(fastShutdown));
+    }
     for (auto &qu : commitQu_) {
         InboundWork commitShutdown;
         commitShutdown.kind = InboundKind::SHUTDOWN;
         qu.enqueue(std::move(commitShutdown));
     }
-    if (fastWorkerThread_.joinable()) {
-        fastWorkerThread_.join();
+    for (auto &thread : fastWorkerThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
     }
+    fastWorkerThreads_.clear();
     for (auto &thread : commitThreads_) {
         if (thread.joinable()) {
             thread.join();
@@ -141,16 +167,16 @@ DynaReplica::StopWorkers()
 }
 
 void
-DynaReplica::FastWorkerLoop()
+DynaReplica::FastPartitionLoop(uint32_t partitionId)
 {
     while (workersRunning_.load()) {
         InboundWork work;
         bool handledWork = false;
-        while (fastInboundQu_.try_dequeue(work)) {
+        while (fastInboundQu_[partitionId].try_dequeue(work)) {
             if (work.kind == InboundKind::SHUTDOWN) {
                 return;
             }
-            DispatchFastInbound(work);
+            DispatchFastInbound(partitionId, work);
             handledWork = true;
         }
         if (!handledWork) {
@@ -206,20 +232,26 @@ DynaReplica::DrainIncomingBuffered(uint32_t partitionId)
 }
 
 void
-DynaReplica::DispatchFastInbound(InboundWork &work)
+DynaReplica::DispatchFastInbound(uint32_t partitionId, InboundWork &work)
 {
     if (!work.remote) {
-        Warning("DYNA fast inbound work missing remote address");
+        Warning("DYNA fast inbound work missing remote address part=%u", partitionId);
         return;
     }
     const TransportAddress &remote = *work.remote;
 
     if (work.kind != InboundKind::REQUEST) {
-        Panic("Unexpected DYNA fast inbound work kind");
+        Panic("Unexpected DYNA fast inbound work kind on part=%u", partitionId);
     }
     ALLOCATE_MESSAGE(proto::RequestMessage, req);
     if (!req->ParseFromString(work.payload)) {
-        Warning("Failed to parse RequestMessage");
+        Warning("Failed to parse RequestMessage part=%u", partitionId);
+        return;
+    }
+    if (req->partition_id() % numPartitions != partitionId) {
+        Warning("DYNA request routed to wrong fast worker part=%u req_part=%u",
+                  partitionId,
+                  req->partition_id() % numPartitions);
         return;
     }
     HandleRequestFast(remote, *req);
@@ -317,7 +349,11 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote, const std::string_vi
     const static auto fetchResponseName = proto::FetchResponse::default_instance().GetDescriptor()->full_name();
 
     if (type == requestName) {
-        EnqueueFast(InboundKind::REQUEST, remote, data);
+        ALLOCATE_MESSAGE(proto::RequestMessage, req);
+        if (!req->ParseFromArray(data.data(), data.size())) {
+            return;
+        }
+        EnqueueFast(req->partition_id(), InboundKind::REQUEST, remote, data);
         return;
     }
     if (type == syncBroadcastName) {
@@ -642,6 +678,7 @@ DynaReplica::HandleCommitBroadcast(const TransportAddress &remote, const proto::
     if (cb.up_to_log_index() <= state.commitPoint) {
         return;
     }
+    AdvanceDeadlineCounterUpTo(partitionId, cb.up_to_log_index());
     if (!PersistCommittedRange(partitionId, cb.up_to_log_index())) {
         return;
     }
@@ -985,6 +1022,7 @@ DynaReplica::TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack)
         return;
     }
 
+    AdvanceDeadlineCounterUpTo(partitionId, upToCommitPoint);
     if (!LeaderCommitToDiskAndBroadcast(partitionId, upToCommitPoint)) {
         return;
     }
@@ -1023,7 +1061,6 @@ DynaReplica::ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex)
                 req.set_is_read(true);
                 MaybeSendReadResult(partitionId, *addrIt->second, req);
             }
-            UpdateDeadlineCounter(state.deadlineCounter, entry.deadlineUs);
             entry.applied = true;
             continue;
         }
@@ -1039,7 +1076,6 @@ DynaReplica::ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex)
             kvStore[key] = value;
             appliedWrites.push_back(StoredWrite{partitionId, entry.logIndex, key, value});
         }
-        UpdateDeadlineCounter(state.deadlineCounter, entry.deadlineUs);
         entry.applied = true;
     }
 }
