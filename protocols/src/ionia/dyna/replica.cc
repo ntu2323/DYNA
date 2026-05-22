@@ -20,10 +20,8 @@ namespace dyna {
 
 /** Max log-append/sync steps per durability-loop iteration. */
 static constexpr size_t kDurabilityBudgetPerLoop = 256;
-/** Max replication control messages per commit-loop iteration. */
-static constexpr size_t kCommitInboundBudgetPerLoop = 64;
-/** Extra drain/release spins before doing append/sync work. */
-static constexpr int kAdmissionPrioritySpins = 8;
+/** Max replication messages handled per process-loop iteration. */
+static constexpr size_t kReplicationInboundBudgetPerLoop = 64;
 
 static bool
 SlowPathDebugEnabled()
@@ -51,9 +49,10 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
       transport(transport),
       partitions(numPartitions),
       partitionMu_(numPartitions),
-      commitQu_(numPartitions),
+      replicationQu_(numPartitions),
       incomingQu_(numPartitions),
       durabilityQu_(numPartitions),
+      fastReplyQu_(numPartitions),
       owdEstimator_(DeadlineConfig::FromEnvironment()),
       walDir_(WalDirFromEnv())
 {
@@ -152,18 +151,18 @@ DynaReplica::EnqueueClientRequest(uint32_t partitionId,
 }
 
 bool
-DynaReplica::EnqueueCommit(uint32_t partitionId,
-                           InboundKind kind,
-                           const TransportAddress &remote,
-                           const std::string_view data)
+DynaReplica::EnqueueReplication(uint32_t partitionId,
+                                InboundKind kind,
+                                const TransportAddress &remote,
+                                const std::string_view data)
 {
     const uint32_t pid = partitionId % numPartitions;
     InboundWork work;
     work.kind = kind;
     work.remote.reset(remote.clone());
     work.payload.assign(data.data(), data.length());
-    if (!commitQu_[pid].enqueue(std::move(work))) {
-        Warning("DYNA commit queue full part=%u kind=%d", pid, static_cast<int>(kind));
+    if (!replicationQu_[pid].enqueue(std::move(work))) {
+        Warning("DYNA replication queue full part=%u kind=%d", pid, static_cast<int>(kind));
         return false;
     }
     return true;
@@ -173,10 +172,15 @@ void
 DynaReplica::StartWorkers()
 {
     workersRunning_.store(true);
-    commitThreads_.reserve(numPartitions);
+    processThreads_.reserve(numPartitions);
     durabilityThreads_.reserve(numPartitions);
+    fastReplyThreads_.reserve(numPartitions);
+    for (uint32_t shard = 0; shard < numPartitions; ++shard) {
+        fastReplyThreads_.emplace_back(&DynaReplica::FastReplyThreadLoop, this, shard);
+    }
+    owdThread_ = std::thread(&DynaReplica::OwdThreadLoop, this);
     for (uint32_t partitionId = 0; partitionId < numPartitions; ++partitionId) {
-        commitThreads_.emplace_back(&DynaReplica::CommitPartitionLoop, this, partitionId);
+        processThreads_.emplace_back(&DynaReplica::ProcessPartitionLoop, this, partitionId);
         durabilityThreads_.emplace_back(&DynaReplica::DurabilityPartitionLoop, this, partitionId);
     }
 }
@@ -187,80 +191,96 @@ DynaReplica::StopWorkers()
     if (!workersRunning_.exchange(false)) {
         return;
     }
-    for (auto &qu : commitQu_) {
-        InboundWork commitShutdown;
-        commitShutdown.kind = InboundKind::SHUTDOWN;
-        qu.enqueue(std::move(commitShutdown));
+    for (auto &qu : replicationQu_) {
+        InboundWork shutdown;
+        shutdown.kind = InboundKind::SHUTDOWN;
+        qu.enqueue(std::move(shutdown));
     }
-    for (auto &thread : commitThreads_) {
+    for (auto &thread : processThreads_) {
         if (thread.joinable()) {
             thread.join();
         }
     }
-    commitThreads_.clear();
+    processThreads_.clear();
     for (auto &thread : durabilityThreads_) {
         if (thread.joinable()) {
             thread.join();
         }
     }
     durabilityThreads_.clear();
+    for (auto &thread : fastReplyThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    fastReplyThreads_.clear();
+    if (owdThread_.joinable()) {
+        owdThread_.join();
+    }
 }
 
 void
-DynaReplica::CommitPartitionLoop(uint32_t partitionId)
+DynaReplica::ProcessPartitionLoop(uint32_t partitionId)
 {
-    using clock = std::chrono::steady_clock;
-    auto lastTick = clock::now();
-    const auto tickInterval = std::chrono::milliseconds(1);
-
     while (workersRunning_.load()) {
         bool handledWork = false;
-        std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
-        PartitionState &state = StateFor(partitionId);
+        {
+            std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
+            PartitionState &state = StateFor(partitionId);
 
-        // Admission + FastReply at deadline must run ahead of append/sync (open-loop
-        // latency is submit→FastReply; holding in incomingQu_ past deadline adds full
-        // queue wait even though deadline_us is already in the past).
-        for (int spin = 0; spin < kAdmissionPrioritySpins; ++spin) {
-            const size_t incomingBefore = incomingQu_[partitionId].size_approx();
             DrainIncomingBuffered(partitionId);
             const uint64_t nowUs = NowMicros();
             while (EarlyBufferHasDue(state, nowUs)) {
                 ProcessDueFastReplies(partitionId);
             }
-            if (incomingQu_[partitionId].size_approx() == 0 && !EarlyBufferHasDue(state, NowMicros())) {
-                if (incomingBefore == 0) {
+
+            for (size_t i = 0; i < kReplicationInboundBudgetPerLoop; ++i) {
+                InboundWork work;
+                if (!replicationQu_[partitionId].try_dequeue(work)) {
                     break;
                 }
+                if (work.kind == InboundKind::SHUTDOWN) {
+                    return;
+                }
+                DispatchCommitInbound(partitionId, work);
+                handledWork = true;
             }
-            handledWork = true;
-        }
 
-        ProcessDueFastReplies(partitionId);
-
-        for (size_t i = 0; i < kCommitInboundBudgetPerLoop; ++i) {
-            InboundWork work;
-            if (!commitQu_[partitionId].try_dequeue(work)) {
-                break;
+            if (!state.earlyBuffer.empty() || incomingQu_[partitionId].size_approx() > 0) {
+                handledWork = true;
             }
-            if (work.kind == InboundKind::SHUTDOWN) {
-                return;
-            }
-            DispatchCommitInbound(partitionId, work);
-            handledWork = true;
         }
 
-        const auto now = clock::now();
-        if (now - lastTick >= tickInterval) {
-            lastTick = now;
-            ProcessDueFastReplies(partitionId);
+        if (!handledWork) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
+    }
+}
 
-        if (!handledWork && state.earlyBuffer.empty() &&
-            incomingQu_[partitionId].size_approx() == 0 &&
-            durabilityQu_[partitionId].size_approx() == 0) {
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+void
+DynaReplica::FastReplyThreadLoop(uint32_t shardId)
+{
+    while (workersRunning_.load()) {
+        FastReplySendJob job;
+        if (fastReplyQu_[shardId].try_dequeue(job)) {
+            SendFastReplyFromJob(job);
+            continue;
         }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
+void
+DynaReplica::OwdThreadLoop()
+{
+    while (workersRunning_.load()) {
+        OwdSample sample;
+        if (owdQu_.try_dequeue(sample)) {
+            std::lock_guard<std::mutex> lock(owdMutex_);
+            owdEstimator_.sample(sample.clientId, sample.delayUs);
+            continue;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 }
 
@@ -435,8 +455,10 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote, const std::string_vi
         }
         const uint64_t recv_us = NowMicros();
         if (recv_us > req->send_time_us()) {
-            std::lock_guard<std::mutex> lock(owdMutex_);
-            owdEstimator_.sample(req->client_id(), recv_us - req->send_time_us());
+            OwdSample sample;
+            sample.clientId = req->client_id();
+            sample.delayUs = recv_us - req->send_time_us();
+            owdQu_.enqueue(sample);
         }
         EnqueueClientRequest(req->partition_id(), remote, *req);
         return;
@@ -446,37 +468,37 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote, const std::string_vi
         if (!sb->ParseFromArray(data.data(), data.size())) {
             return;
         }
-        EnqueueCommit(sb->partition_id(), InboundKind::SYNC_BROADCAST, remote, data);
+        EnqueueReplication(sb->partition_id(), InboundKind::SYNC_BROADCAST, remote, data);
     } else if (type == syncAckName) {
         ALLOCATE_MESSAGE(proto::SyncAck, ack);
         if (!ack->ParseFromArray(data.data(), data.size())) {
             return;
         }
-        EnqueueCommit(ack->partition_id(), InboundKind::SYNC_ACK, remote, data);
+        EnqueueReplication(ack->partition_id(), InboundKind::SYNC_ACK, remote, data);
     } else if (type == commitBroadcastName) {
         ALLOCATE_MESSAGE(proto::CommitBroadcast, cb);
         if (!cb->ParseFromArray(data.data(), data.size())) {
             return;
         }
-        EnqueueCommit(cb->partition_id(), InboundKind::COMMIT_BROADCAST, remote, data);
+        EnqueueReplication(cb->partition_id(), InboundKind::COMMIT_BROADCAST, remote, data);
     } else if (type == lateSyncName) {
         ALLOCATE_MESSAGE(proto::LateSyncBroadcast, lsb);
         if (!lsb->ParseFromArray(data.data(), data.size())) {
             return;
         }
-        EnqueueCommit(lsb->partition_id(), InboundKind::LATE_SYNC_BROADCAST, remote, data);
+        EnqueueReplication(lsb->partition_id(), InboundKind::LATE_SYNC_BROADCAST, remote, data);
     } else if (type == fetchRequestName) {
         ALLOCATE_MESSAGE(proto::FetchRequest, fr);
         if (!fr->ParseFromArray(data.data(), data.size())) {
             return;
         }
-        EnqueueCommit(fr->partition_id(), InboundKind::FETCH_REQUEST, remote, data);
+        EnqueueReplication(fr->partition_id(), InboundKind::FETCH_REQUEST, remote, data);
     } else if (type == fetchResponseName) {
         ALLOCATE_MESSAGE(proto::FetchResponse, fr);
         if (!fr->ParseFromArray(data.data(), data.size())) {
             return;
         }
-        EnqueueCommit(fr->partition_id(), InboundKind::FETCH_RESPONSE, remote, data);
+        EnqueueReplication(fr->partition_id(), InboundKind::FETCH_RESPONSE, remote, data);
     } else {
         Panic("Unexpected DYNA message type: %s", type.data());
     }
@@ -525,18 +547,40 @@ DynaReplica::EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs)
            state.earlyBuffer.top().request.deadline_us() <= nowUs;
 }
 
-void
-DynaReplica::ReleaseBufferedRequest(uint32_t partitionId, BufferedRequest &buffered)
+uint32_t
+DynaReplica::FastReplyShardFor(const proto::RequestMessage &req, uint32_t numShards)
 {
-    PartitionState &state = StateFor(partitionId);
-    if (buffered.clientAddress) {
-        SendFastReply(partitionId,
-                      *buffered.clientAddress,
-                      buffered.request.client_id(),
-                      buffered.request.request_id(),
-                      buffered.request.deadline_us());
+    if (numShards == 0) {
+        return 0;
     }
+    return static_cast<uint32_t>(ReqKeyFromMessage(req) % static_cast<uint64_t>(numShards));
+}
+
+void
+DynaReplica::ReleaseBufferedRequest(PartitionState &state,
+                                    uint32_t partitionId,
+                                    BufferedRequest &buffered)
+{
     RecordReleasedRank(state, buffered.request);
+
+    if (buffered.clientAddress) {
+        FastReplySendJob job;
+        job.partitionId = partitionId;
+        job.clientAddress = buffered.clientAddress;
+        job.clientId = buffered.request.client_id();
+        job.requestId = buffered.request.request_id();
+        job.deadlineUs = buffered.request.deadline_us();
+        job.viewId = state.viewId.load(std::memory_order_relaxed);
+        {
+            std::lock_guard<std::mutex> lock(owdMutex_);
+            job.owdUs = owdEstimator_.estimate_us(job.clientId);
+        }
+        const uint32_t shard = FastReplyShardFor(buffered.request, numPartitions);
+        if (!fastReplyQu_[shard].enqueue(std::move(job))) {
+            Warning("DYNA fast-reply queue full shard=%u part=%u", shard, partitionId);
+        }
+    }
+
     if (!durabilityQu_[partitionId].enqueue(std::move(buffered))) {
         Warning("DYNA durability queue full part=%u", partitionId);
     }
@@ -555,8 +599,26 @@ DynaReplica::ProcessDueFastReplies(uint32_t partitionId)
 
         BufferedRequest current = top;
         state.earlyBuffer.pop();
-        ReleaseBufferedRequest(partitionId, current);
+        ReleaseBufferedRequest(state, partitionId, current);
     }
+}
+
+void
+DynaReplica::SendFastReplyFromJob(const FastReplySendJob &job)
+{
+    if (!job.clientAddress) {
+        return;
+    }
+    proto::FastReply reply;
+    reply.set_partition_id(job.partitionId);
+    reply.set_request_id(job.requestId);
+    reply.set_replica_id(static_cast<uint32_t>(replicaIdx));
+    reply.set_view_id(job.viewId);
+    reply.set_deadline_us(job.deadlineUs);
+    if (job.owdUs > 0) {
+        reply.set_owd_us(job.owdUs);
+    }
+    transport->SendMessage(this, *job.clientAddress, reply);
 }
 
 void

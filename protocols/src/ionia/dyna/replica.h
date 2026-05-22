@@ -81,6 +81,22 @@ private:
         uint64_t sequence = 0;
     };
 
+    /** UDP fast reply work (Nezha FastReplyThread); built at release, no PartitionState on send. */
+    struct FastReplySendJob {
+        uint32_t partitionId = 0;
+        std::shared_ptr<TransportAddress> clientAddress;
+        uint64_t clientId = 0;
+        uint64_t requestId = 0;
+        uint64_t deadlineUs = 0;
+        uint32_t viewId = 0;
+        uint64_t owdUs = 0;
+    };
+
+    struct OwdSample {
+        uint64_t clientId = 0;
+        uint64_t delayUs = 0;
+    };
+
     struct DeadlineCompare {
         bool operator()(const BufferedRequest &a, const BufferedRequest &b) const {
             if (a.request.deadline_us() != b.request.deadline_us()) {
@@ -144,28 +160,33 @@ private:
     mutable std::mutex owdMutex_;
     mutable std::mutex kvMutex_;
 
-    std::vector<moodycamel::ConcurrentQueue<InboundWork>> commitQu_;
+    std::vector<moodycamel::ConcurrentQueue<InboundWork>> replicationQu_;
     std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> incomingQu_;
-    /** Post-FastReply log append / sync (off hot commit thread). */
     std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> durabilityQu_;
-    std::vector<std::thread> commitThreads_;
+    std::vector<moodycamel::ConcurrentQueue<FastReplySendJob>> fastReplyQu_;
+    moodycamel::ConcurrentQueue<OwdSample> owdQu_;
+    std::vector<std::thread> processThreads_;
     std::vector<std::thread> durabilityThreads_;
+    std::vector<std::thread> fastReplyThreads_;
+    std::thread owdThread_;
     std::atomic<bool> workersRunning_{false};
 
     void StartWorkers();
     void StopWorkers();
-    void CommitPartitionLoop(uint32_t partitionId);
+    void ProcessPartitionLoop(uint32_t partitionId);
     void DurabilityPartitionLoop(uint32_t partitionId);
+    void FastReplyThreadLoop(uint32_t shardId);
+    void OwdThreadLoop();
     void DispatchCommitInbound(uint32_t partitionId, InboundWork &work);
     void DrainIncomingBuffered(uint32_t partitionId);
     void AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &buffered);
     bool EnqueueClientRequest(uint32_t partitionId,
                               const TransportAddress &remote,
                               const proto::RequestMessage &req);
-    bool EnqueueCommit(uint32_t partitionId,
-                       InboundKind kind,
-                       const TransportAddress &remote,
-                       const std::string_view data);
+    bool EnqueueReplication(uint32_t partitionId,
+                            InboundKind kind,
+                            const TransportAddress &remote,
+                            const std::string_view data);
     static void UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t value);
     static uint64_t OpKeyFromCommand(const std::string &command);
     static ReleasedRank RankOf(const proto::RequestMessage &req);
@@ -180,7 +201,11 @@ private:
     PartitionState &StateFor(uint32_t partitionId);
     const PartitionState &StateFor(uint32_t partitionId) const;
     void ProcessDueFastReplies(uint32_t partitionId);
-    void ReleaseBufferedRequest(uint32_t partitionId, BufferedRequest &buffered);
+    void ReleaseBufferedRequest(PartitionState &state,
+                                uint32_t partitionId,
+                                BufferedRequest &buffered);
+    void SendFastReplyFromJob(const FastReplySendJob &job);
+    static uint32_t FastReplyShardFor(const proto::RequestMessage &req, uint32_t numShards);
     static bool EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs);
     void AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released);
     void BufferRequestUntilDeadline(uint32_t partitionId,

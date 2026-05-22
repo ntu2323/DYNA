@@ -43,10 +43,12 @@ Environment (optional overrides):
 
 ### Replica threading (Nezha-style pipeline)
 
-- **Transport thread:** `ReceiveMessage` parses client `RequestMessage`, samples OWD at **receive** (`recv_us − send_time_us`, Nezha-style), and enqueues to `incomingQu_[partition]` (single parse).
-- **Commit worker (one thread per partition):** drains `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** sends `FastReply` at deadline in **global deadline order** (never release out of order on admit — that breaks per-key rank and causes slow-path storms). Drains `commitQu_` for replication control (capped per loop). Does **not** run log append/sync on the hot path.
-- **Durability worker (one thread per partition):** drains `durabilityQu_` after each `FastReply` and runs **`AppendPendingLogEntry`** (log + `SyncBroadcast` + WAL). Keeps multicast sync off the commit thread that releases client-visible replies. Both workers take **`partitionMu_[partition]`** before touching `PartitionState` (required — shared maps are not thread-safe).
-- **Shared state:** `deadlineCounter` per partition is updated on **apply** (read visibility / commit ordering). Fast-path admission uses **`lastReleasedByOpKey`** `(deadline_us, request_id)` per KV op-key. `ReplicaOwdEstimator` is sampled on the transport thread; `owdMutex_` guards the estimator map.
+- **Transport thread:** parse client `RequestMessage` once; enqueue OWD sample to `owdQu_`; enqueue request to `incomingQu_[partition]`.
+- **OWD worker (`OwdThreadLoop`):** drains `owdQu_`, updates `ReplicaOwdEstimator` under `owdMutex_` (not on receive hot path).
+- **Process worker (one thread per partition):** under `partitionMu_[partition]`: drain `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** at deadline in global order (enqueue `FastReplySendJob` + `durabilityQu_`, no UDP here); drain `replicationQu_` for sync/ack/commit (capped per loop).
+- **Fast-reply workers (one thread per shard, `reqKey % n`):** drain `fastReplyQu_`, **`SendFastReplyFromJob`** only (UDP isolated from process thread).
+- **Durability worker (one thread per partition):** under `partitionMu_`, drain `durabilityQu_` → **`AppendPendingLogEntry`** (log + `SyncBroadcast` + WAL).
+- **Shared state:** fast-path admission uses **`lastReleasedByOpKey`** with **`reqKey = (client_id<<32)|request_id`**. `deadlineCounter` updated on apply for read visibility.
 
 ### Fast path (single-shard network partition)
 
