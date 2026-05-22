@@ -20,8 +20,21 @@ namespace dyna {
 
 /** Max log-append/sync steps per durability-loop iteration. */
 static constexpr size_t kDurabilityBudgetPerLoop = 256;
-/** Max replication messages handled per process-loop iteration. */
-static constexpr size_t kReplicationInboundBudgetPerLoop = 64;
+/** Max replication messages handled per replication-loop iteration. */
+static constexpr size_t kReplicationBudgetPerLoop = 256;
+static constexpr uint32_t kDefaultFastReplyShards = 16;
+
+static uint32_t
+FastReplyShardCountFromEnv()
+{
+    if (const char *v = std::getenv("DYNA_FAST_REPLY_SHARDS"); v && *v) {
+        unsigned long x = std::strtoul(v, nullptr, 10);
+        if (x > 0) {
+            return static_cast<uint32_t>(x);
+        }
+    }
+    return kDefaultFastReplyShards;
+}
 
 static bool
 SlowPathDebugEnabled()
@@ -45,6 +58,7 @@ WalDirFromEnv()
 DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport *transport)
     : config(config),
       numPartitions(static_cast<uint32_t>(std::max(1, config.n))),
+      numFastReplyShards(FastReplyShardCountFromEnv()),
       replicaIdx(replicaIdx),
       transport(transport),
       partitions(numPartitions),
@@ -52,10 +66,10 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
       replicationQu_(numPartitions),
       incomingQu_(numPartitions),
       durabilityQu_(numPartitions),
-      fastReplyQu_(numPartitions),
       owdEstimator_(DeadlineConfig::FromEnvironment()),
       walDir_(WalDirFromEnv())
 {
+    fastReplyQu_.resize(numFastReplyShards);
     std::error_code ec;
     std::filesystem::create_directories(walDir_, ec);
     if (ec) {
@@ -173,14 +187,16 @@ DynaReplica::StartWorkers()
 {
     workersRunning_.store(true);
     processThreads_.reserve(numPartitions);
+    replicationThreads_.reserve(numPartitions);
     durabilityThreads_.reserve(numPartitions);
-    fastReplyThreads_.reserve(numPartitions);
-    for (uint32_t shard = 0; shard < numPartitions; ++shard) {
+    fastReplyThreads_.reserve(numFastReplyShards);
+    for (uint32_t shard = 0; shard < numFastReplyShards; ++shard) {
         fastReplyThreads_.emplace_back(&DynaReplica::FastReplyThreadLoop, this, shard);
     }
     owdThread_ = std::thread(&DynaReplica::OwdThreadLoop, this);
     for (uint32_t partitionId = 0; partitionId < numPartitions; ++partitionId) {
         processThreads_.emplace_back(&DynaReplica::ProcessPartitionLoop, this, partitionId);
+        replicationThreads_.emplace_back(&DynaReplica::ReplicationPartitionLoop, this, partitionId);
         durabilityThreads_.emplace_back(&DynaReplica::DurabilityPartitionLoop, this, partitionId);
     }
 }
@@ -202,6 +218,12 @@ DynaReplica::StopWorkers()
         }
     }
     processThreads_.clear();
+    for (auto &thread : replicationThreads_) {
+        if (thread.joinable()) {
+            thread.join();
+        }
+    }
+    replicationThreads_.clear();
     for (auto &thread : durabilityThreads_) {
         if (thread.joinable()) {
             thread.join();
@@ -229,21 +251,10 @@ DynaReplica::ProcessPartitionLoop(uint32_t partitionId)
             PartitionState &state = StateFor(partitionId);
 
             DrainIncomingBuffered(partitionId);
-            const uint64_t nowUs = NowMicros();
+            uint64_t nowUs = NowMicros();
             while (EarlyBufferHasDue(state, nowUs)) {
                 ProcessDueFastReplies(partitionId);
-            }
-
-            for (size_t i = 0; i < kReplicationInboundBudgetPerLoop; ++i) {
-                InboundWork work;
-                if (!replicationQu_[partitionId].try_dequeue(work)) {
-                    break;
-                }
-                if (work.kind == InboundKind::SHUTDOWN) {
-                    return;
-                }
-                DispatchCommitInbound(partitionId, work);
-                handledWork = true;
+                nowUs = NowMicros();
             }
 
             if (!state.earlyBuffer.empty() || incomingQu_[partitionId].size_approx() > 0) {
@@ -252,6 +263,31 @@ DynaReplica::ProcessPartitionLoop(uint32_t partitionId)
         }
 
         if (!handledWork) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        }
+    }
+}
+
+void
+DynaReplica::ReplicationPartitionLoop(uint32_t partitionId)
+{
+    while (workersRunning_.load()) {
+        bool didWork = false;
+        for (size_t i = 0; i < kReplicationBudgetPerLoop; ++i) {
+            InboundWork work;
+            if (!replicationQu_[partitionId].try_dequeue(work)) {
+                break;
+            }
+            if (work.kind == InboundKind::SHUTDOWN) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> partitionLock(partitionMu_[partitionId]);
+                DispatchCommitInbound(partitionId, work);
+            }
+            didWork = true;
+        }
+        if (!didWork) {
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     }
@@ -575,7 +611,7 @@ DynaReplica::ReleaseBufferedRequest(PartitionState &state,
             std::lock_guard<std::mutex> lock(owdMutex_);
             job.owdUs = owdEstimator_.estimate_us(job.clientId);
         }
-        const uint32_t shard = FastReplyShardFor(buffered.request, numPartitions);
+        const uint32_t shard = FastReplyShardFor(buffered.request, numFastReplyShards);
         if (!fastReplyQu_[shard].enqueue(std::move(job))) {
             Warning("DYNA fast-reply queue full shard=%u part=%u", shard, partitionId);
         }

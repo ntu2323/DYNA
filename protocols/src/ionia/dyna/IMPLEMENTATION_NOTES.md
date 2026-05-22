@@ -45,8 +45,9 @@ Environment (optional overrides):
 
 - **Transport thread:** parse client `RequestMessage` once; enqueue OWD sample to `owdQu_`; enqueue request to `incomingQu_[partition]`.
 - **OWD worker (`OwdThreadLoop`):** drains `owdQu_`, updates `ReplicaOwdEstimator` under `owdMutex_` (not on receive hot path).
-- **Process worker (one thread per partition):** under `partitionMu_[partition]`: drain `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** at deadline in global order (enqueue `FastReplySendJob` + `durabilityQu_`, no UDP here); drain `replicationQu_` for sync/ack/commit (capped per loop).
-- **Fast-reply workers (one thread per shard, `reqKey % n`):** drain `fastReplyQu_`, **`SendFastReplyFromJob`** only (UDP isolated from process thread).
+- **Process worker (one thread per partition):** under `partitionMu_[partition]`: drain `incomingQu_` → **`AdmitInboundClientRequest`** → **`earlyBuffer`**; **`ProcessDueFastReplies`** at deadline in global order (enqueue `FastReplySendJob` + `durabilityQu_`, no UDP). Does **not** handle replication messages.
+- **Replication worker (one thread per partition):** drains `replicationQu_` (sync/ack/commit/fetch) under `partitionMu_`, separate from client fast path.
+- **Fast-reply workers (`DYNA_FAST_REPLY_SHARDS`, default 16):** `reqKey % numFastReplyShards`; drain `fastReplyQu_`, **`SendFastReplyFromJob`** only (UDP isolated from process thread).
 - **Durability worker (one thread per partition):** under `partitionMu_`, drain `durabilityQu_` → **`AppendPendingLogEntry`** (log + `SyncBroadcast` + WAL).
 - **Shared state:** fast-path admission uses **`lastReleasedByOpKey`** with **`reqKey = (client_id<<32)|request_id`**. `deadlineCounter` updated on apply for read visibility.
 

@@ -148,10 +148,11 @@ private:
 
     Configuration config;
     uint32_t numPartitions;
+    uint32_t numFastReplyShards;
     int replicaIdx;
     Transport *transport;
     std::vector<PartitionState> partitions;
-    /** Guards PartitionState for each index (commit + durability threads). */
+    /** Guards PartitionState (process, replication, durability threads). */
     std::vector<std::mutex> partitionMu_;
     std::deque<StoredWrite> appliedWrites;
     std::unordered_map<std::string, std::string> kvStore;
@@ -166,6 +167,7 @@ private:
     std::vector<moodycamel::ConcurrentQueue<FastReplySendJob>> fastReplyQu_;
     moodycamel::ConcurrentQueue<OwdSample> owdQu_;
     std::vector<std::thread> processThreads_;
+    std::vector<std::thread> replicationThreads_;
     std::vector<std::thread> durabilityThreads_;
     std::vector<std::thread> fastReplyThreads_;
     std::thread owdThread_;
@@ -174,6 +176,7 @@ private:
     void StartWorkers();
     void StopWorkers();
     void ProcessPartitionLoop(uint32_t partitionId);
+    void ReplicationPartitionLoop(uint32_t partitionId);
     void DurabilityPartitionLoop(uint32_t partitionId);
     void FastReplyThreadLoop(uint32_t shardId);
     void OwdThreadLoop();
