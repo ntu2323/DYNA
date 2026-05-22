@@ -18,6 +18,9 @@
 namespace specpaxos {
 namespace dyna {
 
+/** Max log-append/sync steps per commit-loop iteration (FastReply release is not capped). */
+static constexpr size_t kPendingLogAppendBudgetPerLoop = 128;
+
 static bool
 SlowPathDebugEnabled()
 {
@@ -179,6 +182,10 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
     while (workersRunning_.load()) {
         bool handledWork = false;
         DrainIncomingBuffered(partitionId);
+        ProcessDueFastReplies(partitionId);
+        if (ProcessPendingLogAppends(partitionId, kPendingLogAppendBudgetPerLoop)) {
+            handledWork = true;
+        }
 
         InboundWork work;
         while (commitQu_[partitionId].try_dequeue(work)) {
@@ -191,11 +198,14 @@ DynaReplica::CommitPartitionLoop(uint32_t partitionId)
 
         const auto now = clock::now();
         if (now - lastTick >= tickInterval) {
-            ProcessDueRequestsTick(partitionId);
             lastTick = now;
+            if (ProcessPendingLogAppends(partitionId, kPendingLogAppendBudgetPerLoop)) {
+                handledWork = true;
+            }
         }
 
-        if (!handledWork) {
+        PartitionState &state = StateFor(partitionId);
+        if (!handledWork && state.pendingLogAppend.empty() && state.earlyBuffer.empty()) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     }
@@ -418,9 +428,90 @@ DynaReplica::PartitionLeader(uint32_t partitionId) const
 }
 
 void
-DynaReplica::ProcessDueRequestsTick(uint32_t partitionId)
+DynaReplica::ProcessDueFastReplies(uint32_t partitionId)
 {
-    ProcessDueRequests(partitionId);
+    PartitionState &state = StateFor(partitionId);
+    const uint64_t nowUs = NowMicros();
+    while (!state.earlyBuffer.empty()) {
+        const BufferedRequest &top = state.earlyBuffer.top();
+        if (top.request.deadline_us() > nowUs) {
+            break;
+        }
+
+        BufferedRequest current = top;
+        state.earlyBuffer.pop();
+
+        if (current.clientAddress) {
+            SendFastReply(partitionId,
+                          *current.clientAddress,
+                          current.request.client_id(),
+                          current.request.request_id(),
+                          current.request.deadline_us());
+        }
+        state.pendingLogAppend.push_back(std::move(current));
+    }
+}
+
+void
+DynaReplica::AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released)
+{
+    PartitionState &state = StateFor(partitionId);
+    const RequestKey keyReq = KeyOf(released.request);
+
+    char op = '\0';
+    std::string key;
+    std::string value;
+    if (!ParseCommand(released.request.command(), op, key, value)) {
+        return;
+    }
+
+    if (state.requestToLogIndex.find(keyReq) != state.requestToLogIndex.end()) {
+        return;
+    }
+
+    AppendToLog(partitionId, released.request);
+    if (!AmLeader(partitionId)) {
+        return;
+    }
+
+    auto lateIt = state.pendingLateSyncByReq.find(keyReq);
+    if (lateIt == state.pendingLateSyncByReq.end()) {
+        return;
+    }
+
+    auto logIt = state.requestToLogIndex.find(keyReq);
+    if (logIt == state.requestToLogIndex.end() ||
+        logIt->second >= state.logEntries.size() ||
+        !state.logEntries[logIt->second].valid) {
+        state.pendingLateSyncByReq.erase(lateIt);
+        return;
+    }
+
+    BroadcastLateSyncForLogEntry(partitionId,
+                                 state.logEntries[logIt->second],
+                                 lateIt->second.first,
+                                 lateIt->second.second);
+    state.pendingLateSyncByReq.erase(lateIt);
+}
+
+bool
+DynaReplica::ProcessPendingLogAppends(uint32_t partitionId, size_t maxEntries)
+{
+    if (maxEntries == 0) {
+        return false;
+    }
+
+    PartitionState &state = StateFor(partitionId);
+    size_t processed = 0;
+    bool didWork = false;
+    while (processed < maxEntries && !state.pendingLogAppend.empty()) {
+        BufferedRequest released = std::move(state.pendingLogAppend.front());
+        state.pendingLogAppend.pop_front();
+        AppendPendingLogEntry(partitionId, released);
+        ++processed;
+        didWork = true;
+    }
+    return didWork;
 }
 
 void
@@ -521,58 +612,6 @@ DynaReplica::HandleLateRequest(const TransportAddress &remote, const proto::Requ
 
     state.pendingLateSyncByReq[key] = std::make_pair(oldDeadline, newDeadline);
     BufferRequestUntilDeadline(partitionId, remote, revised);
-}
-
-//pops requests on timer
-void
-DynaReplica::ProcessDueRequests(uint32_t partitionId)
-{
-    PartitionState &state = StateFor(partitionId);
-    const uint64_t nowUs = NowMicros();
-    while (!state.earlyBuffer.empty()) {
-        const BufferedRequest &top = state.earlyBuffer.top();
-        if (top.request.deadline_us() > nowUs) {
-            break;
-        }
-
-        BufferedRequest current = top;
-        state.earlyBuffer.pop();
-
-        const RequestKey keyReq = KeyOf(current.request);
-        if (current.clientAddress) {
-            SendFastReply(partitionId,
-                          *current.clientAddress,
-                          current.request.client_id(),
-                          current.request.request_id(),
-                          current.request.deadline_us());
-        }
-
-        char op = '\0';
-        std::string key;
-        std::string value;
-        if (!ParseCommand(current.request.command(), op, key, value)) {
-            continue;
-        }
-
-        if (state.requestToLogIndex.find(keyReq) == state.requestToLogIndex.end()) {
-            AppendToLog(partitionId, current.request);
-            if (AmLeader(partitionId)) {
-                auto lateIt = state.pendingLateSyncByReq.find(keyReq);
-                if (lateIt != state.pendingLateSyncByReq.end()) {
-                    auto logIt = state.requestToLogIndex.find(keyReq);
-                    if (logIt != state.requestToLogIndex.end() &&
-                        logIt->second < state.logEntries.size() &&
-                        state.logEntries[logIt->second].valid) {
-                        BroadcastLateSyncForLogEntry(partitionId,
-                                                     state.logEntries[logIt->second],
-                                                     lateIt->second.first,
-                                                     lateIt->second.second);
-                    }
-                    state.pendingLateSyncByReq.erase(lateIt);
-                }
-            }
-        }
-    }
 }
 
 void

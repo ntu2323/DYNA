@@ -121,6 +121,8 @@ private:
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingSyncByReq;
         /** Slow-path leader: (old_deadline, new_deadline) for LateSyncBroadcast after append. */
         std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingLateSyncByReq;
+        /** FastReply already sent; waiting for log append / sync (commit thread only). */
+        std::deque<BufferedRequest> pendingLogAppend;
     };
 
     Configuration config;
@@ -167,7 +169,9 @@ private:
     RequestKey KeyOf(const proto::RequestMessage &req) const;
     PartitionState &StateFor(uint32_t partitionId);
     const PartitionState &StateFor(uint32_t partitionId) const;
-    void ProcessDueRequestsTick(uint32_t partitionId);
+    void ProcessDueFastReplies(uint32_t partitionId);
+    bool ProcessPendingLogAppends(uint32_t partitionId, size_t maxEntries);
+    void AppendPendingLogEntry(uint32_t partitionId, const BufferedRequest &released);
     void BufferRequestUntilDeadline(uint32_t partitionId,
                                     const TransportAddress &remote,
                                     const proto::RequestMessage &req);
@@ -178,7 +182,6 @@ private:
     void HandleCommitBroadcast(const TransportAddress &remote, const proto::CommitBroadcast &cb);
     void HandleFetchRequest(const TransportAddress &remote, const proto::FetchRequest &fr);
     void HandleFetchResponse(const TransportAddress &remote, const proto::FetchResponse &fr);
-    void ProcessDueRequests(uint32_t partitionId);
     void AppendToLog(uint32_t partitionId, const proto::RequestMessage &req);
     void BroadcastSyncForLogEntry(uint32_t partitionId, const LogEntry &entry);
     void BroadcastLateSyncForLogEntry(uint32_t partitionId,
