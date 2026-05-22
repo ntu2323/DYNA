@@ -164,3 +164,28 @@ LATENCY_LINE_RE = re.compile(
     r"(Median|Average|90th percentile|95th percentile|99th percentile)\s+latency\s+is\s+(\d+)\s+ns",
     re.IGNORECASE,
 )
+INFLIGHT_LINE_RE = re.compile(
+    r"Completed\s+\d+\s+requests\s+at\s+\d+\s+ms\s+inflight=(\d+)\s+submitted=(\d+)",
+    re.IGNORECASE,
+)
+DYNA_CLIENT_STATS_RE = re.compile(
+    r"DYNA client stats client=\d+\s+completions=(\d+).*?bound_us=(\d+)",
+    re.IGNORECASE,
+)
+DYNA_CLIENT_TOTAL_US_RE = re.compile(
+    r"DYNA client stats client=\d+\s+total_us\s+samples=(\d+)\s+avg=(\d+)\s+p50=(\d+)\s+p99=(\d+)\s+max=(\d+)",
+    re.IGNORECASE,
+)
+DYNA_CLIENT_FIRST_REPLY_US_RE = re.compile(
+    r"DYNA client stats client=\d+\s+first_reply_us\s+samples=(\d+)\s+avg=(\d+)\s+p50=(\d+)\s+p99=(\d+)\s+max=(\d+)",
+    re.IGNORECASE,
+)
+DYNA_CLIENT_QUORUM_WAIT_US_RE = re.compile(
+    r"DYNA client stats client=\d+\s+quorum_wait_us\s+samples=(\d+)\s+avg=(\d+)\s+p50=(\d+)\s+p99=(\d+)\s+max=(\d+)",
+    re.IGNORECASE,
+)
+DYNA_REPLICA_STATS_RE = re.compile(
+    r"DYNA stats rep=(\d+)\s+incoming=(\d+)\s+early=(\d+)\s+fastQ=(\d+)\s+durQ=(\d+)\s+replQ=(\d+)\s+"
+    r"releases=([\d.]+)/s\s+slowpath=([\d.]+)/s",
+    re.IGNORECASE,
+)

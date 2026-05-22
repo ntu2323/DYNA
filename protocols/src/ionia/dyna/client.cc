@@ -4,17 +4,49 @@
 
 
 #include "dyna/client.h"
+#include "dyna/stats_util.h"
 #include "dyna/wall_clock.h"
 
 #include "lib/assert.h"
 #include "lib/message.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 
 namespace specpaxos {
 namespace dyna {
+
+namespace {
+
+struct ClientRuntimeStats {
+    CounterWindow completions;
+    CounterWindow deadlineMismatchDrops;
+    CounterWindow epochResets;
+    std::atomic<uint64_t> maxPendingPeak{0};
+    LatencySampleBuffer totalUs;
+    LatencySampleBuffer firstReplyUs;
+    LatencySampleBuffer quorumWaitUs;
+
+    void notePendingSize(size_t count)
+    {
+        uint64_t value = static_cast<uint64_t>(count);
+        uint64_t cur = maxPendingPeak.load(std::memory_order_relaxed);
+        while (value > cur &&
+               !maxPendingPeak.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {
+        }
+    }
+
+    uint64_t snapshotMaxPending()
+    {
+        return maxPendingPeak.exchange(0, std::memory_order_relaxed);
+    }
+};
+
+ClientRuntimeStats g_clientStats;
+
+} // namespace
 
 static bool
 SlowPathDebugEnabled()
@@ -30,11 +62,18 @@ DynaClient::DynaClient(const Configuration &config, Transport *transport, uint64
     : Client(config, transport, clientid),
       lastReqId(0),
       numPartitions(static_cast<uint32_t>(std::max(1, config.n))),
-      bound_tracker_(DeadlineConfig::FromEnvironment(), config.n)
+      bound_tracker_(DeadlineConfig::FromEnvironment(), config.n),
+      clientStatsEnabled_(EnvFlagEnabled("DYNA_CLIENT_STATS")),
+      clientStatsLogEvery_(std::max<uint64_t>(1, EnvUint64OrDefault("DYNA_CLIENT_STATS_LOG_EVERY", 10000)))
 {
 }
 
-DynaClient::~DynaClient() = default;
+DynaClient::~DynaClient()
+{
+    if (clientStatsEnabled_) {
+        MaybeLogClientStats();
+    }
+}
 
 void
 DynaClient::Invoke(const string &request, continuation_t continuation)
@@ -50,11 +89,15 @@ DynaClient::Invoke(const string &request, continuation_t continuation)
     pending.isRead = IsReadCommand(request);
     pending.partitionId = partitionId;
     pending.requestId = requestId;
+    pending.sendUs = send_us;
     pending.deadlineUs = deadline;
     pending.activeDeadlineUs = deadline;
     pending.continuation = std::move(continuation);
 
     pendingRequests[requestId] = std::move(pending);
+    if (clientStatsEnabled_) {
+        g_clientStats.notePendingSize(pendingRequests.size());
+    }
 
     proto::RequestMessage req;
     req.set_partition_id(partitionId);
@@ -120,6 +163,9 @@ DynaClient::ReceiveMessage(const TransportAddress &remote, const std::string_vie
             pending.leaderAcked = false;
             pending.readResultReceived = false;
             pending.readResultData.clear();
+            if (clientStatsEnabled_) {
+                g_clientStats.epochResets.add();
+            }
             if (SlowPathDebugEnabled()) {
                 Notice("DYNA slowpath client epoch switch req=%lu part=%u old_deadline=%lu new_deadline=%lu",
                        pending.requestId,
@@ -129,7 +175,13 @@ DynaClient::ReceiveMessage(const TransportAddress &remote, const std::string_vie
             }
         }
         if (reply->deadline_us() != pending.activeDeadlineUs) {
+            if (clientStatsEnabled_) {
+                g_clientStats.deadlineMismatchDrops.add();
+            }
             return;
+        }
+        if (clientStatsEnabled_ && pending.firstReplyUs == 0) {
+            pending.firstReplyUs = NowMicros();
         }
         pending.responders.insert(reply->replica_id());
         if (fromLeader) {
@@ -151,6 +203,9 @@ DynaClient::ReceiveMessage(const TransportAddress &remote, const std::string_vie
             return;
         }
         if (result->deadline_us() != pending.activeDeadlineUs) {
+            if (clientStatsEnabled_) {
+                g_clientStats.deadlineMismatchDrops.add();
+            }
             return;
         }
         if (result->has_owd_us()) {
@@ -203,6 +258,74 @@ DynaClient::PartitionLeaderFor(uint32_t partitionId) const
 }
 
 void
+DynaClient::RecordClientCompletion(const PendingRequest &pending)
+{
+    const uint64_t completeUs = NowMicros();
+    if (pending.sendUs > 0 && completeUs > pending.sendUs) {
+        g_clientStats.totalUs.record(completeUs - pending.sendUs);
+    }
+    if (pending.firstReplyUs > 0 && pending.firstReplyUs > pending.sendUs) {
+        g_clientStats.firstReplyUs.record(pending.firstReplyUs - pending.sendUs);
+        if (completeUs > pending.firstReplyUs) {
+            g_clientStats.quorumWaitUs.record(completeUs - pending.firstReplyUs);
+        }
+    }
+    g_clientStats.completions.add();
+}
+
+void
+DynaClient::MaybeLogClientStats()
+{
+    const uint64_t completions = g_clientStats.completions.snapshotAndReset();
+    if (completions == 0) {
+        return;
+    }
+    const uint64_t mismatch = g_clientStats.deadlineMismatchDrops.snapshotAndReset();
+    const uint64_t epochs = g_clientStats.epochResets.snapshotAndReset();
+    const uint64_t maxPending = g_clientStats.snapshotMaxPending();
+    const auto totalSnap = g_clientStats.totalUs.snapshotAndClear();
+    const auto firstSnap = g_clientStats.firstReplyUs.snapshotAndClear();
+    const auto quorumSnap = g_clientStats.quorumWaitUs.snapshotAndClear();
+
+    Notice("DYNA client stats client=%lu completions=%lu pending_max=%lu "
+           "deadline_mismatch=%lu epoch_resets=%lu bound_us=%lu",
+           static_cast<unsigned long>(clientid),
+           static_cast<unsigned long>(completions),
+           static_cast<unsigned long>(maxPending),
+           static_cast<unsigned long>(mismatch),
+           static_cast<unsigned long>(epochs),
+           static_cast<unsigned long>(bound_tracker_.bound_us()));
+
+    if (totalSnap.count > 0) {
+        Notice("DYNA client stats client=%lu total_us samples=%lu avg=%lu p50=%lu p99=%lu max=%lu",
+               static_cast<unsigned long>(clientid),
+               static_cast<unsigned long>(totalSnap.count),
+               static_cast<unsigned long>(totalSnap.avg_us),
+               static_cast<unsigned long>(totalSnap.p50_us),
+               static_cast<unsigned long>(totalSnap.p99_us),
+               static_cast<unsigned long>(totalSnap.max_us));
+    }
+    if (firstSnap.count > 0) {
+        Notice("DYNA client stats client=%lu first_reply_us samples=%lu avg=%lu p50=%lu p99=%lu max=%lu",
+               static_cast<unsigned long>(clientid),
+               static_cast<unsigned long>(firstSnap.count),
+               static_cast<unsigned long>(firstSnap.avg_us),
+               static_cast<unsigned long>(firstSnap.p50_us),
+               static_cast<unsigned long>(firstSnap.p99_us),
+               static_cast<unsigned long>(firstSnap.max_us));
+    }
+    if (quorumSnap.count > 0) {
+        Notice("DYNA client stats client=%lu quorum_wait_us samples=%lu avg=%lu p50=%lu p99=%lu max=%lu",
+               static_cast<unsigned long>(clientid),
+               static_cast<unsigned long>(quorumSnap.count),
+               static_cast<unsigned long>(quorumSnap.avg_us),
+               static_cast<unsigned long>(quorumSnap.p50_us),
+               static_cast<unsigned long>(quorumSnap.p99_us),
+               static_cast<unsigned long>(quorumSnap.max_us));
+    }
+}
+
+void
 DynaClient::TryComplete(PendingRequest &pending)
 {
     const size_t quorum = static_cast<size_t>(config.f + 1);
@@ -211,6 +334,12 @@ DynaClient::TryComplete(PendingRequest &pending)
     }
 
     if (!pending.isRead) {
+        if (clientStatsEnabled_) {
+            RecordClientCompletion(pending);
+            if (g_clientStats.completions.load() % clientStatsLogEvery_ == 0) {
+                MaybeLogClientStats();
+            }
+        }
         pending.continuation("", "");
         pendingRequests.erase(pending.requestId);
         return;
@@ -220,6 +349,12 @@ DynaClient::TryComplete(PendingRequest &pending)
         return;
     }
 
+    if (clientStatsEnabled_) {
+        RecordClientCompletion(pending);
+        if (g_clientStats.completions.load() % clientStatsLogEvery_ == 0) {
+            MaybeLogClientStats();
+        }
+    }
     pending.continuation("", pending.readResultData);
     pendingRequests.erase(pending.requestId);
 }

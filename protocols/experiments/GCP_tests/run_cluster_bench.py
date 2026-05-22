@@ -113,9 +113,16 @@ def _build_client_cmd(
         if open_loop:
             args.extend(["-O", "-R", str(poisson_rate)])
     quoted = " ".join(_bash_word(a) for a in args)
+    dyna_env = ""
+    if protocol == "dyna":
+        dyna_env = (
+            "export DYNA_CLIENT_STATS=${DYNA_CLIENT_STATS:-1}; "
+            "export DYNA_CLIENT_STATS_LOG_EVERY=${DYNA_CLIENT_STATS_LOG_EVERY:-10000}; "
+            "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
+        )
     # Background subshell: SSH returns immediately; client writes done when finished.
     client_run = (
-        f"{cfg['client_bin']} {quoted} "
+        f"{dyna_env}{cfg['client_bin']} {quoted} "
         f"> {run_dir}/client.log 2>&1; "
         f"echo $? > {run_dir}/exit_code; "
         f"touch {run_dir}/done"

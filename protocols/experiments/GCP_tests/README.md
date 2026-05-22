@@ -146,6 +146,17 @@ Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (update 
 
 **DYNA slow-path logs:** `~/bench/start_dyna_replica.sh` sets `DYNA_SLOWPATH_DEBUG=1` by default (logging only; does not force slow path). After a bench run, on each receiver: `grep "DYNA slowpath" ~/bench/replica-*.log`. Disable with `DYNA_SLOWPATH_DEBUG=0` before starting a replica. Re-run `setup_dyna_cluster.py --skip-build` to refresh the helper on existing VMs. Deadlines use **`system_clock`** (Nezha-style), not per-VM `steady_clock`, so senders and replicas should agree under GCP NTP.
 
+**DYNA performance stats (default on via setup helpers):**
+
+| Env | Where | Meaning |
+|-----|--------|---------|
+| `DYNA_STATS=1` | replica | Every `DYNA_STATS_INTERVAL_SEC` (default 1s): queue depths, release/slowpath rates, sampled `queue_us` / `hold_us` / `fastQ_us` |
+| `DYNA_STATS_SAMPLE` | replica | Sample 1/N releases for latency breakdown (default 1024) |
+| `DYNA_CLIENT_STATS=1` | client | Every `DYNA_CLIENT_STATS_LOG_EVERY` completions (default 10000): total / first-reply / quorum-wait μs percentiles |
+| `BENCH_INFLIGHT_LOG=1` | client | Adds `inflight=` and `submitted=` to throughput interval lines |
+
+Replica lines: `grep "DYNA stats" ~/bench/replica-0.log`. Client lines are in `runs/<id>/client.log`; `aggregate_bench_results.py` pulls `per_sender_diagnostics` (max inflight, client phase p50s) into `summary.json`. Disable any flag with `=0`.
+
 **DYNA vs VR latency (same open-loop bench):** VR replies as soon as the leader path completes (no hold-until-`deadline_us`); DYNA intentionally waits until **`now >= send_us + bound_us`** before `FastReply`. With correct OWD on GCP, **`bound_us` should be ~100–500 μs** (`DYNA_INITIAL_BOUND_US` / `DYNA_MAX_OWD_US` on replicas and senders via `start_dyna_replica.sh` / `run_dyna_client.sh`). Closed-loop sanity: `--closed-loop` with one sender should land near **bound + quorum RTT** (sub–few ms), not tens of ms. Open-loop at high offered load on a **small keyspace** adds per-key queueing on top of that floor; the default trace uses **1000 keys** so `-R 30` is closer to a defensible paper setup. If closed-loop is fast but open-loop median is still very high, look at pipeline/threading before deadline math.
 
 **Deadline env (GCP defaults in setup helpers):** `DYNA_INITIAL_BOUND_US=500`, `DYNA_MAX_OWD_US=10000`, `DYNA_BOUND_RECOMPUTE_K=1`, `DYNA_FAST_REPLY_SHARDS=16` (UDP send parallelism for FastReply).

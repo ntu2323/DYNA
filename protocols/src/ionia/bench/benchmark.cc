@@ -21,6 +21,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
@@ -33,6 +35,19 @@
 namespace specpaxos {
 
 DEFINE_LATENCY(op);
+
+static bool
+BenchInflightLogEnabled()
+{
+    static const bool enabled = []() {
+        if (const char *v = std::getenv("BENCH_INFLIGHT_LOG"); v && *v && std::strcmp(v, "0") != 0) {
+            return true;
+        }
+        const char *dyna = std::getenv("DYNA_CLIENT_STATS");
+        return dyna && *dyna && std::strcmp(dyna, "0") != 0;
+    }();
+    return enabled;
+}
 
 BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
                                  int numRequests_, uint64_t delay,
@@ -224,7 +239,17 @@ BenchmarkClient::TimeInterval()
     struct timeval tv;
     gettimeofday(&tv, NULL);
     msSinceStart += tputInterval;
-    Notice("Completed %d requests at %lu ms", n - opLastInterval, (((tv.tv_sec * 1000000 + tv.tv_usec) / 1000) / 10) * 10);
+    const int intervalOps = n - opLastInterval;
+    const unsigned long wallMs = (((tv.tv_sec * 1000000 + tv.tv_usec) / 1000) / 10) * 10;
+    if (BenchInflightLogEnabled() && openLoop_) {
+        Notice("Completed %d requests at %lu ms inflight=%zu submitted=%lu",
+               intervalOps,
+               wallMs,
+               inflightStartNs_.size(),
+               static_cast<unsigned long>(totalSubmitted_));
+    } else {
+        Notice("Completed %d requests at %lu ms", intervalOps, wallMs);
+    }
     opLastInterval = n;
     transport.Timer(tputInterval, std::bind(&BenchmarkClient::TimeInterval, this));
 }

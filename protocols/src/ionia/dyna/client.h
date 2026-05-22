@@ -36,6 +36,8 @@ private:
         bool isRead = false;
         uint32_t partitionId = 0;
         uint64_t requestId = 0;
+        uint64_t sendUs = 0;
+        uint64_t firstReplyUs = 0;
         uint64_t deadlineUs = 0;       // original client-stamped deadline
         uint64_t activeDeadlineUs = 0; // leader-authoritative epoch for quorum matching
         continuation_t continuation;
@@ -49,8 +51,12 @@ private:
     uint32_t numPartitions;
     std::unordered_map<uint64_t, PendingRequest> pendingRequests;
     ClientBoundTracker bound_tracker_;
+    bool clientStatsEnabled_ = false;
+    uint64_t clientStatsLogEvery_ = 10000;
 
     uint64_t NowMicros() const;
+    void RecordClientCompletion(const PendingRequest &pending);
+    void MaybeLogClientStats();
     uint64_t ComputeDeadline(uint64_t send_time_us) const;
     bool IsReadCommand(const std::string &request) const;
     uint32_t PartitionForRequest(const std::string &request) const;

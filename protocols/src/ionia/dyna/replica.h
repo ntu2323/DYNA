@@ -79,6 +79,8 @@ private:
         proto::RequestMessage request;
         std::shared_ptr<TransportAddress> clientAddress;
         uint64_t sequence = 0;
+        /** Wall time when enqueued on incomingQu_ (DYNA_STATS). */
+        uint64_t enqueuedUs = 0;
     };
 
     /** UDP fast reply work (Nezha FastReplyThread); built at release, no PartitionState on send. */
@@ -90,6 +92,8 @@ private:
         uint64_t deadlineUs = 0;
         uint32_t viewId = 0;
         uint64_t owdUs = 0;
+        /** Wall time when enqueued on fastReplyQu_ (DYNA_STATS). */
+        uint64_t queuedUs = 0;
     };
 
     struct OwdSample {
@@ -171,9 +175,16 @@ private:
     std::vector<std::thread> durabilityThreads_;
     std::vector<std::thread> fastReplyThreads_;
     std::thread owdThread_;
+    std::thread statsThread_;
     std::atomic<bool> workersRunning_{false};
+    bool replicaStatsEnabled_ = false;
+    uint64_t replicaStatsIntervalUs_ = 1000000;
+    uint64_t replicaStatsSampleEvery_ = 1024;
+    std::atomic<uint64_t> replicaStatsSampleCounter_{0};
 
     void StartWorkers();
+    void StatsThreadLoop();
+    void EmitReplicaStats();
     void StopWorkers();
     void ProcessPartitionLoop(uint32_t partitionId);
     void ReplicationPartitionLoop(uint32_t partitionId);

@@ -19,7 +19,12 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 from gcp_bench_common import (
+    DYNA_CLIENT_FIRST_REPLY_US_RE,
+    DYNA_CLIENT_QUORUM_WAIT_US_RE,
+    DYNA_CLIENT_STATS_RE,
+    DYNA_CLIENT_TOTAL_US_RE,
     FINISH_LINE_RE,
+    INFLIGHT_LINE_RE,
     INTERVAL_LINE_RE,
     LATENCY_LINE_RE,
 )
@@ -55,6 +60,71 @@ def _parse_log(path: str, sender: str) -> Tuple[List[IntervalSample], Optional[T
                 latencies[key] = int(m.group(2))
 
     return intervals, finish, latencies
+
+
+def _parse_client_diagnostics(path: str) -> dict:
+    """Parse DYNA client stats and open-loop inflight lines from client.log."""
+    max_inflight = 0
+    last_summary: dict = {}
+    last_total_us: dict = {}
+    last_first_reply_us: dict = {}
+    last_quorum_wait_us: dict = {}
+
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = INFLIGHT_LINE_RE.search(line)
+            if m:
+                max_inflight = max(max_inflight, int(m.group(1)))
+                continue
+            m = DYNA_CLIENT_STATS_RE.search(line)
+            if m:
+                last_summary = {
+                    "completions": int(m.group(1)),
+                    "bound_us": int(m.group(2)),
+                }
+                continue
+            m = DYNA_CLIENT_TOTAL_US_RE.search(line)
+            if m:
+                last_total_us = {
+                    "samples": int(m.group(1)),
+                    "avg_us": int(m.group(2)),
+                    "p50_us": int(m.group(3)),
+                    "p99_us": int(m.group(4)),
+                    "max_us": int(m.group(5)),
+                }
+                continue
+            m = DYNA_CLIENT_FIRST_REPLY_US_RE.search(line)
+            if m:
+                last_first_reply_us = {
+                    "samples": int(m.group(1)),
+                    "avg_us": int(m.group(2)),
+                    "p50_us": int(m.group(3)),
+                    "p99_us": int(m.group(4)),
+                    "max_us": int(m.group(5)),
+                }
+                continue
+            m = DYNA_CLIENT_QUORUM_WAIT_US_RE.search(line)
+            if m:
+                last_quorum_wait_us = {
+                    "samples": int(m.group(1)),
+                    "avg_us": int(m.group(2)),
+                    "p50_us": int(m.group(3)),
+                    "p99_us": int(m.group(4)),
+                    "max_us": int(m.group(5)),
+                }
+
+    out: dict = {}
+    if max_inflight > 0:
+        out["max_inflight"] = max_inflight
+    if last_summary:
+        out["client_stats"] = last_summary
+    if last_total_us:
+        out["total_us"] = last_total_us
+    if last_first_reply_us:
+        out["first_reply_us"] = last_first_reply_us
+    if last_quorum_wait_us:
+        out["quorum_wait_us"] = last_quorum_wait_us
+    return out
 
 
 def _measurement_window_ms(meta: dict, trim_pad_sec: float) -> Tuple[int, int]:
@@ -205,6 +275,7 @@ def aggregate_run(run_dir: str, trim_pad_sec: Optional[float]) -> dict:
     all_intervals: List[IntervalSample] = []
     per_sender_latency: Dict[str, dict] = {}
     per_sender_finish: Dict[str, dict] = {}
+    per_sender_diagnostics: Dict[str, dict] = {}
 
     for s in meta["senders"]:
         role = s["role"]
@@ -215,6 +286,10 @@ def aggregate_run(run_dir: str, trim_pad_sec: Optional[float]) -> dict:
         intervals, finish, lats = _parse_log(log_path, role)
         all_intervals.extend(intervals)
         per_sender_latency[role] = lats
+        if meta.get("protocol") == "dyna":
+            diag = _parse_client_diagnostics(log_path)
+            if diag:
+                per_sender_diagnostics[role] = diag
         if finish:
             ops, sec = finish
             per_sender_finish[role] = {
@@ -251,6 +326,7 @@ def aggregate_run(run_dir: str, trim_pad_sec: Optional[float]) -> dict:
         "per_sender_latency_ns": per_sender_latency,
         "latency_across_senders_ns": latency_across_senders,
         "per_sender_finish": per_sender_finish,
+        "per_sender_diagnostics": per_sender_diagnostics,
         "meta": {
             "num_ops": meta.get("num_ops"),
             "experiment_sec": meta.get("experiment_sec"),
@@ -303,6 +379,26 @@ def _print_summary(summary: dict) -> None:
     print("  Per-sender finish line:")
     for role, fin in summary["per_sender_finish"].items():
         print(f"    {role}: {fin['ops']} ops in {fin['seconds']:.2f}s => {fin['ops_per_sec']:.1f} ops/s")
+    diag_all = summary.get("per_sender_diagnostics") or {}
+    if diag_all:
+        print("  Per-sender diagnostics (DYNA):")
+        for role, diag in diag_all.items():
+            parts = []
+            if "max_inflight" in diag:
+                parts.append(f"max_inflight={diag['max_inflight']}")
+            cs = diag.get("client_stats") or {}
+            if cs:
+                parts.append(f"bound_us={cs.get('bound_us')}")
+            tr = diag.get("total_us") or {}
+            if tr.get("p50_us") is not None:
+                parts.append(f"total_p50_us={tr['p50_us']}")
+            fr = diag.get("first_reply_us") or {}
+            if fr.get("p50_us") is not None:
+                parts.append(f"first_reply_p50_us={fr['p50_us']}")
+            qw = diag.get("quorum_wait_us") or {}
+            if qw.get("p50_us") is not None:
+                parts.append(f"quorum_wait_p50_us={qw['p50_us']}")
+            print(f"    {role}: " + "  ".join(parts))
 
 
 def main() -> None:

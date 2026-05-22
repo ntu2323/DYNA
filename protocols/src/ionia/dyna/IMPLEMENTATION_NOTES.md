@@ -51,6 +51,12 @@ Environment (optional overrides):
 - **Durability worker (one thread per partition):** under `partitionMu_`, drain `durabilityQu_` → **`AppendPendingLogEntry`** (log + `SyncBroadcast` + WAL).
 - **Shared state:** fast-path admission uses **`lastReleasedByOpKey`** with **`reqKey = (client_id<<32)|request_id`**. `deadlineCounter` updated on apply for read visibility.
 
+### Performance diagnostics (`DYNA_STATS`, `DYNA_CLIENT_STATS`)
+
+- **`DYNA_STATS=1` (replica):** background thread emits `DYNA stats` every `DYNA_STATS_INTERVAL_SEC` (default 1): approximate `incomingQu_` / `earlyBuffer` / `fastReplyQu_` / `durabilityQu_` / `replicationQu_` depths, release and slow-path rates, queue-full counters. Every `DYNA_STATS_SAMPLE` releases (default 1024) records sampled `queue_us` (release − `send_time_us`), `hold_us` (release − `deadline_us`), and `fastQ_us` (UDP send − fast-reply enqueue).
+- **`DYNA_CLIENT_STATS=1` (client):** every `DYNA_CLIENT_STATS_LOG_EVERY` completions (default 10000), logs total / first-reply / quorum-wait μs percentiles plus `bound_us`, mismatch drops, and epoch resets.
+- **Bench:** `BENCH_INFLIGHT_LOG=1` (or `DYNA_CLIENT_STATS=1`) adds `inflight=` to throughput interval lines. GCP `setup_dyna.sh` / `run_cluster_bench.py` enable these by default.
+
 ### Fast path (single-shard network partition)
 
 - Step 3: Replica buffers on-time requests in `earlyBuffer` until deadline `d`.

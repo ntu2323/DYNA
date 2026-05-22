@@ -1,6 +1,7 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
 
 #include "dyna/replica.h"
+#include "dyna/stats_util.h"
 #include "dyna/wall_clock.h"
 
 #include "lib/assert.h"
@@ -55,6 +56,24 @@ WalDirFromEnv()
     return "/tmp/ionia-dyna-wal";
 }
 
+namespace {
+
+struct ReplicaRuntimeStats {
+    CounterWindow releases;
+    CounterWindow slowpathAdmit;
+    CounterWindow incomingFull;
+    CounterWindow fastReplyFull;
+    CounterWindow durabilityFull;
+    CounterWindow replicationFull;
+    LatencySampleBuffer queueUs;
+    LatencySampleBuffer holdUs;
+    LatencySampleBuffer fastReplyQueueUs;
+};
+
+ReplicaRuntimeStats g_replicaStats;
+
+} // namespace
+
 DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport *transport)
     : config(config),
       numPartitions(static_cast<uint32_t>(std::max(1, config.n))),
@@ -67,7 +86,10 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
       incomingQu_(numPartitions),
       durabilityQu_(numPartitions),
       owdEstimator_(DeadlineConfig::FromEnvironment()),
-      walDir_(WalDirFromEnv())
+      walDir_(WalDirFromEnv()),
+      replicaStatsEnabled_(EnvFlagEnabled("DYNA_STATS")),
+      replicaStatsIntervalUs_(EnvUint64OrDefault("DYNA_STATS_INTERVAL_SEC", 1) * 1000000ULL),
+      replicaStatsSampleEvery_(std::max<uint64_t>(1, EnvUint64OrDefault("DYNA_STATS_SAMPLE", 1024)))
 {
     fastReplyQu_.resize(numFastReplyShards);
     std::error_code ec;
@@ -82,6 +104,9 @@ DynaReplica::DynaReplica(const Configuration &config, int replicaIdx, Transport 
 DynaReplica::~DynaReplica()
 {
     StopWorkers();
+    if (replicaStatsEnabled_) {
+        EmitReplicaStats();
+    }
 }
 
 void
@@ -157,7 +182,13 @@ DynaReplica::EnqueueClientRequest(uint32_t partitionId,
     BufferedRequest buffered;
     buffered.request = req;
     buffered.clientAddress = std::shared_ptr<TransportAddress>(remote.clone());
+    if (replicaStatsEnabled_) {
+        buffered.enqueuedUs = NowMicros();
+    }
     if (!incomingQu_[pid].enqueue(std::move(buffered))) {
+        if (replicaStatsEnabled_) {
+            g_replicaStats.incomingFull.add();
+        }
         Warning("DYNA incoming queue full part=%u req=(%lu,%lu)", pid, req.client_id(), req.request_id());
         return false;
     }
@@ -176,6 +207,9 @@ DynaReplica::EnqueueReplication(uint32_t partitionId,
     work.remote.reset(remote.clone());
     work.payload.assign(data.data(), data.length());
     if (!replicationQu_[pid].enqueue(std::move(work))) {
+        if (replicaStatsEnabled_) {
+            g_replicaStats.replicationFull.add();
+        }
         Warning("DYNA replication queue full part=%u kind=%d", pid, static_cast<int>(kind));
         return false;
     }
@@ -199,6 +233,9 @@ DynaReplica::StartWorkers()
         replicationThreads_.emplace_back(&DynaReplica::ReplicationPartitionLoop, this, partitionId);
         durabilityThreads_.emplace_back(&DynaReplica::DurabilityPartitionLoop, this, partitionId);
     }
+    if (replicaStatsEnabled_) {
+        statsThread_ = std::thread(&DynaReplica::StatsThreadLoop, this);
+    }
 }
 
 void
@@ -206,6 +243,9 @@ DynaReplica::StopWorkers()
 {
     if (!workersRunning_.exchange(false)) {
         return;
+    }
+    if (statsThread_.joinable()) {
+        statsThread_.join();
     }
     for (auto &qu : replicationQu_) {
         InboundWork shutdown;
@@ -299,10 +339,102 @@ DynaReplica::FastReplyThreadLoop(uint32_t shardId)
     while (workersRunning_.load()) {
         FastReplySendJob job;
         if (fastReplyQu_[shardId].try_dequeue(job)) {
+            if (replicaStatsEnabled_ && job.queuedUs > 0) {
+                const uint64_t sendUs = NowMicros();
+                if (sendUs > job.queuedUs) {
+                    g_replicaStats.fastReplyQueueUs.record(sendUs - job.queuedUs);
+                }
+            }
             SendFastReplyFromJob(job);
             continue;
         }
         std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+}
+
+void
+DynaReplica::StatsThreadLoop()
+{
+    while (workersRunning_.load()) {
+        std::this_thread::sleep_for(std::chrono::microseconds(replicaStatsIntervalUs_));
+        if (!workersRunning_.load()) {
+            break;
+        }
+        EmitReplicaStats();
+    }
+}
+
+void
+DynaReplica::EmitReplicaStats()
+{
+    const double intervalSec =
+        static_cast<double>(replicaStatsIntervalUs_) / 1000000.0;
+    size_t incomingApprox = 0;
+    size_t durabilityApprox = 0;
+    size_t replicationApprox = 0;
+    size_t fastReplyApprox = 0;
+    size_t earlyBufferTotal = 0;
+    for (uint32_t pid = 0; pid < numPartitions; ++pid) {
+        incomingApprox += incomingQu_[pid].size_approx();
+        durabilityApprox += durabilityQu_[pid].size_approx();
+        replicationApprox += replicationQu_[pid].size_approx();
+        {
+            std::lock_guard<std::mutex> partitionLock(partitionMu_[pid]);
+            earlyBufferTotal += StateFor(pid).earlyBuffer.size();
+        }
+    }
+    for (uint32_t shard = 0; shard < numFastReplyShards; ++shard) {
+        fastReplyApprox += fastReplyQu_[shard].size_approx();
+    }
+
+    const uint64_t releases = g_replicaStats.releases.snapshotAndReset();
+    const uint64_t slowpath = g_replicaStats.slowpathAdmit.snapshotAndReset();
+    const uint64_t incomingFull = g_replicaStats.incomingFull.snapshotAndReset();
+    const uint64_t fastReplyFull = g_replicaStats.fastReplyFull.snapshotAndReset();
+    const uint64_t durFull = g_replicaStats.durabilityFull.snapshotAndReset();
+    const uint64_t replFull = g_replicaStats.replicationFull.snapshotAndReset();
+
+    const auto queueSnap = g_replicaStats.queueUs.snapshotAndClear();
+    const auto holdSnap = g_replicaStats.holdUs.snapshotAndClear();
+    const auto fastSnap = g_replicaStats.fastReplyQueueUs.snapshotAndClear();
+
+    Notice("DYNA stats rep=%d incoming=%zu early=%zu fastQ=%zu durQ=%zu replQ=%zu "
+           "releases=%.0f/s slowpath=%.0f/s incoming_full=%lu fastreply_full=%lu "
+           "dur_full=%lu repl_full=%lu",
+           replicaIdx,
+           incomingApprox,
+           earlyBufferTotal,
+           fastReplyApprox,
+           durabilityApprox,
+           replicationApprox,
+           intervalSec > 0 ? static_cast<double>(releases) / intervalSec : 0.0,
+           intervalSec > 0 ? static_cast<double>(slowpath) / intervalSec : 0.0,
+           static_cast<unsigned long>(incomingFull),
+           static_cast<unsigned long>(fastReplyFull),
+           static_cast<unsigned long>(durFull),
+           static_cast<unsigned long>(replFull));
+
+    if (queueSnap.count > 0 || holdSnap.count > 0 || fastSnap.count > 0) {
+        Notice("DYNA stats rep=%d latency_us queue_samples=%lu queue_avg=%lu queue_p50=%lu "
+               "queue_p99=%lu queue_max=%lu hold_samples=%lu hold_avg=%lu hold_p50=%lu "
+               "hold_p99=%lu hold_max=%lu fastQ_samples=%lu fastQ_avg=%lu fastQ_p50=%lu "
+               "fastQ_p99=%lu fastQ_max=%lu",
+               replicaIdx,
+               static_cast<unsigned long>(queueSnap.count),
+               static_cast<unsigned long>(queueSnap.avg_us),
+               static_cast<unsigned long>(queueSnap.p50_us),
+               static_cast<unsigned long>(queueSnap.p99_us),
+               static_cast<unsigned long>(queueSnap.max_us),
+               static_cast<unsigned long>(holdSnap.count),
+               static_cast<unsigned long>(holdSnap.avg_us),
+               static_cast<unsigned long>(holdSnap.p50_us),
+               static_cast<unsigned long>(holdSnap.p99_us),
+               static_cast<unsigned long>(holdSnap.max_us),
+               static_cast<unsigned long>(fastSnap.count),
+               static_cast<unsigned long>(fastSnap.avg_us),
+               static_cast<unsigned long>(fastSnap.p50_us),
+               static_cast<unsigned long>(fastSnap.p99_us),
+               static_cast<unsigned long>(fastSnap.max_us));
     }
 }
 
@@ -370,6 +502,9 @@ DynaReplica::AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &bu
     }
 
     if (AmLeader(partitionId)) {
+        if (replicaStatsEnabled_) {
+            g_replicaStats.slowpathAdmit.add();
+        }
         if (SlowPathDebugEnabled()) {
             const uint64_t opKey = OpKeyFromCommand(req.command());
             ReleasedRank released{0, 0};
@@ -599,6 +734,21 @@ DynaReplica::ReleaseBufferedRequest(PartitionState &state,
 {
     RecordReleasedRank(state, buffered.request);
 
+    if (replicaStatsEnabled_) {
+        g_replicaStats.releases.add();
+        const uint64_t releaseUs = NowMicros();
+        const uint64_t sampleIdx =
+            replicaStatsSampleCounter_.fetch_add(1, std::memory_order_relaxed);
+        if (sampleIdx % replicaStatsSampleEvery_ == 0) {
+            if (buffered.request.send_time_us() > 0 && releaseUs > buffered.request.send_time_us()) {
+                g_replicaStats.queueUs.record(releaseUs - buffered.request.send_time_us());
+            }
+            if (releaseUs > buffered.request.deadline_us()) {
+                g_replicaStats.holdUs.record(releaseUs - buffered.request.deadline_us());
+            }
+        }
+    }
+
     if (buffered.clientAddress) {
         FastReplySendJob job;
         job.partitionId = partitionId;
@@ -611,13 +761,22 @@ DynaReplica::ReleaseBufferedRequest(PartitionState &state,
             std::lock_guard<std::mutex> lock(owdMutex_);
             job.owdUs = owdEstimator_.estimate_us(job.clientId);
         }
+        if (replicaStatsEnabled_) {
+            job.queuedUs = NowMicros();
+        }
         const uint32_t shard = FastReplyShardFor(buffered.request, numFastReplyShards);
         if (!fastReplyQu_[shard].enqueue(std::move(job))) {
+            if (replicaStatsEnabled_) {
+                g_replicaStats.fastReplyFull.add();
+            }
             Warning("DYNA fast-reply queue full shard=%u part=%u", shard, partitionId);
         }
     }
 
     if (!durabilityQu_[partitionId].enqueue(std::move(buffered))) {
+        if (replicaStatsEnabled_) {
+            g_replicaStats.durabilityFull.add();
+        }
         Warning("DYNA durability queue full part=%u", partitionId);
     }
 }
