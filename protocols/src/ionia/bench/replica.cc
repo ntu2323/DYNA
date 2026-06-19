@@ -39,6 +39,7 @@
 #include "lib/fasttransport.h"
 #include "lib/cpu_affinity.h"
 #include "dyna/replica.h"
+#include "dyna_new/replica.h"
 #include "vr/replica.h"
 #include "vr/durabilityreplica.h"
 
@@ -57,7 +58,7 @@
 static void
 Usage(const char *progName)
 {
-        fprintf(stderr, "usage: %s -c conf-file [-R] -i replica-index -m {vr|dyna} [-b batch-size] [-d packet-drop-rate] [-r packet-reorder-rate] [-q dscp]\n",
+        fprintf(stderr, "usage: %s -c conf-file [-R] -i replica-index -m {vr|dyna|dyna_new} [-b batch-size] [-d packet-drop-rate] [-r packet-reorder-rate] [-q dscp]\n",
                 progName);
         exit(1);
 }
@@ -96,7 +97,8 @@ main(int argc, char **argv)
     {
         PROTO_UNKNOWN,
         PROTO_VR,
-        PROTO_DYNA
+        PROTO_DYNA,
+        PROTO_DYNA_NEW
     } proto = PROTO_UNKNOWN;
 
     // Parse arguments
@@ -152,6 +154,8 @@ main(int argc, char **argv)
                 proto = PROTO_VR;
             } else if (strcasecmp(optarg, "dyna") == 0) {
                 proto = PROTO_DYNA;
+            } else if (strcasecmp(optarg, "dyna_new") == 0) {
+                proto = PROTO_DYNA_NEW;
             } else {
                 fprintf(stderr, "unknown mode '%s'\n", optarg);
                 Usage(argv[0]);
@@ -283,6 +287,13 @@ main(int argc, char **argv)
     if (proto == PROTO_DYNA) {
         FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size);
         specpaxos::dyna::DynaReplica replica(internalConfig, index, &transport);
+        transport.Run();
+        return 0;
+    }
+
+    if (proto == PROTO_DYNA_NEW) {
+        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size);
+        specpaxos::dyna_new::DynaNewReplica replica(internalConfig, index, &transport);
         transport.Run();
         return 0;
     }

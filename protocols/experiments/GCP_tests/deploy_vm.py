@@ -28,7 +28,7 @@ IMAGE_PROJECT = "ubuntu-os-cloud"
 IMAGE_FAMILY = "ubuntu-2204-lts"  # Folly pin patched in remote/folly_build.sh (glibc 2.34 / SIGSTKSZ)
 INSTANCE_NAME = "lazylog-vm-1"
 
-EXTRA_REPLICA_ZONES = ['europe-north1','asia-northeast1','southamerica-east1']
+
 
 # -----------------------------------------------------------------------------
 # Load secrets (only key file path and service account email)

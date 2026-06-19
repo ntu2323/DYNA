@@ -96,6 +96,19 @@ SlowPathDebugEnabled()
     return enabled;
 }
 
+// Verbose tracing of the sync -> ack -> commit -> read-result chain. Use to
+// diagnose stalls where writes complete (fast path) but reads never do
+// (reads depend on commit). Enable with DYNA_COMMIT_DEBUG=1.
+static bool
+CommitDebugEnabled()
+{
+    static const bool enabled = []() {
+        const char *v = std::getenv("DYNA_COMMIT_DEBUG");
+        return v && *v && std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
 /**
  * When DYNA_EAGER_FAST_REPLY=1, on-time client requests bypass the
  * earlyBuffer/ProcessDueFastReplies deadline hold and are released
@@ -944,6 +957,68 @@ DynaReplica::ReleaseBufferedRequest(PartitionState &state,
         }
     }
 
+    // Read path (spec §6.3): reads are served off the release/deadline path, NOT
+    // through the write commit round. Releases are processed in deadline order
+    // under the partition lock, and the leader mem-applies writes at release
+    // (below), so by the time a read releases every write ordered before it is
+    // already visible in memory -- the read is linearizable w.r.t. those writes
+    // without any synchronous disk flush (disk persistence stays in the
+    // background durability path). Followers do not execute reads; their release
+    // FastReply above is the client-visible endorsement.
+    char op = '\0';
+    std::string parsedKey;
+    std::string parsedValue;
+    const bool parsed = ParseCommand(buffered.request.command(), op, parsedKey, parsedValue);
+    const bool isReadReq = parsed && IsReadOp(op);
+
+    if (parsed && AmLeader(partitionId)) {
+        if (isReadReq) {
+            if (buffered.clientAddress &&
+                state.repliedReads.find(buffered.request.request_id()) == state.repliedReads.end()) {
+                std::string result = "NOTFOUND";
+                {
+                    std::lock_guard<std::mutex> lock(kvMutex_);
+                    if (auto it = kvStore.find(parsedKey); it != kvStore.end()) {
+                        result = it->second;
+                    }
+                }
+                proto::ReadResult reply;
+                reply.set_partition_id(partitionId);
+                reply.set_request_id(buffered.request.request_id());
+                reply.set_view_id(state.viewId.load(std::memory_order_relaxed));
+                reply.set_deadline_us(buffered.request.deadline_us());
+                reply.set_data(result);
+                {
+                    std::lock_guard<std::mutex> lock(owdMutex_);
+                    const uint64_t owd = owdEstimator_.estimate_us(buffered.request.client_id());
+                    if (owd > 0) {
+                        reply.set_owd_us(owd);
+                    }
+                }
+                transport->SendMessage(this, *buffered.clientAddress, reply);
+                state.repliedReads.insert(buffered.request.request_id());
+                if (CommitDebugEnabled()) {
+                    Notice("DYNA commit-dbg LEADER %d served READ at release part=%u req=(%lu,%lu) deadline=%lu data='%s'",
+                           replicaIdx, partitionId,
+                           static_cast<unsigned long>(buffered.request.client_id()),
+                           static_cast<unsigned long>(buffered.request.request_id()),
+                           static_cast<unsigned long>(buffered.request.deadline_us()),
+                           result.c_str());
+                }
+            }
+        } else {
+            // Optimistic memory apply at release so later reads observe this
+            // write. Idempotent with the commit-time apply in ApplyCommittedUpTo.
+            std::lock_guard<std::mutex> lock(kvMutex_);
+            kvStore[parsedKey] = parsedValue;
+        }
+    }
+
+    if (isReadReq) {
+        // Reads never enter the durable log or the sync/commit round.
+        return;
+    }
+
     if (!durabilityQu_[partitionId].enqueue(std::move(buffered))) {
         if (replicaStatsEnabled_) {
             g_replicaStats.durabilityFull.add();
@@ -1101,6 +1176,15 @@ DynaReplica::BroadcastSyncForLogEntry(uint32_t partitionId, uint64_t viewId, con
     sb.set_client_id(entry.clientId);
     sb.set_request_id(entry.requestId);
     sb.set_deadline_us(entry.deadlineUs);
+    if (CommitDebugEnabled()) {
+        Notice("DYNA commit-dbg LEADER broadcast sync part=%u log=%lu req=(%lu,%lu) deadline=%lu isRead=%d",
+               partitionId,
+               static_cast<unsigned long>(entry.logIndex),
+               static_cast<unsigned long>(entry.clientId),
+               static_cast<unsigned long>(entry.requestId),
+               static_cast<unsigned long>(entry.deadlineUs),
+               entry.isRead ? 1 : 0);
+    }
     transport->SendMessageToAll(this, sb);
 }
 
@@ -1134,6 +1218,15 @@ DynaReplica::HandleSyncBroadcast(const TransportAddress &remote, const proto::Sy
         PartitionState &state = StateFor(partitionId);
         if (sb.view_id() != state.viewId.load(std::memory_order_relaxed) || AmLeader(partitionId) ||
             !IsValidSyncBroadcast(partitionId, sb)) {
+            if (CommitDebugEnabled()) {
+                Notice("DYNA commit-dbg FOLLOWER %d drop sync part=%u log=%lu (view=%lu/%lu amLeader=%d validBcast=%d)",
+                       replicaIdx, partitionId,
+                       static_cast<unsigned long>(sb.log_index()),
+                       static_cast<unsigned long>(sb.view_id()),
+                       static_cast<unsigned long>(state.viewId.load(std::memory_order_relaxed)),
+                       AmLeader(partitionId) ? 1 : 0,
+                       IsValidSyncBroadcast(partitionId, sb) ? 1 : 0);
+            }
             return;
         }
 
@@ -1149,6 +1242,14 @@ DynaReplica::HandleSyncBroadcast(const TransportAddress &remote, const proto::Sy
         sendAck = true;
     }
     if (sendAck) {
+        if (CommitDebugEnabled()) {
+            Notice("DYNA commit-dbg FOLLOWER %d -> ack part=%u log=%lu req=(%lu,%lu) deadline=%lu",
+                   replicaIdx, ack.partition_id(),
+                   static_cast<unsigned long>(ack.log_index()),
+                   static_cast<unsigned long>(ack.client_id()),
+                   static_cast<unsigned long>(ack.request_id()),
+                   static_cast<unsigned long>(ack.deadline_us()));
+        }
         transport->SendMessage(this, remote, ack);
     }
 }
@@ -1164,6 +1265,15 @@ DynaReplica::HandleSyncAck(const TransportAddress &remote, const proto::SyncAck 
         const PartitionState &state = StateFor(partitionId);
         if (!AmLeader(partitionId) || ack.view_id() != state.viewId.load(std::memory_order_relaxed) ||
             !IsValidSyncAck(partitionId, ack)) {
+            if (CommitDebugEnabled()) {
+                Notice("DYNA commit-dbg LEADER %d drop ack from=%u part=%u log=%lu (amLeader=%d view=%lu/%lu validAck=%d)",
+                       replicaIdx, ack.replica_id(), partitionId,
+                       static_cast<unsigned long>(ack.log_index()),
+                       AmLeader(partitionId) ? 1 : 0,
+                       static_cast<unsigned long>(ack.view_id()),
+                       static_cast<unsigned long>(state.viewId.load(std::memory_order_relaxed)),
+                       IsValidSyncAck(partitionId, ack) ? 1 : 0);
+            }
             return;
         }
     }
@@ -1589,9 +1699,25 @@ DynaReplica::TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack)
             return;
         }
         if (entry.clientId != ack.client_id() || entry.requestId != ack.request_id()) {
+            if (CommitDebugEnabled()) {
+                Notice("DYNA commit-dbg LEADER %d ack/log MISMATCH part=%u log=%lu ack=(%lu,%lu) entry=(%lu,%lu)",
+                       replicaIdx, partitionId,
+                       static_cast<unsigned long>(ack.log_index()),
+                       static_cast<unsigned long>(ack.client_id()),
+                       static_cast<unsigned long>(ack.request_id()),
+                       static_cast<unsigned long>(entry.clientId),
+                       static_cast<unsigned long>(entry.requestId));
+            }
             return;
         }
         if (entry.deadlineUs != ack.deadline_us()) {
+            if (CommitDebugEnabled()) {
+                Notice("DYNA commit-dbg LEADER %d ack DEADLINE MISMATCH part=%u log=%lu ack_deadline=%lu entry_deadline=%lu",
+                       replicaIdx, partitionId,
+                       static_cast<unsigned long>(ack.log_index()),
+                       static_cast<unsigned long>(ack.deadline_us()),
+                       static_cast<unsigned long>(entry.deadlineUs));
+            }
             return;
         }
         if (entry.committed) {
@@ -1600,6 +1726,12 @@ DynaReplica::TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack)
 
         state.ackMap[ack.log_index()][ack.replica_id()] = ack;
         const size_t quorum = static_cast<size_t>(config.f + 1);
+        if (CommitDebugEnabled()) {
+            Notice("DYNA commit-dbg LEADER %d ack count part=%u log=%lu have=%zu need=%zu",
+                   replicaIdx, partitionId,
+                   static_cast<unsigned long>(ack.log_index()),
+                   state.ackMap[ack.log_index()].size(), quorum);
+        }
         if (state.ackMap[ack.log_index()].size() < quorum) {
             return;
         }
@@ -1710,6 +1842,15 @@ void
 DynaReplica::MaybeSendReadResult(uint32_t partitionId, const TransportAddress &remote, const proto::RequestMessage &req)
 {
     PartitionState &state = StateFor(partitionId);
+    if (CommitDebugEnabled()) {
+        Notice("DYNA commit-dbg LEADER %d MaybeSendReadResult part=%u req=(%lu,%lu) deadline=%lu alreadyReplied=%d visible=%d",
+               replicaIdx, partitionId,
+               static_cast<unsigned long>(req.client_id()),
+               static_cast<unsigned long>(req.request_id()),
+               static_cast<unsigned long>(req.deadline_us()),
+               state.repliedReads.find(req.request_id()) != state.repliedReads.end() ? 1 : 0,
+               EnsureReadVisibilityBeforeDeadline(partitionId, req.deadline_us()) ? 1 : 0);
+    }
     if (state.repliedReads.find(req.request_id()) != state.repliedReads.end()) {
         return;
     }

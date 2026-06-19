@@ -15,8 +15,10 @@ PKILL_REPLICA = "pkill -f '[b]ench/replica' 2>/dev/null || true"
 PKILL_CLIENT = "pkill -f '[b]ench/client' 2>/dev/null || true"
 PGREP_CLIENT = "pgrep -f '[b]ench/client' >/dev/null"
 
-# Default DYNA WAL path from remote/setup_dyna.sh (DYNA_WAL_DIR).
-DYNA_WAL_DIR = "$HOME/bench/wal"
+# DYNA WAL paths (see remote/setup_dyna.sh, run_cluster_bench.py --wal-tmpfs).
+DYNA_WAL_DIR_DISK = "$HOME/bench/wal"
+DYNA_WAL_DIR_TMPFS = "/dev/shm/dyna-wal"
+DYNA_WAL_DIR = DYNA_WAL_DIR_DISK
 
 
 def remote_sender_cleanup_cmd() -> str:
@@ -29,7 +31,12 @@ def remote_sender_cleanup_cmd() -> str:
     )
 
 
-def remote_receiver_cleanup_cmd(protocol: str, replica_idx: int) -> str:
+def remote_receiver_cleanup_cmd(
+    protocol: str,
+    replica_idx: int,
+    *,
+    dyna_wal_dir: Optional[str] = None,
+) -> str:
     """Stop replicas and wipe durable bench state for a clean run.
 
     Must not embed ``bench/replica`` in the same remote shell command as PKILL_REPLICA:
@@ -40,7 +47,8 @@ def remote_receiver_cleanup_cmd(protocol: str, replica_idx: int) -> str:
     if protocol == "vr":
         parts.append(f"rm -rf /dev/shm/rocks{replica_idx}")
     elif protocol == "dyna":
-        parts.append(f"rm -rf {DYNA_WAL_DIR}")
+        wal = dyna_wal_dir or DYNA_WAL_DIR_DISK
+        parts.append(f"rm -rf {wal}")
     return "; ".join(parts)
 
 

@@ -1,25 +1,23 @@
 {
+  "extra_client_zone": "us-west1-b",
   "hosts": {
-    "receiver1": "136.107.110.192",
-    "receiver2": "136.107.213.94",
-    "receiver3": "34.181.200.75",
-    "sender1": "34.181.238.147",
-    "sender2": "34.181.162.175",
-    "sender3": "34.150.255.184",
-    "sender4": "34.181.243.42"
+    "receiver1": "128.110.218.53",
+    "receiver2": "128.110.218.79",
+    "receiver3": "128.110.218.48",
+    "sender1": "128.110.218.42"
   },
-  "machine_count": 7,
+  "machine_count": 4,
   "name_prefix": "ionia",
   "receiver_internal": {
-    "receiver1": "10.150.0.24",
-    "receiver2": "10.150.0.25",
-    "receiver3": "10.150.15.231"
+    "receiver1": "10.10.1.1",
+    "receiver2": "10.10.1.2",
+    "receiver3": "10.10.1.3"
   },
   "receiver_zones": {
-    "receiver1": "us-east4-c",
-    "receiver2": "us-east4-c",
+    "receiver1": "europe-north2-b",
+    "receiver2": "asia-northeast1-b",
     "receiver3": "us-east4-c"
   },
-  "sender_zone": "us-east4-c",
-  "spread_replica_zones": false
+  "sender_zone": "us-west1-b",
+  "spread_replica_zones": true
 }

@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from gcp_bench_common import (
+    DYNA_WAL_DIR_DISK,
+    DYNA_WAL_DIR_TMPFS,
     PKILL_CLIENT,
     PKILL_REPLICA,
     fetch_remote_file,
@@ -67,6 +69,26 @@ def _bash_word(word: str) -> str:
     return shlex.quote(word)
 
 
+def _offered_ops_per_sender(offered_ops_per_sec: float, poisson_rate: int) -> float:
+    if offered_ops_per_sec > 0.0:
+        return offered_ops_per_sec
+    return float(poisson_rate * 100)
+
+
+def _auto_max_inflight_cap(
+    offered_ops_per_sec: float,
+    poisson_rate: int,
+    *,
+    expected_rtt_sec: float,
+    inflight_factor: float,
+    floor: int,
+) -> int:
+    """Pipeline depth for open-loop: offered * RTT * factor (Little's law)."""
+    offered = _offered_ops_per_sender(offered_ops_per_sec, poisson_rate)
+    computed = int(offered * expected_rtt_sec * inflight_factor + 0.999)
+    return max(floor, computed)
+
+
 def _build_client_cmd(
     protocol: str,
     run_id: str,
@@ -79,6 +101,8 @@ def _build_client_cmd(
     machine_id: int,
     open_loop: bool,
     poisson_rate: int,
+    offered_ops_per_sec: float,
+    max_inflight: int,
 ) -> str:
     run_dir = _remote_run_dir(run_id)
     cfg = PROTOCOLS[protocol]
@@ -95,7 +119,13 @@ def _build_client_cmd(
             "-l", f"{run_dir}/latencies",
         ]
         if open_loop:
-            args.extend(["-O", "-R", str(poisson_rate)])
+            args.append("-O")
+            if offered_ops_per_sec > 0.0:
+                args.extend(["-G", repr(offered_ops_per_sec)])
+            else:
+                args.extend(["-R", str(poisson_rate)])
+            if max_inflight > 0:
+                args.extend(["-F", str(max_inflight)])
     else:
         args = [
             "-s", "$HOME/bench/dynaconfig",
@@ -111,7 +141,13 @@ def _build_client_cmd(
             "-l", f"{run_dir}/latencies",
         ]
         if open_loop:
-            args.extend(["-O", "-R", str(poisson_rate)])
+            args.append("-O")
+            if offered_ops_per_sec > 0.0:
+                args.extend(["-G", repr(offered_ops_per_sec)])
+            else:
+                args.extend(["-R", str(poisson_rate)])
+            if max_inflight > 0:
+                args.extend(["-F", str(max_inflight)])
     quoted = " ".join(_bash_word(a) for a in args)
     dyna_env = ""
     if protocol == "dyna":
@@ -134,6 +170,15 @@ def _build_client_cmd(
     )
 
 
+def _dyna_replica_env_prefix(*, wal_tmpfs: bool, eager_fast_reply: bool) -> str:
+    parts: List[str] = []
+    if wal_tmpfs:
+        parts.append(f"mkdir -p {DYNA_WAL_DIR_TMPFS}")
+        parts.append(f"export DYNA_WAL_DIR={DYNA_WAL_DIR_TMPFS}")
+    parts.append(f"export DYNA_EAGER_FAST_REPLY={'1' if eager_fast_reply else '0'}")
+    return "; ".join(parts) + "; "
+
+
 def _start_replica(
     role: str,
     host: str,
@@ -142,15 +187,31 @@ def _start_replica(
     ssh_key: Optional[str],
     *,
     clean_remote: bool,
+    wal_tmpfs: bool,
+    eager_fast_reply: bool,
 ) -> tuple[str, bool, str]:
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
+    dyna_wal_dir = DYNA_WAL_DIR_TMPFS if wal_tmpfs else DYNA_WAL_DIR_DISK
     parts = []
     if clean_remote:
-        parts.append(remote_receiver_cleanup_cmd(protocol, idx))
+        parts.append(
+            remote_receiver_cleanup_cmd(
+                protocol,
+                idx,
+                dyna_wal_dir=dyna_wal_dir if protocol == "dyna" else None,
+            )
+        )
     else:
         parts.extend([PKILL_REPLICA, "sleep 1"])
-    parts.append(cfg["replica_start"].format(idx=idx))
+    replica_start = cfg["replica_start"].format(idx=idx)
+    if protocol == "dyna":
+        parts.append(
+            _dyna_replica_env_prefix(wal_tmpfs=wal_tmpfs, eager_fast_reply=eager_fast_reply)
+            + replica_start
+        )
+    else:
+        parts.append(replica_start)
     cmd = "; ".join(parts)
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     ok = r.returncode == 0
@@ -283,7 +344,46 @@ def main() -> None:
         "--poisson-rate",
         type=int,
         default=60,
-        help="Open-loop (default): mean requests per 10ms per sender (~rate*100 offered ops/s). Nezha-style.",
+        help="Open-loop: mean requests per 10ms per sender (~rate*100 offered ops/s). Ignored if --offered-ops-per-sec set.",
+    )
+    ap.add_argument(
+        "--offered-ops-per-sec",
+        type=float,
+        default=0.0,
+        help="Open-loop: target offered ops/s per sender (-G; use for WAN instead of --poisson-rate).",
+    )
+    ap.add_argument(
+        "--max-inflight",
+        type=int,
+        default=0,
+        help="Open-loop: cap outstanding requests per sender (0 = unlimited). Backpressure for WAN.",
+    )
+    ap.add_argument(
+        "--wan-open-loop",
+        action="store_true",
+        help="Open-loop WAN preset: -G 10 ops/s per sender, -F 500 max inflight (override with flags).",
+    )
+    ap.add_argument(
+        "--auto-max-inflight",
+        action="store_true",
+        help="Set -F from offered load and --expected-rtt-sec (pipeline depth for high-throughput latency).",
+    )
+    ap.add_argument(
+        "--expected-rtt-sec",
+        type=float,
+        default=0.35,
+        help="Planning RTT (seconds) for --auto-max-inflight (WAN ~0.33; same-region ~0.0004–0.001).",
+    )
+    ap.add_argument(
+        "--inflight-factor",
+        type=float,
+        default=4.0,
+        help="max_inflight = offered_ops/s * expected_rtt_sec * factor (with --auto-max-inflight).",
+    )
+    ap.add_argument(
+        "--high-throughput-latency",
+        action="store_true",
+        help="Shorthand: open-loop latency under load; enables --auto-max-inflight (set offered rate explicitly).",
     )
     ap.add_argument("--replica-wait-sec", type=int, default=8)
     ap.add_argument("--client-timeout-sec", type=int, default=7200)
@@ -292,12 +392,47 @@ def main() -> None:
         action="store_true",
         help="Do not wipe remote bench state (default: pkill, rm runs/*, VR rocks, DYNA WAL).",
     )
+    ap.add_argument(
+        "--wal-tmpfs",
+        action="store_true",
+        help="DYNA only: WAL on /dev/shm/dyna-wal (isolates fsync/disk from latency; for triage).",
+    )
+    ap.add_argument(
+        "--no-eager-fast-reply",
+        action="store_true",
+        help="DYNA only: Nezha-style deadline hold (default is eager fast-reply on admit).",
+    )
     ap.add_argument("--skip-replicas", action="store_true")
     ap.add_argument("--skip-clients", action="store_true", help="Only (re)start replicas.")
     args = ap.parse_args()
 
     if not args.ssh_user:
         sys.exit("Set --ssh-user or SSH_USER")
+    if args.wal_tmpfs and args.protocol != "dyna":
+        sys.exit("--wal-tmpfs applies only to --protocol dyna")
+    if args.wan_open_loop and args.closed_loop:
+        sys.exit("--wan-open-loop requires open-loop (omit --closed-loop)")
+    if args.high_throughput_latency and args.closed_loop:
+        sys.exit("--high-throughput-latency requires open-loop (omit --closed-loop)")
+
+    offered_ops_per_sec = args.offered_ops_per_sec
+    max_inflight = args.max_inflight
+    auto_max_inflight = args.auto_max_inflight or args.high_throughput_latency
+    if args.wan_open_loop:
+        if offered_ops_per_sec <= 0.0:
+            offered_ops_per_sec = 10.0
+        if max_inflight <= 0 and not auto_max_inflight:
+            max_inflight = 500
+
+    if auto_max_inflight and not args.closed_loop:
+        computed = _auto_max_inflight_cap(
+            offered_ops_per_sec,
+            args.poisson_rate,
+            expected_rtt_sec=args.expected_rtt_sec,
+            inflight_factor=args.inflight_factor,
+            floor=64,
+        )
+        max_inflight = max(max_inflight, computed)
 
     hosts_path = args.hosts_file
     if not os.path.isabs(hosts_path):
@@ -313,6 +448,7 @@ def main() -> None:
 
     ssh_key = args.ssh_key or None
     clean_remote = not args.no_clean_remote
+    eager_fast_reply = not args.no_eager_fast_reply
     open_loop = not args.closed_loop
     if open_loop:
         num_ops = args.num_ops
@@ -326,6 +462,8 @@ def main() -> None:
         "threads": args.threads,
         "open_loop": open_loop,
         "poisson_rate": args.poisson_rate,
+        "offered_ops_per_sec": offered_ops_per_sec,
+        "max_inflight": max_inflight,
     }
 
     senders_meta = [
@@ -345,12 +483,28 @@ def main() -> None:
         "num_ops": num_ops,
         "open_loop": open_loop,
         "poisson_rate": args.poisson_rate if open_loop else None,
-        "offered_ops_per_sec": (args.poisson_rate * 100) if open_loop else None,
+        "offered_ops_per_sec_per_sender": offered_ops_per_sec if open_loop else None,
+        "max_inflight_per_sender": max_inflight if open_loop else None,
+        "auto_max_inflight": auto_max_inflight if open_loop else None,
+        "expected_rtt_sec": args.expected_rtt_sec if open_loop and auto_max_inflight else None,
+        "inflight_factor": args.inflight_factor if open_loop and auto_max_inflight else None,
+        "high_throughput_latency": args.high_throughput_latency if open_loop else None,
+        "wan_open_loop": args.wan_open_loop if open_loop else None,
+        "offered_ops_per_sec": (
+            offered_ops_per_sec
+            if open_loop and offered_ops_per_sec > 0.0
+            else ((args.poisson_rate * 100) if open_loop else None)
+        ),
         "experiment_sec": args.experiment_sec,
         "warmup_sec": args.warmup_sec,
         "interval_ms": args.interval_ms,
         "trim_pad_sec": args.trim_pad_sec,
         "clean_remote": clean_remote,
+        "wal_tmpfs": args.wal_tmpfs if args.protocol == "dyna" else None,
+        "dyna_wal_dir": (DYNA_WAL_DIR_TMPFS if args.wal_tmpfs else DYNA_WAL_DIR_DISK)
+        if args.protocol == "dyna"
+        else None,
+        "eager_fast_reply": eager_fast_reply if args.protocol == "dyna" else None,
         "threads": args.threads,
         "receivers": [{"role": r, "host": hosts[r], "index": receiver_index(r)} for r in receiver_roles],
         "senders": senders_meta,
@@ -361,6 +515,12 @@ def main() -> None:
     if not args.skip_replicas:
         if clean_remote:
             print(f"Cleaning remote replica state ({args.protocol})...")
+        if args.protocol == "dyna":
+            if args.wal_tmpfs:
+                print(f"DYNA WAL: {DYNA_WAL_DIR_TMPFS} (--wal-tmpfs)")
+            print(
+                f"DYNA eager fast-reply: {'on' if eager_fast_reply else 'off (Nezha hold)'}"
+            )
         print(f"Starting {args.protocol} replicas on {len(receiver_roles)} hosts...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:
             futs = [
@@ -372,6 +532,8 @@ def main() -> None:
                     args.ssh_user,
                     ssh_key,
                     clean_remote=clean_remote,
+                    wal_tmpfs=args.wal_tmpfs,
+                    eager_fast_reply=eager_fast_reply,
                 )
                 for r in receiver_roles
             ]
@@ -393,6 +555,25 @@ def main() -> None:
 
     if clean_remote:
         print("Cleaning remote sender run dirs...")
+    if open_loop:
+        effective_offered = _offered_ops_per_sender(offered_ops_per_sec, args.poisson_rate)
+        if offered_ops_per_sec > 0.0:
+            print(
+                f"Open-loop load: {offered_ops_per_sec:g} offered ops/s per sender "
+                f"(max_inflight={max_inflight or 'unlimited'})"
+            )
+        else:
+            print(
+                f"Open-loop load: poisson-rate={args.poisson_rate} "
+                f"(~{effective_offered:g} offered ops/s per sender, "
+                f"max_inflight={max_inflight or 'unlimited'})"
+            )
+        if auto_max_inflight:
+            print(
+                f"  auto max_inflight: offered({effective_offered:g}) * "
+                f"rtt({args.expected_rtt_sec}s) * factor({args.inflight_factor}) "
+                f"→ {max_inflight}"
+            )
     print(f"Starting clients on {len(sender_roles)} senders (run_id={run_id})...")
     t0 = time.time()
     meta["t0_unix"] = t0

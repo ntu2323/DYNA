@@ -17,3 +17,5 @@ OBJS-dyna-client := $(o)client.o $(o)dyna-proto.o \
 OBJS-dyna-replica := $(o)replica.o $(o)dyna-proto.o \
                      $(o)deadline/deadline_config.o $(o)deadline/replica_owd_estimator.o \
                      $(LIB-message) $(LIB-configuration) $(LIB-transport)
+
+include $(d)tests/Rules.mk

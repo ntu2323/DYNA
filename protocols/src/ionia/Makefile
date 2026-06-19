@@ -157,6 +157,7 @@ include lib/Rules.mk
 include common/Rules.mk
 include vr/Rules.mk
 include dyna/Rules.mk
+include dyna_new/Rules.mk
 include bench/Rules.mk
 
 

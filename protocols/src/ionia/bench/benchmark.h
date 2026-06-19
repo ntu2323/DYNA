@@ -8,6 +8,7 @@
 #include "lib/transport.h"
 #include <chrono>
 #include <cstdint>
+#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -29,7 +30,9 @@ public:
                     string latencyFilename = "",
                     bool openLoop = false,
                     int poissonRate = 0,
-                    uint64_t poissonSeed = 1);
+                    uint64_t poissonSeed = 1,
+                    double offeredOpsPerSec = 0.0,
+                    size_t maxInflight = 0);
     void Start();
     void OnReply(const string &request, const string &reply);
     struct Latency_t latency;
@@ -54,6 +57,7 @@ private:
     void TimeInterval();
     bool ExperimentElapsed() const;
     bool MaySubmitMore() const;
+    bool InflightCapReached() const;
 
     Client &client;
     Transport &transport;
@@ -72,11 +76,17 @@ private:
 
     bool openLoop_;
     int poissonRate_;
+    double offeredOpsPerSec_;
+    size_t maxInflight_;
     uint64_t submitSeq_;
     uint64_t totalSubmitted_;
     size_t poissonIdx_;
     std::vector<uint32_t> poissonTrace_;
     std::unordered_map<uint64_t, uint64_t> inflightStartNs_;
+    // Per-client RNG for random key selection (seeded from poissonSeed so each
+    // client thread draws a distinct, reproducible stream). Keeps the bench from
+    // walking the keyspace sequentially without affecting offered throughput.
+    std::mt19937_64 keyRng_;
 };
 
 } // namespace specpaxos

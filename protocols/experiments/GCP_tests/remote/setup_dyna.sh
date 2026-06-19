@@ -51,10 +51,27 @@ install_helpers() {
   cat > ~/bench/start_dyna_replica.sh << 'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+# Usage: start_dyna_replica.sh <idx> [--wal-tmpfs]
+#   --wal-tmpfs  WAL on /dev/shm/dyna-wal (low-jitter fsync triage; not durable across reboot)
 IDX="${1:?replica index 0|1|2}"
+shift || true
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --wal-tmpfs)
+      export DYNA_WAL_DIR=/dev/shm/dyna-wal
+      shift
+      ;;
+    *)
+      echo "Unknown option: $1 (usage: $0 <idx> [--wal-tmpfs])" >&2
+      exit 1
+      ;;
+  esac
+done
 export IONIA_DB_MODE=memory
 export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
 export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
+# WAL on local persistent disk; for low-jitter throughput sweeps set
+# DYNA_WAL_DIR=/dev/shm/dyna-wal to take real fsync out of the loop.
 export DYNA_WAL_DIR="${DYNA_WAL_DIR:-$HOME/bench/wal}"
 # Level-1 tuning: tighter deadline bound to shrink earlyBuffer hold under load.
 # Steady-state bound is driven by the OWD estimator (~20-50us in same-region runs),
@@ -63,15 +80,14 @@ export DYNA_WAL_DIR="${DYNA_WAL_DIR:-$HOME/bench/wal}"
 export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
 export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
 export DYNA_BOUND_RECOMPUTE_K="${DYNA_BOUND_RECOMPUTE_K:-1}"
-# Default fast-reply shard count is tuned for small (2 vCPU) replica VMs:
-# more shards mean more worker threads, which on a 2-vCPU box leads to CPU
-# oversubscription and ms-scale OS scheduling stalls on the reply path.
-# Bump back to 8-16 on >=4 vCPU machines if fastreply_full ever shows up.
-export DYNA_FAST_REPLY_SHARDS="${DYNA_FAST_REPLY_SHARDS:-2}"
-# Set DYNA_EAGER_FAST_REPLY=1 to bypass the earlyBuffer deadline hold and
-# fast-reply on admit (lower mean/p99 under load, at the cost of more
-# slow-path events under high same-key contention). Default OFF.
-export DYNA_EAGER_FAST_REPLY="${DYNA_EAGER_FAST_REPLY:-0}"
+# Default fast-reply shard count is sized for the current 8 vCPU replica VMs:
+# 4 shards leaves headroom on 3 partitions × 3 worker threads + transport without
+# CPU oversubscription. Lower to 2 on 2 vCPU boxes; raise toward 8 only if
+# fastreply_full counters start showing up in DYNA stats.
+export DYNA_FAST_REPLY_SHARDS="${DYNA_FAST_REPLY_SHARDS:-4}"
+# Eager fast-reply bypasses the earlyBuffer deadline hold (lower mean/p99 under load).
+# Set DYNA_EAGER_FAST_REPLY=0 for Nezha-style deadline-ordered release.
+export DYNA_EAGER_FAST_REPLY="${DYNA_EAGER_FAST_REPLY:-1}"
 export DYNA_SLOWPATH_DEBUG="${DYNA_SLOWPATH_DEBUG:-1}"
 export DYNA_STATS="${DYNA_STATS:-1}"
 export DYNA_STATS_INTERVAL_SEC="${DYNA_STATS_INTERVAL_SEC:-1}"

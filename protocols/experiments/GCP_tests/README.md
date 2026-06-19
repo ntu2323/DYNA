@@ -90,7 +90,7 @@ SSH_USER=nathan python3 run_cluster_bench.py \
 
 
 
-`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`, DYNA `rm ~/bench/wal`). Use `--no-clean-remote` only if you need to preserve state for debugging.
+`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`, DYNA `rm` the active WAL dir — `~/bench/wal` or `/dev/shm/dyna-wal` with `--wal-tmpfs`). Use `--no-clean-remote` only if you need to preserve state for debugging.
 
 ```bash
 # VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
@@ -100,6 +100,10 @@ SSH_USER=nathan python3 run_cluster_bench.py --protocol vr --hosts-file cluster_
 # DYNA — same defaults
 SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
   -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
+
+# DYNA — WAL on tmpfs (fsync triage: if mean/p99 drop sharply, disk fsync is the bottleneck)
+SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
+  --wal-tmpfs -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
 # Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)
 SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
@@ -125,6 +129,73 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--closed-loop` | Disable Poisson; wait for ack before next send |
 | `--interval-ms` | Throughput log interval (`bench/client -i`) |
 | `--no-clean-remote` | Skip wiping remote runs / RocksDB / WAL (default is clean) |
+| `--wal-tmpfs` | DYNA only: `DYNA_WAL_DIR=/dev/shm/dyna-wal` on replicas (fsync isolation) |
+| `--no-eager-fast-reply` | DYNA only: Nezha deadline hold (default: **eager** fast-reply on admit) |
+| `--offered-ops-per-sec` | Open-loop: per-sender offered ops/s (`-G`; use on WAN instead of `--poisson-rate`) |
+| `--max-inflight` | Open-loop: cap outstanding requests per sender (`-F`; backpressure) |
+| `--wan-open-loop` | Preset: `-G 10`, `-F 500`, no Poisson load during warmup (needs rebuilt `bench/client`) |
+| `--auto-max-inflight` | `-F ≈ offered × --expected-rtt-sec × --inflight-factor` (for high-throughput latency) |
+| `--expected-rtt-sec` | Planning RTT for auto inflight (default `0.35` WAN) |
+| `--high-throughput-latency` | Enables `--auto-max-inflight`; you set offered rate (`-G` or `--poisson-rate`) |
+
+### WAN open-loop (VR or DYNA)
+
+Wide RTT makes `--poisson-rate 50` (~5k offered ops/s per sender) stall the client (0 experiment completions). Use:
+
+```bash
+# Rebuild on senders after pulling bench changes:
+# setup_*_cluster.py --skip-build  OR  dyna_build_rsync.sh
+
+SSH_USER=nathan python3 run_cluster_bench.py --protocol vr \
+  --hosts-file cluster_hosts.json --wan-open-loop -e 150 -w 5 --interval-ms 1000
+
+# Tune offered load (per sender); rule of thumb: start near 1/RTT_sec ops/s
+SSH_USER=nathan python3 run_cluster_bench.py --protocol vr \
+  --offered-ops-per-sec 10 --max-inflight 500 -e 150 -w 5 --interval-ms 1000
+```
+
+Open-loop changes: **no submissions during warmup**; optional **max inflight**; **`-G`** for fractional offered rates (not limited to `-R` ≥ 1 = 100 ops/s).
+
+### High-throughput **and** latency (open-loop under load)
+
+Two different goals:
+
+| Goal | Setup | What latency means |
+|------|--------|-------------------|
+| **RTT / protocol floor** | `--closed-loop` or low `--offered-ops-per-sec` (~`1/RTT`) | Mostly network + consensus |
+| **Latency at high offered load** | High `-G` or `--poisson-rate` + **`--auto-max-inflight`** | Includes queueing (intentional load test) |
+
+Without enough inflight capacity, high offered load on WAN stalls the client (0 completions). Use **`--auto-max-inflight`** so `-F` scales with offered rate and planning RTT:
+
+\[
+\text{max\_inflight} \approx \text{offered ops/s} \times \text{RTT}_{\text{sec}} \times \text{factor}
+\]
+
+(default factor = 4, RTT = 0.35 s for WAN).
+
+**WAN example** (~200 offered ops/s per sender, ~330 ms RTT):
+
+```bash
+SSH_USER=nathan python3 run_cluster_bench.py --protocol vr \
+  --hosts-file cluster_hosts.json \
+  --offered-ops-per-sec 200 \
+  --auto-max-inflight --expected-rtt-sec 0.33 \
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10
+```
+
+**Same-region / high offered** (e.g. `--poisson-rate 50` → ~5000/s per sender, ~0.5–1 ms RTT):
+
+```bash
+SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna \
+  --hosts-file cluster_hosts.json \
+  --poisson-rate 50 \
+  --high-throughput-latency --expected-rtt-sec 0.0008 \
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10
+```
+
+(`--high-throughput-latency` enables `--auto-max-inflight`.)
+
+Increase offered rate until throughput plateaus or `max_inflight` is constantly full (enable `BENCH_INFLIGHT_LOG=1` on senders). Compare VR vs DYNA at the **same** `--offered-ops-per-sec` and same `--max-inflight` / `--auto-max-inflight`.
 
 Results:
 
@@ -142,6 +213,7 @@ results/<run_id>/
 ```bash
 ~/bench/start_paxos_vr_replica.sh 0    # VR on receiver1 (index 0)
 ~/bench/start_dyna_replica.sh 0        # DYNA
+~/bench/start_dyna_replica.sh 0 --wal-tmpfs   # DYNA, WAL on tmpfs
 ```
 
 **Sender (open-loop example):**

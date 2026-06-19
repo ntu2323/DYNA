@@ -38,6 +38,7 @@
 #include "lib/configuration.h"
 #include "lib/cpu_affinity.h"
 #include "dyna/client.h"
+#include "dyna_new/client.h"
 #include "vr/client.h"
 
 #include <unistd.h>
@@ -50,10 +51,13 @@ Usage(const char *progName)
 {
         fprintf(stderr,
                 "usage: %s [-n max-requests] [-t client-id] [-w warmup-secs] [-l latency-file] "
-                "[-q dscp] [-d delay-ms] [-O] [-R poisson-rate] -c conf-file -m {vr|dyna}\n"
+                "[-q dscp] [-d delay-ms] [-O] [-R poisson-rate] [-G offered-ops-per-sec] "
+                "[-F max-inflight] -c conf-file -m {vr|dyna|dyna_new}\n"
                 "  default: closed-loop (next request after each completion)\n"
-                "  -O -R <rate>: open-loop Poisson load, rate = mean requests per 10ms interval\n"
-                "  open-loop: -n caps submissions (0 = unlimited); experiment ends at -e seconds\n",
+                "  -O -R <rate>: open-loop Poisson, rate = mean requests per 10ms (~rate*100 ops/s)\n"
+                "  -O -G <ops/s>: open-loop Poisson with target offered ops/s (WAN-friendly)\n"
+                "  -F: cap outstanding open-loop requests (backpressure; 0 = unlimited)\n"
+                "  open-loop: no load during warmup; experiment starts after -w seconds\n",
                 progName);
         exit(1);
 }
@@ -80,12 +84,15 @@ int main(int argc, char **argv)
     bool dontLogLatency = false;
     bool openLoop = false;
     int poissonRate = 0;
+    double offeredOpsPerSec = 0.0;
+    size_t maxInflight = 0;
 
     enum
     {
         PROTO_UNKNOWN,
         PROTO_VR,
-        PROTO_DYNA
+        PROTO_DYNA,
+        PROTO_DYNA_NEW
     } proto = PROTO_UNKNOWN;
 
     string latencyFile;
@@ -94,7 +101,7 @@ int main(int argc, char **argv)
 
     // Parse arguments
     int opt;
-    while ((opt = getopt(argc, argv, "c:d:e:q:k:l:m:n:t:w:i:z:j:p:s:OR:")) != -1) {
+    while ((opt = getopt(argc, argv, "c:d:e:q:k:l:m:n:t:w:i:z:j:p:s:OR:G:F:")) != -1) {
         switch (opt) {
         case 'c':
             configPath = optarg;
@@ -157,6 +164,8 @@ int main(int argc, char **argv)
                 proto = PROTO_VR;
             } else if (strcasecmp(optarg, "dyna") == 0) {
                 proto = PROTO_DYNA;
+            } else if (strcasecmp(optarg, "dyna_new") == 0) {
+                proto = PROTO_DYNA_NEW;
             } else {
                 fprintf(stderr, "unknown mode '%s'\n", optarg);
                 Usage(argv[0]);
@@ -268,6 +277,30 @@ int main(int argc, char **argv)
             break;
         }
 
+        case 'G':
+        {
+            char *endPtr = nullptr;
+            offeredOpsPerSec = strtod(optarg, &endPtr);
+            if ((*optarg == '\0') || (endPtr == optarg) || (offeredOpsPerSec <= 0.0))
+            {
+                fprintf(stderr, "option -G requires a positive numeric arg (offered ops/s)\n");
+                Usage(argv[0]);
+            }
+            break;
+        }
+
+        case 'F':
+        {
+            char *strtolPtr;
+            maxInflight = strtoul(optarg, &strtolPtr, 10);
+            if ((*optarg == '\0') || (*strtolPtr != '\0'))
+            {
+                fprintf(stderr, "option -F requires a numeric arg\n");
+                Usage(argv[0]);
+            }
+            break;
+        }
+
         default:
             fprintf(stderr, "Unknown argument %s\n", argv[optind]);
             Usage(argv[0]);
@@ -287,8 +320,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "option -m is required\n");
         Usage(argv[0]);
     }
-    if (openLoop && poissonRate <= 0) {
-        fprintf(stderr, "open-loop mode (-O) requires -R <poisson-rate>\n");
+    if (openLoop && poissonRate <= 0 && offeredOpsPerSec <= 0.0) {
+        fprintf(stderr, "open-loop mode (-O) requires -R <poisson-rate> or -G <offered-ops-per-sec>\n");
+        Usage(argv[0]);
+    }
+    if (openLoop && poissonRate > 0 && offeredOpsPerSec > 0.0) {
+        fprintf(stderr, "open-loop: use only one of -R or -G\n");
         Usage(argv[0]);
     }
     if (openLoop && delay != 0) {
@@ -359,6 +396,9 @@ int main(int argc, char **argv)
             case PROTO_DYNA:
                 client = new specpaxos::dyna::DynaClient(config, &transport, client_id);
                 break;
+            case PROTO_DYNA_NEW:
+                client = new specpaxos::dyna_new::DynaNewClient(config, &transport, client_id);
+                break;
 
             default:
                 NOT_REACHABLE();
@@ -383,6 +423,10 @@ int main(int argc, char **argv)
                 openLoop ? std::max(1, (poissonRate + benchThreads - 1) / benchThreads) : 0;
             const uint64_t poissonSeed =
                 static_cast<uint64_t>(clientId) * 1000 + static_cast<uint64_t>(thread_id);
+            const double perThreadOffered =
+                offeredOpsPerSec > 0.0
+                    ? offeredOpsPerSec / static_cast<double>(benchThreads)
+                    : 0.0;
             specpaxos::BenchmarkClient *bench = new specpaxos::BenchmarkClient(
                 *client,
                 transport,
@@ -396,7 +440,9 @@ int main(int argc, char **argv)
                 latencyFile,
                 openLoop,
                 perThreadPoisson,
-                poissonSeed);
+                poissonSeed,
+                perThreadOffered,
+                maxInflight);
 
             //transport.Timer(0, [=]() {bench->Start(); });
 

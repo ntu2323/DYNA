@@ -59,7 +59,9 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
                                  string latencyFilename,
                                  bool openLoop,
                                  int poissonRate,
-                                 uint64_t poissonSeed)
+                                 uint64_t poissonSeed,
+                                 double offeredOpsPerSec,
+                                 size_t maxInflight)
     : tputInterval(tputInterval),
       client(client),
       transport(transport),
@@ -72,27 +74,50 @@ BenchmarkClient::BenchmarkClient(Client &client, Transport &transport,
       latencyFilename(latencyFilename),
       openLoop_(openLoop),
       poissonRate_(poissonRate),
+      offeredOpsPerSec_(offeredOpsPerSec),
+      maxInflight_(maxInflight),
       submitSeq_(0),
       totalSubmitted_(0),
-      poissonIdx_(0)
+      poissonIdx_(0),
+      keyRng_(poissonSeed)
 {
     if (openLoop_) {
-        if (poissonRate_ <= 0) {
-            Panic("Open-loop mode requires poisson rate > 0 (-R)");
+        if (poissonRate_ <= 0 && offeredOpsPerSec_ <= 0.0) {
+            Panic("Open-loop mode requires -R <poisson-rate> or -G <offered-ops-per-sec>");
         }
         poissonTrace_.resize(1000, 0);
         std::default_random_engine generator(static_cast<uint32_t>(poissonSeed));
-        std::poisson_distribution<int> distribution(poissonRate_);
+        double lambdaPerTick = 0.0;
+        if (offeredOpsPerSec_ > 0.0) {
+            lambdaPerTick =
+                offeredOpsPerSec_ * static_cast<double>(kOpenLoopIntervalMs) / 1000.0;
+        } else {
+            lambdaPerTick = static_cast<double>(poissonRate_);
+        }
+        std::poisson_distribution<int> distribution(lambdaPerTick);
         for (size_t i = 0; i < poissonTrace_.size(); ++i) {
             const int reqNum = distribution(generator);
             poissonTrace_[i] = reqNum > 0 ? static_cast<uint32_t>(reqNum) : 0;
         }
         const double offeredPerSec =
-            (static_cast<double>(poissonRate_) * 1000.0) / kOpenLoopIntervalMs;
-        Notice("Open-loop client: poisson rate %d reqs/%dms (~%.0f offered ops/s)",
-               poissonRate_,
-               kOpenLoopIntervalMs,
-               offeredPerSec);
+            offeredOpsPerSec_ > 0.0
+                ? offeredOpsPerSec_
+                : (static_cast<double>(poissonRate_) * 1000.0) / kOpenLoopIntervalMs;
+        if (maxInflight_ > 0) {
+            Notice("Open-loop client: ~%.2f offered ops/s, max inflight %zu",
+                   offeredPerSec,
+                   maxInflight_);
+        } else if (offeredOpsPerSec_ > 0.0) {
+            Notice("Open-loop client: -G %.2f offered ops/s (lambda=%.4f per %dms tick)",
+                   offeredOpsPerSec_,
+                   lambdaPerTick,
+                   kOpenLoopIntervalMs);
+        } else {
+            Notice("Open-loop client: poisson rate %d reqs/%dms (~%.0f offered ops/s)",
+                   poissonRate_,
+                   kOpenLoopIntervalMs,
+                   offeredPerSec);
+        }
     } else if (delay != 0) {
         Notice("Closed-loop client: delay between requests %lu ms", delay);
     } else {
@@ -184,10 +209,19 @@ BenchmarkClient::ExperimentElapsed() const
 bool
 BenchmarkClient::MaySubmitMore() const
 {
+    if (InflightCapReached()) {
+        return false;
+    }
     if (numRequests <= 0) {
         return true;
     }
     return totalSubmitted_ < static_cast<uint64_t>(numRequests);
+}
+
+bool
+BenchmarkClient::InflightCapReached() const
+{
+    return maxInflight_ > 0 && inflightStartNs_.size() >= maxInflight_;
 }
 
 void
@@ -324,7 +358,13 @@ BenchmarkClient::SubmitOne()
         return;
     }
 
-    const size_t opIdx = static_cast<size_t>(totalSubmitted_) % messages.size();
+    // Pick the target key uniformly at random instead of walking the trace
+    // sequentially. This only changes *which* key each request hits, not the
+    // request rate, so offered throughput (closed-loop inflight / open-loop
+    // poisson) is unchanged. Applies to all protocols (VR, DYNA) since the
+    // bench is protocol-agnostic.
+    std::uniform_int_distribution<size_t> keyDist(0, messages.size() - 1);
+    const size_t opIdx = keyDist(keyRng_);
     const uint64_t submitId = ++submitSeq_;
     totalSubmitted_++;
 
@@ -356,6 +396,14 @@ BenchmarkClient::OpenLoopTick()
         return;
     }
 
+    // Do not offer load during warmup: avoids building an unbounded WAN backlog
+    // before the measured experiment window (WarmupDone sets started=true).
+    if (!started) {
+        transport.Timer(kOpenLoopIntervalMs,
+                        std::bind(&BenchmarkClient::OpenLoopTick, this));
+        return;
+    }
+
     const uint32_t reqNum = poissonTrace_[poissonIdx_ % poissonTrace_.size()];
     poissonIdx_++;
 
@@ -364,6 +412,9 @@ BenchmarkClient::OpenLoopTick()
             break;
         }
         SubmitOne();
+        if (InflightCapReached()) {
+            break;
+        }
     }
 
     MaybeFinishExperiment();

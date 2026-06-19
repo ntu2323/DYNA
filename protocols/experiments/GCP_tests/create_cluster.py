@@ -34,7 +34,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _REQUIREMENTS = os.path.join(_SCRIPT_DIR, "requirements-deploy.txt")
 
 # Match create_networktp_cluster.py: replica/receiver nodes use c4-standard-2.
-RECEIVER_MACHINE_TYPE = "c4-standard-2"
+RECEIVER_MACHINE_TYPE = "c4-standard-8"
 RECIEVER_FAMILY = "reciever1"
 SENDER_FAMILY = "sender1"
 IMAGE_PROJECT = "corfu-488815"

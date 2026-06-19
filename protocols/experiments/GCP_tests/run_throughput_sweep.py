@@ -42,6 +42,23 @@ def main() -> None:
         action="store_true",
         help="Pass through to run_cluster_bench.py (default wipes remote state each run).",
     )
+    ap.add_argument(
+        "--wal-tmpfs",
+        action="store_true",
+        help="Pass through to run_cluster_bench.py (DYNA WAL on tmpfs).",
+    )
+    ap.add_argument(
+        "--no-eager-fast-reply",
+        action="store_true",
+        help="Pass through to run_cluster_bench.py (disable eager fast-reply).",
+    )
+    ap.add_argument("--offered-ops-per-sec", type=float, default=0.0)
+    ap.add_argument("--max-inflight", type=int, default=0)
+    ap.add_argument("--wan-open-loop", action="store_true")
+    ap.add_argument("--auto-max-inflight", action="store_true")
+    ap.add_argument("--expected-rtt-sec", type=float, default=0.35)
+    ap.add_argument("--inflight-factor", type=float, default=4.0)
+    ap.add_argument("--high-throughput-latency", action="store_true")
     args = ap.parse_args()
 
     sweep_id = args.sweep_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -93,6 +110,24 @@ def main() -> None:
             run_cmd.append("--closed-loop")
         if args.poisson_rate != 60:
             run_cmd.extend(["--poisson-rate", str(args.poisson_rate)])
+        if args.wal_tmpfs:
+            run_cmd.append("--wal-tmpfs")
+        if args.no_eager_fast_reply:
+            run_cmd.append("--no-eager-fast-reply")
+        if args.offered_ops_per_sec > 0.0:
+            run_cmd.extend(["--offered-ops-per-sec", str(args.offered_ops_per_sec)])
+        if args.max_inflight > 0:
+            run_cmd.extend(["--max-inflight", str(args.max_inflight)])
+        if args.wan_open_loop:
+            run_cmd.append("--wan-open-loop")
+        if args.auto_max_inflight:
+            run_cmd.append("--auto-max-inflight")
+        if args.high_throughput_latency:
+            run_cmd.append("--high-throughput-latency")
+        if args.expected_rtt_sec != 0.35:
+            run_cmd.extend(["--expected-rtt-sec", str(args.expected_rtt_sec)])
+        if args.inflight_factor != 4.0:
+            run_cmd.extend(["--inflight-factor", str(args.inflight_factor)])
 
         subprocess.run(run_cmd, check=True)
 
