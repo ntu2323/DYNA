@@ -8,19 +8,26 @@ OUT_DIR="${IONIA_SMOKE_OUT:-/work/ionia/docker/smoke-output}"
 LOW_MEMORY="${LOW_MEMORY:-0}"
 SMOKE_SHOW_LOGS="${SMOKE_SHOW_LOGS:-1}"
 SMOKE_TAIL_LINES="${SMOKE_TAIL_LINES:-40}"
-# vr | dyna (same bench binaries; default keeps historical smoke behavior)
+# vr | dyna | dyna_new (same bench binaries; default keeps historical smoke behavior)
 SMOKE_PROTOCOL="${SMOKE_PROTOCOL:-vr}"
 
-# Docker wrapper defaults LOW_MEMORY=1 (single replica). DYNA still commits via follower SyncAck,
-# so one replica never reaches commit → client times out. Force multi-replica smoke for dyna.
-if [[ "${SMOKE_PROTOCOL}" == "dyna" && "${LOW_MEMORY}" == "1" ]]; then
-    echo "SMOKE_PROTOCOL=dyna: overriding LOW_MEMORY=1 → 0 (DYNA needs replica quorum for sync/commit)." >&2
+# dyna and dyna_new share the same deadline/quorum requirements for the smoke.
+IS_DYNA_FAMILY=0
+if [[ "${SMOKE_PROTOCOL}" == "dyna" || "${SMOKE_PROTOCOL}" == "dyna_new" ]]; then
+    IS_DYNA_FAMILY=1
+fi
+
+# Docker wrapper defaults LOW_MEMORY=1 (single replica). DYNA commits via an f+1
+# replica quorum, so one replica never reaches commit → client times out. Force
+# multi-replica smoke for the dyna family.
+if [[ "${IS_DYNA_FAMILY}" == "1" && "${LOW_MEMORY}" == "1" ]]; then
+    echo "SMOKE_PROTOCOL=${SMOKE_PROTOCOL}: overriding LOW_MEMORY=1 → 0 (needs replica quorum for commit)." >&2
     LOW_MEMORY=0
 fi
 
 # DYNA smoke in container should stay memory-backed: multiple local replicas can
 # otherwise collide with stale/shared on-disk state across runs.
-if [[ "${SMOKE_PROTOCOL}" == "dyna" ]]; then
+if [[ "${IS_DYNA_FAMILY}" == "1" ]]; then
     export IONIA_DB_MODE=memory
     export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-64}"
     export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-1}"
@@ -68,7 +75,7 @@ R user42847818606673772111
 EOF
 fi
 
-if [[ "${SMOKE_PROTOCOL}" == "dyna" ]]; then
+if [[ "${IS_DYNA_FAMILY}" == "1" ]]; then
     # bench/client currently uses -c as the transport peer config for protocol
     # clients (and does not consume -s). Point -c to active replica endpoints.
     CLIENT_CONFIG="${SERVER_CONFIG}"

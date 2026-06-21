@@ -11,9 +11,11 @@
 
 #include "common/log.h"                  // ClientAndReqId + std::hash<ClientAndReqId>
 #include "lib/data_structure.h"          // HashMap (ankerl::unordered_dense::map)
+#include "lib/transport.h"               // TransportAddress
 #include "dyna_new/dyna-new-proto.pb.h"  // proto::RequestType
 
 #include <cstdint>
+#include <memory>
 #include <queue>
 #include <string>
 #include <vector>
@@ -39,6 +41,11 @@ struct LogEntry {
 
     std::string result;         // populated for RMW / read on the leader
     bool has_result = false;
+
+    // Where to send this request's reply (set by the replica from the inbound
+    // message; null for entries that need no client reply, e.g. sync-fetched).
+    // shared_ptr keeps LogEntry cheaply movable through queues later.
+    std::shared_ptr<TransportAddress> client_addr;
 
     ClientAndReqId Key() const { return ClientAndReqId{client_id, request_id}; }
 };

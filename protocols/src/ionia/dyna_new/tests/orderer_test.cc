@@ -224,3 +224,45 @@ TEST(PartitionOrderer, IdleLoopDoesNotBusyWait)
 
     orderer.Stop();
 }
+
+// §6.1: the leader fires the on-release callback per released entry (used by the
+// replica to send the leader reply), after appending to synced_log.
+TEST(PartitionOrderer, LeaderFiresReleaseCallback)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    std::vector<LogEntry> released;
+    PartitionOrderer orderer(0, 0, &backend, &clock,
+                             PartitionOrderer::Role::kLeader,
+                             [&](const LogEntry &e) { released.push_back(e); });
+
+    orderer.Submit(Write(1, 1, 100));
+    clock.Set(100);
+    EXPECT_EQ(orderer.ReleaseDue(), 1u);
+
+    ASSERT_EQ(released.size(), 1u);
+    EXPECT_EQ(released[0].request_id, 1u);
+    EXPECT_EQ(orderer.synced_log_size(), 1u);
+}
+
+// §6.1 follower speculative release: stage in unsynced_log, do NOT apply to
+// memory, and still fire the callback (for the is_leader=false reply).
+TEST(PartitionOrderer, FollowerStagesUnsyncedWithoutApply)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    std::vector<LogEntry> released;
+    PartitionOrderer orderer(0, 0, &backend, &clock,
+                             PartitionOrderer::Role::kFollower,
+                             [&](const LogEntry &e) { released.push_back(e); });
+
+    orderer.Submit(Write(1, 1, 100, "k", "v"));
+    clock.Set(100);
+    EXPECT_EQ(orderer.ReleaseDue(), 1u);
+
+    EXPECT_EQ(orderer.synced_log_size(), 0u);          // not on the synced log
+    ASSERT_EQ(orderer.unsynced_log_size(), 1u);
+    EXPECT_EQ(orderer.unsynced_log_at(0).request_id, 1u);
+    EXPECT_FALSE(backend.mem_read("k").has_value());    // no speculative apply
+    ASSERT_EQ(released.size(), 1u);                      // endorsement callback fired
+}

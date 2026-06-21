@@ -6,9 +6,16 @@
 #include "lib/configuration.h"
 #include "lib/transport.h"
 
+#include "dyna_new/deadline.h"
+#include "dyna_new/partition_orderer.h"
+#include "dyna_new/partition_state.h"
 #include "dyna_new/storage_backend.h"
+#include "dyna_new/wall_clock.h"
 
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <vector>
 
 namespace specpaxos {
 namespace dyna_new {
@@ -27,13 +34,31 @@ public:
                         void *meta_data) override;
 
 private:
+    // Fired by partition `pid`'s orderer when an entry releases: sends the client
+    // reply and, for the leader, broadcasts the sync to followers.
+    void OnRelease(uint32_t pid, bool is_leader, const LogEntry &e);
+    void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
+    void BroadcastSync(uint32_t pid, const LogEntry &e);
+    // Executes the messages a follower's reconciliation asked us to send.
+    void ExecuteReconActions(uint32_t pid, const std::vector<ReconAction> &actions);
+
     specpaxos::Configuration config;
     int replicaIdx;
     Transport *transport;
 
-    // Authoritative memory KV + lagging disk KV (spec §1.7, §3.4). Not yet
-    // exercised — protocol logic that calls into it arrives in later stages.
     std::unique_ptr<StorageBackend> backend_;
+
+    uint32_t numPartitions_;
+    // One clock + orderer per partition (leader of partition==replicaIdx,
+    // follower of the rest). Separate clocks so a Submit only wakes its own
+    // partition's release loop.
+    std::vector<std::unique_ptr<RealClock>> clocks_;
+    std::vector<std::unique_ptr<PartitionOrderer>> orderers_;
+
+    // Per-client OWD estimator, shared across partitions; guarded since it is
+    // sampled on the transport thread and read on orderer release threads.
+    std::mutex owd_mu_;
+    ReplicaOwdEstimator owd_;
 };
 
 } // namespace dyna_new
