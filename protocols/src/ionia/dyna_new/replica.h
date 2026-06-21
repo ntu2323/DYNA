@@ -6,6 +6,10 @@
 #include "lib/configuration.h"
 #include "lib/transport.h"
 
+#include "dyna_new/storage_backend.h"
+
+#include <memory>
+
 namespace specpaxos {
 namespace dyna_new {
 
@@ -26,6 +30,10 @@ private:
     specpaxos::Configuration config;
     int replicaIdx;
     Transport *transport;
+
+    // Authoritative memory KV + lagging disk KV (spec §1.7, §3.4). Not yet
+    // exercised — protocol logic that calls into it arrives in later stages.
+    std::unique_ptr<StorageBackend> backend_;
 };
 
 } // namespace dyna_new

@@ -2,6 +2,7 @@
 
 #include "dyna_new/replica.h"
 
+#include "dyna_new/in_memory_backend.h"
 #include "lib/message.h"
 
 namespace specpaxos {
@@ -10,7 +11,9 @@ namespace dyna_new {
 DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
                                int replicaIdx,
                                Transport *transport)
-    : config(config), replicaIdx(replicaIdx), transport(transport)
+    : config(config), replicaIdx(replicaIdx), transport(transport),
+      backend_(std::make_unique<InMemoryBackend>(
+                   InMemoryBackend::LatencyFromEnv()))
 {
     transport->Register(this, config, 0, replicaIdx);
 }

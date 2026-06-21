@@ -4,18 +4,120 @@
 #define _DYNA_NEW_WALL_CLOCK_H_
 
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <mutex>
 
 namespace specpaxos {
 namespace dyna_new {
 
 // Microsecond epoch from std::chrono::system_clock (NTP-comparable across hosts).
-// Wrap in a lambda or mock wrapper in unit tests that need a controllable clock.
 inline uint64_t WallClockMicros()
 {
     using namespace std::chrono;
     return duration_cast<microseconds>(system_clock::now().time_since_epoch()).count();
 }
+
+// Clock seam for the deadline release loop (Stage 3).
+//
+// Beyond reading the time, the loop must *wait* until the next deadline without
+// busy-waiting, and tests must be able to drive that wait deterministically with
+// virtual time. So the clock owns the wait primitive:
+//   - SleepUntil(t) blocks until Now() >= t OR Interrupt() is called.
+//   - Interrupt() wakes a blocked (or about-to-block) SleepUntil; it is sticky,
+//     so a notification issued just before SleepUntil is not lost.
+// RealClock waits against real time; MockClock only advances when a test calls
+// Set()/Advance(), which wake any SleepUntil — making "released exactly at the
+// deadline" and "idle ⇒ no CPU" both testable.
+class Clock {
+public:
+    static constexpr uint64_t kNever = UINT64_MAX;
+
+    virtual ~Clock() = default;
+    virtual uint64_t Now() = 0;             // current time, microseconds
+    virtual void SleepUntil(uint64_t until_us) = 0;
+    virtual void Interrupt() = 0;
+};
+
+class RealClock : public Clock {
+public:
+    uint64_t Now() override { return WallClockMicros(); }
+
+    void SleepUntil(uint64_t until_us) override {
+        std::unique_lock<std::mutex> lk(mu_);
+        if (until_us == kNever) {
+            cv_.wait(lk, [this] { return interrupted_; });
+        } else {
+            std::chrono::system_clock::time_point tp{
+                std::chrono::microseconds(until_us)};
+            // Returns on interrupt or when real time reaches tp; the caller
+            // re-checks Now(), so a plain timeout return is fine.
+            cv_.wait_until(lk, tp, [this] { return interrupted_; });
+        }
+        interrupted_ = false;
+    }
+
+    void Interrupt() override {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            interrupted_ = true;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool interrupted_ = false;
+};
+
+// Controllable clock for tests: virtual time only moves when told to, and every
+// move wakes any waiter so the release loop re-evaluates deterministically.
+class MockClock : public Clock {
+public:
+    explicit MockClock(uint64_t now_us = 0) : now_us_(now_us) {}
+
+    uint64_t Now() override {
+        std::lock_guard<std::mutex> lk(mu_);
+        return now_us_;
+    }
+
+    void SleepUntil(uint64_t until_us) override {
+        std::unique_lock<std::mutex> lk(mu_);
+        cv_.wait(lk, [this, until_us] { return interrupted_ || now_us_ >= until_us; });
+        interrupted_ = false;
+    }
+
+    void Interrupt() override {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            interrupted_ = true;
+        }
+        cv_.notify_all();
+    }
+
+    void Set(uint64_t now_us) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            now_us_ = now_us;
+        }
+        cv_.notify_all();
+    }
+
+    void Advance(uint64_t delta_us) {
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            now_us_ += delta_us;
+        }
+        cv_.notify_all();
+    }
+
+private:
+    std::mutex mu_;
+    std::condition_variable cv_;
+    uint64_t now_us_;
+    bool interrupted_ = false;
+};
 
 } // namespace dyna_new
 } // namespace specpaxos
