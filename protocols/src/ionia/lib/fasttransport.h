@@ -14,6 +14,7 @@
 #include "lib/udptransport.h"
 #include <atomic>
 #include <memory>
+#include <optional>
 
 class FastTransport : public TransportCommon<UDPTransportAddress>
 {
@@ -25,7 +26,8 @@ public:
                   uint8_t numa_node,
                   uint8_t id,
                   uint64_t send_buf_size = 0,
-                  uint64_t receive_buf_size = 0);
+                  uint64_t receive_buf_size = 0,
+                  bool ionia_multithread = false);
     virtual ~FastTransport();
     virtual void Register(TransportReceiver *receiver,
                           const specpaxos::Configuration &config,
@@ -49,7 +51,14 @@ private:
     std::unique_ptr<UDPTransport> udp_transport;
     uint8_t endpoint_id_;
     int nthreads_;
+    bool ionia_multithread_;
     std::atomic<bool> stopped_{false};
+
+    std::optional<std::pair<int, int>>
+    LookupReplicaForAddress(TransportReceiver *src, const UDPTransportAddress &dst);
+    uint8_t ResolveDstEndpoint(TransportReceiver *src,
+                               const UDPTransportAddress &dst,
+                               const Message &m);
 
     bool SendMessageInternal(TransportReceiver *src,
                              const UDPTransportAddress &dst,

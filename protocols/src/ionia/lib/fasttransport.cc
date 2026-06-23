@@ -11,6 +11,7 @@
 
 #include "lib/assert.h"
 #include "lib/fasttransport_endpoint.h"
+#include "lib/fasttransport_routing.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -19,6 +20,7 @@
 
 #include <string_view>
 #include <utility>
+#include <optional>
 
 FastTransport::FastTransport(const specpaxos::Configuration &config,
                              int nthreads,
@@ -27,11 +29,13 @@ FastTransport::FastTransport(const specpaxos::Configuration &config,
                              uint8_t numa_node,
                              uint8_t id,
                              uint64_t send_buf_size,
-                             uint64_t receive_buf_size)
+                             uint64_t receive_buf_size,
+                             bool ionia_multithread)
     : config(config),
       udp_transport(std::make_unique<UDPTransport>(0.0, 0.0, 0, nullptr)),
       endpoint_id_(id),
-      nthreads_(nthreads)
+      nthreads_(nthreads),
+      ionia_multithread_(ionia_multithread)
 {
     (void)nr_req_types;
     (void)phy_port;
@@ -39,7 +43,7 @@ FastTransport::FastTransport(const specpaxos::Configuration &config,
     (void)send_buf_size;
     (void)receive_buf_size;
     udp_transport->SetEndpointId(endpoint_id_);
-    udp_transport->EnableSharedPort(true);
+    udp_transport->EnableSharedPort(ionia_multithread_);
 }
 
 FastTransport::~FastTransport() = default;
@@ -144,8 +148,51 @@ bool FastTransport::SendMessageInternal(TransportReceiver *src,
                                         const UDPTransportAddress &dst,
                                         const Message &m)
 {
-    const auto meta = MakeFastTransportEndpointMeta(endpoint_id_, 0);
+    if (!ionia_multithread_) {
+        return udp_transport->SendMessage(src, dst, m);
+    }
+    const uint8_t dst_endpoint = ResolveDstEndpoint(src, dst, m);
+    const auto meta = MakeFastTransportEndpointMeta(endpoint_id_, dst_endpoint);
     return udp_transport->SendWithMeta(src, dst, m, &meta, sizeof(meta));
+}
+
+std::optional<std::pair<int, int>>
+FastTransport::LookupReplicaForAddress(TransportReceiver *src,
+                                       const UDPTransportAddress &dst)
+{
+    const specpaxos::Configuration *cfg = configurations[src];
+    if (cfg == nullptr) {
+        return std::nullopt;
+    }
+    if (!replicaAddressesInitialized) {
+        LookupAddresses();
+    }
+    for (int group_idx = 0; group_idx < cfg->g; ++group_idx) {
+        for (int replica_idx = 0; replica_idx < cfg->n; ++replica_idx) {
+            const auto it = replicaAddresses[cfg][group_idx].find(replica_idx);
+            if (it != replicaAddresses[cfg][group_idx].end() && it->second == dst) {
+                return std::make_pair(group_idx, replica_idx);
+            }
+        }
+    }
+    return std::nullopt;
+}
+
+uint8_t
+FastTransport::ResolveDstEndpoint(TransportReceiver *src,
+                                  const UDPTransportAddress &dst,
+                                  const Message &m)
+{
+    const auto replica = LookupReplicaForAddress(src, dst);
+    if (!replica) {
+        return 0;
+    }
+    const specpaxos::Configuration *cfg = configurations[src];
+    if (cfg == nullptr) {
+        return 0;
+    }
+    const int threads = cfg->replica(replica->first, replica->second).threads;
+    return fasttransport_routing::DstEndpointForMessage(m, threads);
 }
 
 UDPTransportAddress FastTransport::LookupAddress(const specpaxos::ReplicaAddress &addr)

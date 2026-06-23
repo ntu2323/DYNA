@@ -18,5 +18,6 @@ OBJS-vr-durabilityreplica := $(o)durabilityreplica.o $(o)vr-proto.o \
                    $(OBJS-replica) $(LIB-message) \
                    $(LIB-configuration) $(LIB-latency)
 
+LIB-fasttransport += $(o)vr-proto.o
 
 include $(d)tests/Rules.mk

@@ -328,11 +328,13 @@ else:
 - [ ] Resolve `Run()` / `RunOnce()` ownership in `bench/replica.cc`
 - [ ] Unit test: 4 endpoints, 1 port, demux correctness
 
-### Phase 2 — Routing parity (2–3 days)
+### Phase 2 — Routing parity (implemented)
 
-- [ ] Use `ReplicaAddress.threads` in `LookupAddress` / send path
-- [ ] Key-hash endpoint selection for `RequestMessage` sends (mirror `vr/replica.cc` queue hash)
-- [ ] Client `bench/client` multi-thread: verify replies reach correct client transport
+- [x] `FastTransport(..., ionia_multithread=true)` gates shared port + endpoint meta (VR/IONIA only)
+- [x] DYNA / DYNA_new use `ionia_multithread=false` — legacy UDP wire format, no shared-port demux
+- [x] Key-hash `dst_endpoint` for `RequestMessage` / `UnloggedRequestMessage` when `ReplicaAddress.threads > 1`
+- [x] Hash matches `vr/replica.cc` execution-queue sharding (djb2 over 24-byte bench key)
+- [ ] Client multi-thread bench validation on cluster
 
 ### Phase 3 — Harness & benchmarks (1–2 days)
 

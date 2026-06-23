@@ -15,6 +15,7 @@ exec docker run "${run_flags[@]}" \
   -v "${OUT_HOST}:/tmp/ionia-docker" \
   -e "LOW_MEMORY=${LOW_MEMORY:-1}" \
   -e "SMOKE_PROTOCOL=${SMOKE_PROTOCOL:-vr}" \
+  -e "SMOKE_DURABILITY_THREADS=${SMOKE_DURABILITY_THREADS:-1}" \
   -e "SMOKE_SHOW_LOGS=${SMOKE_SHOW_LOGS:-1}" \
   -e "SMOKE_TAIL_LINES=${SMOKE_TAIL_LINES:-40}" \
   -e "DYNA_SLOWPATH_DEBUG=${DYNA_SLOWPATH_DEBUG:-}" \
@@ -24,4 +25,5 @@ exec docker run "${run_flags[@]}" \
   -e "DYNA_OWD_WINDOW_LEN=${DYNA_OWD_WINDOW_LEN:-}" \
   -e "DYNA_OWD_PERCENTILE=${DYNA_OWD_PERCENTILE:-}" \
   -e "DYNA_WAL_DIR=${DYNA_WAL_DIR:-}" \
+  -e "DYNA_SIM_DISK_LATENCY_US=${DYNA_SIM_DISK_LATENCY_US:-}" \
   "${IMG}" ./docker/run_udp_smoke.sh "$@"
