@@ -1,10 +1,10 @@
 {
   "extra_client_zone": "us-west1-b",
   "hosts": {
-    "receiver1": "128.110.218.53",
-    "receiver2": "128.110.218.79",
-    "receiver3": "128.110.218.48",
-    "sender1": "128.110.218.42"
+    "receiver1": "128.105.144.55",
+    "receiver2": "128.105.144.54",
+    "receiver3": "128.105.144.57",
+    "sender1": "128.105.144.48"
   },
   "machine_count": 4,
   "name_prefix": "ionia",

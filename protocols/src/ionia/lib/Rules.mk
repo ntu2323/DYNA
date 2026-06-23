@@ -2,7 +2,7 @@ d := $(dir $(lastword $(MAKEFILE_LIST)))
 
 SRCS += $(addprefix $(d), \
 	lookup3.cc message.cc memory.cc \
-	latency.cc configuration.cc transport.cc udptransport.cc simtransport.cc fasttransport.cc \
+	latency.cc configuration.cc transport.cc udptransport.cc shared_udp_port.cc simtransport.cc fasttransport.cc \
 	cpu_affinity.cc \
 	workertasks.cc batchgen.cc data_structure.cc db.cc)
 

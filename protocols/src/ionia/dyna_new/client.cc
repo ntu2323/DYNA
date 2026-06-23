@@ -77,8 +77,7 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         send_us,
         is_read,
         std::move(continuation),
-        WriteQuorum(leader_id, write_quorum_, deadline),
-        std::string(),
+        CommitQuorum(leader_id, write_quorum_),
     };
     pending_.emplace(request_id, std::move(pending));
 
@@ -140,18 +139,18 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
     // OWD feedback (ignored when 0 = insufficient samples).
     bound_tracker_.on_owd_sample(reply.replica_id(), reply.owd_estimate());
 
-    if (reply.is_leader() && reply.has_result()) {
-        p.leader_result = reply.result();
-    }
-
-    const bool committed =
-        p.quorum.AddReply(reply.replica_id(), reply.view_id(), reply.deadline());
+    // Writes agree on the leader's deadline; reads agree on the leader's log
+    // position (§5, §6.3). Reads carry the leader's data as the result.
+    const uint64_t match = p.is_read ? reply.log_pos() : reply.deadline();
+    const bool has_result = reply.is_leader() && reply.has_result();
+    const bool committed = p.quorum.AddReply(reply.replica_id(), reply.view_id(),
+                                             match, has_result, reply.result());
     if (!committed) {
         return;
     }
 
     continuation_t cont = std::move(p.continuation);
-    std::string result = p.is_read ? p.leader_result : std::string();
+    std::string result = p.is_read ? p.quorum.result() : std::string();
     pending_.erase(it);
     cont(std::string(), result);
 }

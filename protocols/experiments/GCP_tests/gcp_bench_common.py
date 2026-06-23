@@ -44,7 +44,9 @@ def remote_receiver_cleanup_cmd(
     Replica logs are truncated by start_*_replica.sh on start.
     """
     parts = [PKILL_REPLICA, "sleep 1"]
-    if protocol == "vr":
+    if protocol in ("vr", "ionia"):
+        # vr baseline (paxos) and ionia (ionia -m vr) both back AppReplica with the
+        # rocks/in-mem KV under /dev/shm/rocks<idx>; wipe it for a clean run.
         parts.append(f"rm -rf /dev/shm/rocks{replica_idx}")
     elif protocol == "dyna":
         wal = dyna_wal_dir or DYNA_WAL_DIR_DISK

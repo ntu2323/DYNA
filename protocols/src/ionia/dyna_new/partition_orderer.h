@@ -68,7 +68,8 @@ public:
 
     PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                      StorageBackend *backend, Clock *clock,
-                     Role role = Role::kLeader, OnRelease on_release = nullptr);
+                     Role role = Role::kLeader, OnRelease on_release = nullptr,
+                     uint32_t commit_quorum = 1);
     ~PartitionOrderer();
 
     PartitionOrderer(const PartitionOrderer &) = delete;
@@ -102,9 +103,25 @@ public:
     // Look up a synced entry by ⟨client,req⟩ so the leader can answer a fetch.
     bool LeaderFetch(uint64_t client_id, uint64_t request_id, LogEntry &out) const;
 
+    // --- background ordering / persistence (spec §7) ---
+    // Leader: record a follower's sync_confirm for a synced write. When the
+    // request reaches commit_quorum confirmations (the leader's own append plus
+    // followers, all agreeing on the leader's deadline) it is client-committed:
+    // disk_persist it (off the critical path) and advance commit_point. Returns
+    // true exactly once per request — when it first commits — so the replica can
+    // broadcast a Commit to followers. No-op (returns false) on a follower.
+    bool HandleSyncConfirm(uint32_t replica_id, uint64_t client_id,
+                           uint64_t request_id, uint64_t deadline);
+    // Follower: a Commit arrived for ⟨client,req⟩. disk_persist this replica's
+    // synced copy and advance commit_point. If the entry is not yet synced the
+    // commit is buffered and applied when reconciliation catches up. No-op on a
+    // leader.
+    void HandleCommit(uint64_t client_id, uint64_t request_id);
+
     // --- inspection accessors (locked snapshots) ---
     uint64_t deadline_counter() const;
     uint64_t sync_point() const;
+    uint64_t commit_point() const;
     size_t synced_log_size() const;
     LogEntry synced_log_at(size_t i) const;
     size_t unsynced_log_size() const;
@@ -121,6 +138,8 @@ private:
     void ReleaseEntryLocked(LogEntry &e);
     // Apply contiguous buffered syncs starting at sync_point (requires mu_).
     void DrainSyncsLocked(std::vector<ReconAction> &out);
+    // Persist a committed synced entry and advance commit_point (requires mu_).
+    void CommitLocked(const ClientAndReqId &key);
 
     const uint32_t partition_id_;
     const uint64_t view_id_;
@@ -128,6 +147,7 @@ private:
     Clock *clock_;
     const Role role_;
     OnRelease on_release_;
+    const uint32_t commit_quorum_;
 
     mutable std::mutex mu_;
     PartitionState state_;
@@ -142,6 +162,18 @@ private:
     HashMap<ClientAndReqId, uint64_t> replied_deadline_; // deadline last replied to client
     std::unordered_map<uint64_t, SyncIn> pending_syncs_; // out-of-order syncs by log_id
     std::unordered_set<uint64_t> fetch_inflight_;        // log_ids awaiting a fetch_resp
+    HashMap<ClientAndReqId, bool> pending_commits_;      // commits arrived before sync
+
+    // Background-persistence state (spec §7). Leader: tally of confirmations per
+    // not-yet-committed write. Both roles: which synced positions are committed,
+    // used to advance commit_point over the contiguous prefix.
+    struct ConfirmState {
+        uint64_t deadline = 0;
+        std::unordered_set<uint32_t> confirmers; // follower replica_ids
+        bool committed = false;
+    };
+    HashMap<ClientAndReqId, ConfirmState> confirm_state_; // leader only
+    std::unordered_set<uint64_t> committed_positions_;    // committed but not yet folded into commit_point
 
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> loop_wakeups_{0};

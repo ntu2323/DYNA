@@ -35,6 +35,18 @@ LogEntry Write(uint64_t client, uint64_t req, uint64_t deadline,
     return e;
 }
 
+LogEntry Read(uint64_t client, uint64_t req, uint64_t deadline,
+              const std::string &key = "k")
+{
+    LogEntry e;
+    e.client_id = client;
+    e.request_id = req;
+    e.type = proto::READ_ONLY;
+    e.key = key;
+    e.deadline = deadline;
+    return e;
+}
+
 // Poll until pred() or timeout; returns pred()'s final value.
 template <typename F>
 bool WaitFor(F pred, int max_ms = 2000)
@@ -265,4 +277,83 @@ TEST(PartitionOrderer, FollowerStagesUnsyncedWithoutApply)
     EXPECT_EQ(orderer.unsynced_log_at(0).request_id, 1u);
     EXPECT_FALSE(backend.mem_read("k").has_value());    // no speculative apply
     ASSERT_EQ(released.size(), 1u);                      // endorsement callback fired
+}
+
+// §6.3 fast read: the leader serves the committed value from memory, with
+// log_pos = number of writes ordered before the read, and never persists.
+TEST(PartitionOrderer, LeaderReadServesCommittedValueLinearizably)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    std::vector<LogEntry> released;
+    PartitionOrderer orderer(0, 0, &backend, &clock,
+                             PartitionOrderer::Role::kLeader,
+                             [&](const LogEntry &e) { released.push_back(e); });
+
+    orderer.Submit(Write(1, 1, 100, "k", "v"));
+    clock.Set(100);
+    orderer.ReleaseDue();                       // write applied to memory
+
+    orderer.Submit(Read(1, 2, 200, "k"));       // read issued after the write
+    clock.Set(200);
+    const uint64_t persists_before_read = backend.disk_persist_count();
+    orderer.ReleaseDue();
+
+    // The read is served but never logged (reads do not enter synced_log).
+    EXPECT_EQ(orderer.synced_log_size(), 1u);   // only the write
+    ASSERT_EQ(released.size(), 2u);
+    const LogEntry &r = released[1];
+    EXPECT_EQ(r.request_id, 2u);
+    EXPECT_TRUE(r.has_result);
+    EXPECT_EQ(r.result, "v");                    // linearizable w.r.t. the write
+    EXPECT_EQ(r.log_pos, 1u);                    // one write ordered before it
+    // Serving the read triggers no durability work (the write may persist in the
+    // background under the single-replica quorum, but the read never does).
+    EXPECT_EQ(backend.disk_persist_count(), persists_before_read);
+}
+
+// A leader read of a missing key returns empty and is still not logged.
+TEST(PartitionOrderer, LeaderReadMissingKeyReturnsEmpty)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    std::vector<LogEntry> released;
+    PartitionOrderer orderer(0, 0, &backend, &clock,
+                             PartitionOrderer::Role::kLeader,
+                             [&](const LogEntry &e) { released.push_back(e); });
+
+    orderer.Submit(Read(1, 1, 100, "absent"));
+    clock.Set(100);
+    orderer.ReleaseDue();
+
+    EXPECT_EQ(orderer.synced_log_size(), 0u);
+    ASSERT_EQ(released.size(), 1u);
+    EXPECT_TRUE(released[0].has_result);
+    EXPECT_EQ(released[0].result, "");
+}
+
+// §6.3 follower read endorsement: log_pos = number of writes the follower has
+// released; the read is not staged in unsynced_log and carries no result.
+TEST(PartitionOrderer, FollowerReadEndorsesWithLogPosNoResult)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    std::vector<LogEntry> released;
+    PartitionOrderer orderer(0, 0, &backend, &clock,
+                             PartitionOrderer::Role::kFollower,
+                             [&](const LogEntry &e) { released.push_back(e); });
+
+    orderer.Submit(Write(1, 1, 100));
+    clock.Set(100);
+    orderer.ReleaseDue();                       // 1 write speculatively released
+
+    orderer.Submit(Read(1, 2, 200));
+    clock.Set(200);
+    orderer.ReleaseDue();
+
+    EXPECT_EQ(orderer.unsynced_log_size(), 1u); // read not staged
+    ASSERT_EQ(released.size(), 2u);
+    EXPECT_EQ(released[1].request_id, 2u);
+    EXPECT_EQ(released[1].log_pos, 1u);          // one preceding write
+    EXPECT_FALSE(released[1].has_result);        // followers do not execute reads
 }

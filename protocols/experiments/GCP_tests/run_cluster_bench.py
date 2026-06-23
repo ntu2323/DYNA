@@ -49,6 +49,14 @@ PROTOCOLS = {
         "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
         "client_bin": "./bench/client",
     },
+    # IONIA = ionia/vr (VRReplica + VRDurabilityReplica), distinct from the "vr"
+    # baseline which is the paxos/src NOPaxos VR. Same ionia binary as dyna, but
+    # launched with -m vr and a two-config setup (internal + .client).
+    "ionia": {
+        "replica_start": "~/bench/start_ionia_replica.sh {idx}",
+        "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
+        "client_bin": "./bench/client",
+    },
 }
 
 
@@ -115,6 +123,31 @@ def _build_client_cmd(
             "-e", str(experiment_sec),
             "-w", str(warmup_sec),
             "-t", str(threads),
+            "-i", str(interval_ms),
+            "-l", f"{run_dir}/latencies",
+        ]
+        if open_loop:
+            args.append("-O")
+            if offered_ops_per_sec > 0.0:
+                args.extend(["-G", repr(offered_ops_per_sec)])
+            else:
+                args.extend(["-R", str(poisson_rate)])
+            if max_inflight > 0:
+                args.extend(["-F", str(max_inflight)])
+    elif protocol == "ionia":
+        # ionia/vr client: -c is the client-facing (durability) config, -s the
+        # internal consensus config. -t is the client/machine id, -j is threads
+        # (same ionia binary semantics as dyna; the "vr" baseline binary differs).
+        args = [
+            "-c", "$HOME/bench/ioniaconfig.client",
+            "-s", "$HOME/bench/ioniaconfig",
+            "-m", "vr",
+            "-k", "$HOME/bench/trace.micro",
+            "-n", str(num_ops),
+            "-e", str(experiment_sec),
+            "-w", str(warmup_sec),
+            "-t", str(machine_id),
+            "-j", str(threads),
             "-i", str(interval_ms),
             "-l", f"{run_dir}/latencies",
         ]
@@ -315,8 +348,37 @@ def _fetch_logs(
         return role, False, str(e)
 
 
+def _fetch_replica_log(
+    role: str,
+    host: str,
+    run_id: str,
+    local_run_dir: str,
+    ssh_user: str,
+    ssh_key: Optional[str],
+) -> tuple[str, bool, str]:
+    """Pull ~/bench/replica-<idx>.log from a receiver (best-effort, for debugging)."""
+    idx = receiver_index(role)
+    local_dir = os.path.join(local_run_dir, role)
+    os.makedirs(local_dir, exist_ok=True)
+    remote = f"~/bench/replica-{idx}.log"
+    r = ssh_run(host, ssh_user, ssh_key, f"test -f {remote} && echo yes")
+    if "yes" not in (r.stdout or ""):
+        return role, False, f"no {remote}"
+    try:
+        fetch_remote_file(
+            host,
+            ssh_user,
+            ssh_key,
+            remote,
+            os.path.join(local_dir, f"replica-{idx}.log"),
+        )
+        return role, True, ""
+    except subprocess.CalledProcessError as e:
+        return role, False, str(e)
+
+
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Orchestrate GCP VR/DYNA cluster benchmark run.")
+    ap = argparse.ArgumentParser(description="Orchestrate GCP VR/DYNA/IONIA cluster benchmark run.")
     ap.add_argument("--hosts-file", default=os.path.join(_SCRIPT_DIR, "cluster_hosts.json"))
     ap.add_argument("--protocol", choices=sorted(PROTOCOLS), required=True)
     ap.add_argument("--ssh-user", default=os.environ.get("SSH_USER", ""))
@@ -641,6 +703,27 @@ def main() -> None:
                 print(f"  [{role}] WARNING: fetch failed: {err}", file=sys.stderr)
             else:
                 print(f"  [{role}] logs saved")
+
+    # Best-effort: pull replica logs too, so server-side crashes are visible locally.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, len(receiver_roles))) as ex:
+        futs = [
+            ex.submit(
+                _fetch_replica_log,
+                r,
+                hosts[r],
+                run_id,
+                local_run_dir,
+                args.ssh_user,
+                ssh_key,
+            )
+            for r in receiver_roles
+        ]
+        for fut in concurrent.futures.as_completed(futs):
+            role, ok, err = fut.result()
+            if ok:
+                print(f"  [{role}] replica log saved")
+            else:
+                print(f"  [{role}] no replica log ({err})", file=sys.stderr)
 
     meta_path = os.path.join(local_run_dir, "run_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:

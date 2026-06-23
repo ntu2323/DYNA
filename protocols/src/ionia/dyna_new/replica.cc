@@ -37,7 +37,8 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
             pid, /*view=*/0, backend_.get(), clocks_[pid].get(), role,
             [this, pid, is_leader](const LogEntry &e) {
                 OnRelease(pid, is_leader, e);
-            });
+            },
+            /*commit_quorum=*/static_cast<uint32_t>(config.f) + 1);
         orderer->Start();
         orderers_.push_back(std::move(orderer));
     }
@@ -65,6 +66,8 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         proto::Sync::default_instance().GetDescriptor()->full_name();
     const static auto syncConfirmName =
         proto::SyncConfirm::default_instance().GetDescriptor()->full_name();
+    const static auto commitName =
+        proto::Commit::default_instance().GetDescriptor()->full_name();
     const static auto fetchReqName =
         proto::FetchRequest::default_instance().GetDescriptor()->full_name();
     const static auto fetchRespName =
@@ -118,8 +121,27 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     }
 
     if (type == syncConfirmName) {
-        // Followers report log agreement; the leader consumes these for
-        // background persistence in a later stage (§7). Accept and ignore now.
+        // A follower reports log agreement. The leader tallies confirmations and,
+        // on f+1 (including its own append), persists off-path and broadcasts a
+        // Commit (§7).
+        proto::SyncConfirm c;
+        if (!c.ParseFromArray(data.data(), data.size())) return;
+        const uint32_t pid = c.partition_id();
+        if (pid >= orderers_.size()) return;
+        if (orderers_[pid]->HandleSyncConfirm(c.replica_id(), c.client_id(),
+                                              c.request_id(), c.deadline())) {
+            BroadcastCommit(pid, c.client_id(), c.request_id());
+        }
+        return;
+    }
+
+    if (type == commitName) {
+        // Background commit from the partition leader: persist our own copy (§7).
+        proto::Commit cm;
+        if (!cm.ParseFromArray(data.data(), data.size())) return;
+        const uint32_t pid = cm.partition_id();
+        if (pid >= orderers_.size()) return;
+        orderers_[pid]->HandleCommit(cm.client_id(), cm.request_id());
         return;
     }
 
@@ -166,7 +188,8 @@ void
 DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
 {
     SendReply(pid, is_leader, e);
-    if (is_leader) {
+    // Reads are not logged or synced (§6.3); only writes are reconciled.
+    if (is_leader && e.type != proto::READ_ONLY) {
         BroadcastSync(pid, e);   // followers reconcile against this (§6.4)
     }
 }
@@ -182,6 +205,18 @@ DynaNewReplica::BroadcastSync(uint32_t pid, const LogEntry &e)
     sync.set_request_id(e.request_id);
     sync.set_deadline(e.deadline);   // possibly reassigned by the slow path (§6.2)
     transport->SendMessageToAll(this, sync);   // self ignores (leader-role HandleSync)
+}
+
+void
+DynaNewReplica::BroadcastCommit(uint32_t pid, uint64_t client_id,
+                                uint64_t request_id)
+{
+    proto::Commit commit;
+    commit.set_view_id(0);
+    commit.set_partition_id(pid);
+    commit.set_client_id(client_id);
+    commit.set_request_id(request_id);
+    transport->SendMessageToAll(this, commit);   // self ignores (leader-role HandleCommit)
 }
 
 void
@@ -233,6 +268,14 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     reply.set_request_id(e.request_id);
     reply.set_deadline(e.deadline);
     reply.set_is_leader(is_leader);
+
+    if (e.type == proto::READ_ONLY) {
+        // Read commit matches on log position; the leader carries the data (§6.3).
+        reply.set_log_pos(e.log_pos);
+        if (e.has_result) {
+            reply.set_result(e.result);
+        }
+    }
 
     {
         std::lock_guard<std::mutex> lk(owd_mu_);

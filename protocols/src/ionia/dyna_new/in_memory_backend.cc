@@ -49,6 +49,7 @@ InMemoryBackend::disk_persist(std::string_view key, std::string_view value)
 {
     // Off the critical path: enqueue and return immediately. The calling
     // thread must never block on disk I/O (invariant 2).
+    disk_persist_count_.fetch_add(1, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lk(q_mu_);
         queue_.push_back(WriteOp{std::string(key), std::string(value)});

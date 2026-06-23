@@ -39,6 +39,7 @@ private:
     void OnRelease(uint32_t pid, bool is_leader, const LogEntry &e);
     void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
     void BroadcastSync(uint32_t pid, const LogEntry &e);
+    void BroadcastCommit(uint32_t pid, uint64_t client_id, uint64_t request_id);
     // Executes the messages a follower's reconciliation asked us to send.
     void ExecuteReconActions(uint32_t pid, const std::vector<ReconAction> &actions);
 

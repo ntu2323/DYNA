@@ -37,16 +37,21 @@ python3 create_cluster.py 4 --hosts-file cluster_hosts.json --spread-replica-zon
 
 ## 2. Setup VMs
 
-Run **one protocol at a time** (same UDP port 31880). First install on all VMs uses full deps; day-to-day use **`--skip-build`** after pushing to GitHub.
+Run **one protocol at a time** (VR/DYNA use UDP port 31880; IONIA uses 31880 internal + 31850 client, matching the canonical IONIA CloudLab harness). First install on all VMs uses full deps; day-to-day use **`--skip-build`** after pushing to GitHub.
+
+Protocols: **`vr`** = paxos/src NOPaxos VR baseline; **`dyna`** = ionia/src `-m dyna`; **`ionia`** = ionia/src `-m vr` (VRReplica + VRDurabilityReplica — the IONIA system, *not* the `vr` baseline). `dyna` and `ionia` share the same `protocols/src/ionia` build.
 
 ### First time (full build)
 
 ```bash
-# VR
+# VR (paxos baseline)
 SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
 
 # DYNA (after VR or instead of VR — not in parallel)
-SSH_USER=$SSH_USER python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
+
+# IONIA (ionia -m vr; two-config layout)
+SSH_USER=$SSH_USER python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json
 ```
 
 Optional: `IONIA_GIT_REF=my-branch` for a non-default branch. Local tree without push: `--rsync-from /path/to/Ionia` (skips git clone).
@@ -57,21 +62,22 @@ Skips apt, Folly, Splinter/RocksDB bootstrap. Still runs **`git pull`** (or uses
 
 ```bash
 # Push to GitHub first, then:
-SSH_USER=nathan python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
-SSH_USER=nathan python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=nathan python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json --skip-build
 
 # Or rsync local Ionia without push:
 IONIA_REPO_ROOT=/path/to/Ionia SSH_USER=$SSH_USER python3 setup_dyna_cluster.py \
   --hosts-file cluster_hosts.json --skip-build --rsync-from "$IONIA_REPO_ROOT"
 ```
 
-Logs: `~/paxos_vr_setup.log` / `~/dyna_setup.log` on each VM. Success markers: `~/bench/.setup_paxos_done` / `.setup_dyna_done`.
+Logs: `~/paxos_vr_setup.log` / `~/dyna_setup.log` / `~/ionia_setup.log` on each VM. Success markers: `~/bench/.setup_paxos_done` / `.setup_dyna_done` / `.setup_ionia_done`.
 
 ---
 
 ## 3. Run benchmarks (from laptop)
 
-Stop the other protocol’s replicas before switching (VR ↔ DYNA).
+Stop the other protocol’s replicas before switching (VR ↔ DYNA ↔ IONIA).
 
 ### Orchestrated (recommended)
 
@@ -101,8 +107,18 @@ SSH_USER=nathan python3 run_cluster_bench.py --protocol vr --hosts-file cluster_
 SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
   -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
+
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.py
+
+
+# IONIA (ionia -m vr, UDP FastTransport) — open-loop.
+# Default -j 15 durability threads per replica (SharedUDPPort on client port 31850).
+# Override: IONIA_DURABILITY_THREADS=1 for single-thread smoke tests.
+SSH_USER=nathan python3 run_cluster_bench.py --protocol ionia --hosts-file cluster_hosts.json \
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
+
 # DYNA — WAL on tmpfs (fsync triage: if mean/p99 drop sharply, disk fsync is the bottleneck)
-SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
   --wal-tmpfs -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
 # Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)

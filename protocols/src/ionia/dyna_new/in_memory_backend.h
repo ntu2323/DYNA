@@ -16,6 +16,7 @@
 
 #include "dyna_new/storage_backend.h"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -45,6 +46,9 @@ public:
 
     // Test helper: number of writes still queued for the disk worker.
     size_t disk_backlog() const;
+    // Test helper: total disk_persist calls accepted (to assert reads never
+    // trigger durability work — build plan Stage 6 / invariant 2).
+    uint64_t disk_persist_count() const { return disk_persist_count_.load(); }
 
 private:
     void DiskWorkerLoop();
@@ -68,6 +72,8 @@ private:
     std::deque<WriteOp> queue_;
     bool stop_ = false;
     std::thread worker_;
+
+    std::atomic<uint64_t> disk_persist_count_{0};
 };
 
 } // namespace dyna_new

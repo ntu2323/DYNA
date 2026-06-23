@@ -5,7 +5,7 @@
 
 #include "common/client.h"
 #include "dyna_new/deadline.h"
-#include "dyna_new/write_quorum.h"
+#include "dyna_new/commit_quorum.h"
 
 #include <cstdint>
 #include <string>
@@ -41,8 +41,7 @@ private:
         uint64_t send_us = 0;
         bool is_read = false;
         continuation_t continuation;
-        WriteQuorum quorum;
-        std::string leader_result;
+        CommitQuorum quorum;
     };
 
     uint64_t NowMicros() const;

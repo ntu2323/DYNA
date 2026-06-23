@@ -1,32 +1,9 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
 /***********************************************************************
  *
- * udptransport.h:
- *   message-passing network interface that uses UDP message delivery
- *   and libasync
- *
- * Copyright 2013 Dan R. K. Ports  <drkp@cs.washington.edu>
- *           2018 Adriana Szekeres  <aaasz@cs.washington.edu>
- *
- * Permission is hereby granted, free of charge, to any person
- * obtaining a copy of this software and associated documentation
- * files (the "Software"), to deal in the Software without
- * restriction, including without limitation the rights to use, copy,
- * modify, merge, publish, distribute, sublicense, and/or sell copies
- * of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be
- * included in all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
- * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
- * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
- * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
- * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
- * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
- * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
- * SOFTWARE.
+ * fasttransport.h:
+ *   compatibility transport that preserves the FastTransport API while
+ *   using UDPTransport as the backend.
  *
  **********************************************************************/
 
@@ -35,6 +12,7 @@
 
 #include "lib/configuration.h"
 #include "lib/udptransport.h"
+#include <atomic>
 #include <memory>
 
 class FastTransport : public TransportCommon<UDPTransportAddress>
@@ -69,6 +47,9 @@ public:
 private:
     specpaxos::Configuration config;
     std::unique_ptr<UDPTransport> udp_transport;
+    uint8_t endpoint_id_;
+    int nthreads_;
+    std::atomic<bool> stopped_{false};
 
     bool SendMessageInternal(TransportReceiver *src,
                              const UDPTransportAddress &dst,

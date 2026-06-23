@@ -10,10 +10,12 @@ namespace dyna_new {
 
 PartitionOrderer::PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                                    StorageBackend *backend, Clock *clock,
-                                   Role role, OnRelease on_release)
+                                   Role role, OnRelease on_release,
+                                   uint32_t commit_quorum)
     : partition_id_(partition_id), view_id_(view_id),
       backend_(backend), clock_(clock), role_(role),
-      on_release_(std::move(on_release))
+      on_release_(std::move(on_release)),
+      commit_quorum_(commit_quorum == 0 ? 1 : commit_quorum)
 {
     state_.view_id = view_id;
 }
@@ -92,16 +94,42 @@ PartitionOrderer::DrainDueLocked(std::vector<LogEntry> &out)
 void
 PartitionOrderer::ReleaseEntryLocked(LogEntry &e)
 {
+    if (e.type == proto::READ_ONLY) {
+        // Reads are served off the release path and never logged or synced
+        // (spec §6.3). Their position is the number of writes ordered before
+        // them, so the leader and followers agree on log_pos without persisting
+        // the read. Writes ordered before this read have already released (we
+        // release in deadline order), so the read sees them in memory.
+        if (role_ == Role::kLeader) {
+            e.log_pos = state_.synced_log.size();
+            auto v = backend_->mem_read(e.key);
+            e.result = v.value_or(std::string());
+            e.has_result = true;
+        } else {
+            e.log_pos = state_.unsynced_log.size();
+        }
+        return;
+    }
+
     if (role_ == Role::kLeader) {
         // Leader is the source of truth: appended entries go straight to
         // synced_log and writes hit authoritative memory (§3.3, §6.1).
         e.log_pos = state_.synced_log.size();
-        if (e.type != proto::READ_ONLY) {
-            backend_->mem_apply(e.key, e.command);
-        }
+        backend_->mem_apply(e.key, e.command);
         state_.synced_log.push_back(e);
         synced_index_[e.Key()] = e.log_pos;
         state_.sync_point = state_.synced_log.size();
+
+        // Start the §7 confirmation tally: the leader's own append is the first
+        // (implicit) confirmation. With a single replica (quorum 1) the write is
+        // already committed, so persist it now; otherwise wait for sync_confirms.
+        ConfirmState &cs = confirm_state_[e.Key()];
+        cs.deadline = e.deadline;
+        if (commit_quorum_ <= 1) {
+            cs.committed = true;
+            CommitLocked(e.Key());
+            confirm_state_.erase(e.Key());
+        }
     } else {
         // Follower: speculative release. Stage in unsynced_log without applying
         // to authoritative memory; reconciliation against the leader's sync
@@ -196,6 +224,11 @@ PartitionOrderer::DrainSyncsLocked(std::vector<ReconAction> &out)
         fetch_inflight_.erase(sync.log_id);
         pending_syncs_.erase(sit);
 
+        // A Commit may have raced ahead of this sync; apply it now (§7).
+        if (pending_commits_.erase(key) > 0) {
+            CommitLocked(key);
+        }
+
         // Make sure the client can count this replica on the leader's deadline.
         // (The replica drops the reply if there is no client address, e.g. for a
         // fetched entry we never received directly — the client commits via the
@@ -234,6 +267,78 @@ PartitionOrderer::LeaderFetch(uint64_t client_id, uint64_t request_id,
     }
     out = state_.synced_log[it->second];
     return true;
+}
+
+bool
+PartitionOrderer::HandleSyncConfirm(uint32_t replica_id, uint64_t client_id,
+                                    uint64_t request_id, uint64_t deadline)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    if (role_ != Role::kLeader) {
+        return false;
+    }
+    const ClientAndReqId key{client_id, request_id};
+    auto it = confirm_state_.find(key);
+    if (it == confirm_state_.end()) {
+        // Either already committed (and erased) or never released here. Ignore.
+        return false;
+    }
+    ConfirmState &cs = it->second;
+    if (cs.committed) {
+        return false;
+    }
+    if (deadline != cs.deadline) {
+        // A confirmation only counts when it agrees on the leader's deadline
+        // (§7). A follower that had to change the deadline (slow path) will send
+        // a confirm at the leader's value once reconciled.
+        return false;
+    }
+    cs.confirmers.insert(replica_id);
+    // +1 for the leader's own append (§7).
+    if (1u + cs.confirmers.size() < commit_quorum_) {
+        return false;
+    }
+    cs.committed = true;
+    CommitLocked(key);
+    confirm_state_.erase(it);
+    return true;   // caller broadcasts Commit
+}
+
+void
+PartitionOrderer::HandleCommit(uint64_t client_id, uint64_t request_id)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    if (role_ != Role::kFollower) {
+        return;
+    }
+    const ClientAndReqId key{client_id, request_id};
+    if (synced_index_.find(key) == synced_index_.end()) {
+        // Commit raced ahead of the sync; apply once reconciliation catches up.
+        pending_commits_[key] = true;
+        return;
+    }
+    CommitLocked(key);
+}
+
+void
+PartitionOrderer::CommitLocked(const ClientAndReqId &key)
+{
+    auto it = synced_index_.find(key);
+    if (it == synced_index_.end()) {
+        return;
+    }
+    const uint64_t pos = it->second;
+    const LogEntry &e = state_.synced_log[pos];
+    if (e.type != proto::READ_ONLY) {
+        // Off the critical path: enqueue the durable write (invariant 2). Reads
+        // are never logged, so this is always a write.
+        backend_->disk_persist(e.key, e.command);
+    }
+    // Advance commit_point over the contiguous committed prefix (§3.3).
+    committed_positions_.insert(pos);
+    while (committed_positions_.erase(state_.commit_point) > 0) {
+        state_.commit_point++;
+    }
 }
 
 void
@@ -295,6 +400,13 @@ PartitionOrderer::sync_point() const
 {
     std::lock_guard<std::mutex> lk(mu_);
     return state_.sync_point;
+}
+
+uint64_t
+PartitionOrderer::commit_point() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return state_.commit_point;
 }
 
 size_t

@@ -37,6 +37,7 @@
 #include "lib/assert.h"
 #include "lib/configuration.h"
 #include "lib/message.h"
+#include "lib/shared_udp_port.h"
 #include "lib/udptransport.h"
 
 #include <google/protobuf/message.h>
@@ -249,11 +250,27 @@ UDPTransport::UDPTransport(double dropRate, double reorderRate,
 
 UDPTransport::~UDPTransport()
 {
-    // XXX Shut down libevent?
+    if (shared_port_ != nullptr && registered_receiver_ != nullptr) {
+        shared_port_->UnregisterEndpoint(endpoint_id_, registered_receiver_);
+        registered_receiver_ = nullptr;
+    }
+    if (shared_port_owned_) {
+        shared_port_->Release();
+        shared_port_ = nullptr;
+        shared_port_owned_ = false;
+    }
+}
 
-    // for (auto kv : timers) {
-    //     delete kv.second;
-    // }
+void
+UDPTransport::SetEndpointId(uint8_t endpoint_id)
+{
+    endpoint_id_ = endpoint_id;
+}
+
+void
+UDPTransport::EnableSharedPort(bool enable)
+{
+    use_shared_port_ = enable;
 }
 
 void
@@ -332,6 +349,39 @@ UDPTransport::Register(TransportReceiver *receiver,
 
     const specpaxos::Configuration *canonicalConfig =
         RegisterConfiguration(receiver, config, groupIdx, replicaIdx);
+
+    if (replicaIdx != -1 && use_shared_port_ && SharedUDPPort::SharedPortsEnabled()) {
+        const string &host = config.replica(groupIdx, replicaIdx).host;
+        const string &port = config.replica(groupIdx, replicaIdx).port;
+
+        if (shared_port_ == nullptr) {
+            shared_port_ = SharedUDPPort::Acquire(host, port, dscp);
+            shared_port_owned_ = true;
+        }
+        shared_port_->RegisterEndpoint(endpoint_id_, receiver);
+        registered_receiver_ = receiver;
+
+        if (libeventBase != nullptr && libeventBase != shared_port_->EventBase()) {
+            event_base_free(libeventBase);
+        }
+        libeventBase = shared_port_->EventBase();
+
+        struct sockaddr_in sin{};
+        socklen_t sinsize = sizeof(sin);
+        if (getsockname(shared_port_->Fd(),
+                        reinterpret_cast<sockaddr *>(&sin),
+                        &sinsize) < 0) {
+            PPanic("Failed to get shared socket name");
+        }
+        auto *addr = new UDPTransportAddress(sin);
+        receiver->SetAddress(addr);
+
+        fds[receiver] = shared_port_->Fd();
+        if (replicaIdx != -1) {
+            ListenOnMulticastPort(canonicalConfig);
+        }
+        return;
+    }
 
     // Create socket
     int fd;
@@ -536,6 +586,17 @@ UDPTransport::SendMessageInternal(TransportReceiver *src,
 }
 
 bool
+UDPTransport::SendWithMeta(TransportReceiver *src,
+                           const UDPTransportAddress &dst,
+                           const Message &m,
+                           const void *meta,
+                           size_t meta_len)
+{
+    return _SendMessageInternal(src, dst, m, meta_len,
+                                const_cast<void *>(meta));
+}
+
+bool
 UDPTransport::OrderedMulticast(TransportReceiver *src,
                                const std::vector<int> &groups,
                                const Message &m)
@@ -582,19 +643,33 @@ UDPTransport::OrderedMulticast(TransportReceiver *src,
 void
 UDPTransport::Run()
 {
-    event_base_dispatch(libeventBase);
+    if (shared_port_ != nullptr) {
+        while (true) {
+            shared_port_->RunOnce();
+        }
+    } else {
+        event_base_dispatch(libeventBase);
+    }
 }
 
 void
 UDPTransport::RunOnce()
 {
-    event_base_loop(libeventBase, EVLOOP_ONCE | EVLOOP_NONBLOCK);
+    if (shared_port_ != nullptr) {
+        shared_port_->RunOnce();
+    } else {
+        event_base_loop(libeventBase, EVLOOP_ONCE | EVLOOP_NONBLOCK);
+    }
 }
 
 void
 UDPTransport::Stop()
 {
-    event_base_loopbreak(libeventBase);
+    if (shared_port_ != nullptr) {
+        shared_port_->Stop();
+    } else {
+        event_base_loopbreak(libeventBase);
+    }
 }
 
 static void
