@@ -36,6 +36,7 @@
 
 #include "lib/assert.h"
 #include "lib/configuration.h"
+#include "lib/fasttransport_endpoint.h"
 #include "lib/message.h"
 #include "lib/shared_udp_port.h"
 #include "lib/udptransport.h"
@@ -740,6 +741,7 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
     UDPTransportAddress senderAddr(sender);
     string msgType, msg;
     void *meta_data = NULL;
+    size_t meta_len = 0;
     multistamp_t stamp;
 
     // Take a peek at the first field. If it's all zeros, this is
@@ -749,7 +751,9 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
 
     if (magic == NONFRAG_MAGIC) {
         // Not a fragment. Decode the packet
-        DecodePacket(buf + sizeof(uint32_t), sz - sizeof(uint32_t),
+        const char *body = buf + sizeof(uint32_t);
+        meta_len = *(uint32_t *)body;
+        DecodePacket(body, sz - sizeof(uint32_t),
                      msgType, msg, &meta_data);
     } else if (magic == FRAG_MAGIC) {
         // This is a fragment. Decode the header
@@ -791,6 +795,7 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
         info.data.append(string(ptr, buf + sz - ptr));
         if (info.data.size() == msgLen) {
             Debug2("Completed packet reconstruction");
+            meta_len = *(uint32_t *)info.data.c_str();
             DecodePacket(info.data.c_str(), info.data.size(),
                          msgType, msg, &meta_data);
             info.msgId = 0;
@@ -800,6 +805,12 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
         }
     } else {
         Warning("Received packet with bad magic number");
+    }
+
+    // IONIA multithread replies include 4-byte FastTransport endpoint meta.
+    // Clients use a dedicated UDP port (not SharedUDPPort); strip it here.
+    if (meta_data != NULL && FastTransportEndpointMetaValid(meta_data, meta_len)) {
+        meta_data = NULL;
     }
 
     // Currently, only ordered multicast puts meta data
