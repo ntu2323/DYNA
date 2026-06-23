@@ -283,16 +283,16 @@ main(int argc, char **argv)
         }
     }
     auto physical_port = 0x0;
-    FastTransport internalTransport(internalConfig, ht_ct, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, true);
+    FastTransport internalTransport(internalConfig, ht_ct, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size);
     if (proto == PROTO_DYNA) {
-        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, false);
+        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size);
         specpaxos::dyna::DynaReplica replica(internalConfig, index, &transport);
         transport.Run();
         return 0;
     }
 
     if (proto == PROTO_DYNA_NEW) {
-        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, false);
+        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size);
         specpaxos::dyna_new::DynaNewReplica replica(internalConfig, index, &transport);
         transport.Run();
         return 0;
@@ -310,19 +310,10 @@ main(int argc, char **argv)
 
     specpaxos::Configuration clientConfig(clientConfigStream);
 
-    if (static_cast<size_t>(totalThreads) >= num_socket_cores) {
+    if (static_cast<size_t>(ht_ct) >= num_socket_cores) {
         Warning("Requested durability threads (%d) >= visible cores (%zu); "
                 "continuing in oversubscribed mode for container compatibility.",
-                totalThreads, num_socket_cores);
-    }
-
-    if (clientConfig.n > 0) {
-        const int config_threads = clientConfig.replica(0, 0).threads;
-        if (config_threads > 1 &&
-            static_cast<int>(totalThreads) != config_threads) {
-            Warning("Durability threads -j %d differs from config /%d suffix",
-                    totalThreads, config_threads);
-        }
+                ht_ct, num_socket_cores);
     }
 
     auto& internal_transport = internalTransport;
@@ -356,8 +347,8 @@ main(int argc, char **argv)
 
     auto server_thread_func = [&](specpaxos::Configuration config, uint8_t numa_node, uint8_t thread_id)
     {
-        const uint8_t transport_id = thread_id;
-        FastTransport client_transport(config, ht_ct, 1, physical_port, numa_node, transport_id, 0, 0, true);
+        const uint8_t transport_id = config.n > 0 ? static_cast<uint8_t>(thread_id % config.n) : 0;
+        FastTransport client_transport(config, ht_ct, 1, physical_port, numa_node, transport_id);
 
         auto durability_replica = specpaxos::vr::VRDurabilityReplica(config, index, !recover, &client_transport, batchSize, nullApp, internalConfig, &internal_transport, thread_id);
 

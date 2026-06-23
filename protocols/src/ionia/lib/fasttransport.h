@@ -1,9 +1,32 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
 /***********************************************************************
  *
- * fasttransport.h:
- *   compatibility transport that preserves the FastTransport API while
- *   using UDPTransport as the backend.
+ * udptransport.h:
+ *   message-passing network interface that uses UDP message delivery
+ *   and libasync
+ *
+ * Copyright 2013 Dan R. K. Ports  <drkp@cs.washington.edu>
+ *           2018 Adriana Szekeres  <aaasz@cs.washington.edu>
+ *
+ * Permission is hereby granted, free of charge, to any person
+ * obtaining a copy of this software and associated documentation
+ * files (the "Software"), to deal in the Software without
+ * restriction, including without limitation the rights to use, copy,
+ * modify, merge, publish, distribute, sublicense, and/or sell copies
+ * of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+ * MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS
+ * BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
  *
  **********************************************************************/
 
@@ -12,9 +35,7 @@
 
 #include "lib/configuration.h"
 #include "lib/udptransport.h"
-#include <atomic>
 #include <memory>
-#include <optional>
 
 class FastTransport : public TransportCommon<UDPTransportAddress>
 {
@@ -26,8 +47,7 @@ public:
                   uint8_t numa_node,
                   uint8_t id,
                   uint64_t send_buf_size = 0,
-                  uint64_t receive_buf_size = 0,
-                  bool ionia_multithread = false);
+                  uint64_t receive_buf_size = 0);
     virtual ~FastTransport();
     virtual void Register(TransportReceiver *receiver,
                           const specpaxos::Configuration &config,
@@ -49,16 +69,6 @@ public:
 private:
     specpaxos::Configuration config;
     std::unique_ptr<UDPTransport> udp_transport;
-    uint8_t endpoint_id_;
-    int nthreads_;
-    bool ionia_multithread_;
-    std::atomic<bool> stopped_{false};
-
-    std::optional<std::pair<int, int>>
-    LookupReplicaForAddress(TransportReceiver *src, const UDPTransportAddress &dst);
-    uint8_t ResolveDstEndpoint(TransportReceiver *src,
-                               const UDPTransportAddress &dst,
-                               const Message &m);
 
     bool SendMessageInternal(TransportReceiver *src,
                              const UDPTransportAddress &dst,

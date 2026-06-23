@@ -373,9 +373,7 @@ int main(int argc, char **argv)
         const size_t num_socket_cores = std::max<std::size_t>(1, CpuCountOnNumaNode(numa_node));
         auto ht_ct = std::max<std::size_t>(1, std::min(num_socket_cores, static_cast<std::size_t>(numRequests)));
 
-        const bool ionia_multithread = (proto == PROTO_VR);
-        FastTransport transport(config, ht_ct, 1, physical_port, numa_node, thread_id,
-                              0, 0, ionia_multithread);
+        FastTransport transport(config, ht_ct, 1, physical_port, numa_node, thread_id);
 
         {
             specpaxos::Client *client;

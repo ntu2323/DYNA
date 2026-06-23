@@ -36,9 +36,7 @@
 
 #include "lib/assert.h"
 #include "lib/configuration.h"
-#include "lib/fasttransport_endpoint.h"
 #include "lib/message.h"
-#include "lib/shared_udp_port.h"
 #include "lib/udptransport.h"
 
 #include <google/protobuf/message.h>
@@ -251,27 +249,11 @@ UDPTransport::UDPTransport(double dropRate, double reorderRate,
 
 UDPTransport::~UDPTransport()
 {
-    if (shared_port_ != nullptr && registered_receiver_ != nullptr) {
-        shared_port_->UnregisterEndpoint(endpoint_id_, registered_receiver_);
-        registered_receiver_ = nullptr;
-    }
-    if (shared_port_owned_) {
-        shared_port_->Release();
-        shared_port_ = nullptr;
-        shared_port_owned_ = false;
-    }
-}
+    // XXX Shut down libevent?
 
-void
-UDPTransport::SetEndpointId(uint8_t endpoint_id)
-{
-    endpoint_id_ = endpoint_id;
-}
-
-void
-UDPTransport::EnableSharedPort(bool enable)
-{
-    use_shared_port_ = enable;
+    // for (auto kv : timers) {
+    //     delete kv.second;
+    // }
 }
 
 void
@@ -350,39 +332,6 @@ UDPTransport::Register(TransportReceiver *receiver,
 
     const specpaxos::Configuration *canonicalConfig =
         RegisterConfiguration(receiver, config, groupIdx, replicaIdx);
-
-    if (replicaIdx != -1 && use_shared_port_ && SharedUDPPort::SharedPortsEnabled()) {
-        const string &host = config.replica(groupIdx, replicaIdx).host;
-        const string &port = config.replica(groupIdx, replicaIdx).port;
-
-        if (shared_port_ == nullptr) {
-            shared_port_ = SharedUDPPort::Acquire(host, port, dscp);
-            shared_port_owned_ = true;
-        }
-        shared_port_->RegisterEndpoint(endpoint_id_, receiver);
-        registered_receiver_ = receiver;
-
-        if (libeventBase != nullptr && libeventBase != shared_port_->EventBase()) {
-            event_base_free(libeventBase);
-        }
-        libeventBase = shared_port_->EventBase();
-
-        struct sockaddr_in sin{};
-        socklen_t sinsize = sizeof(sin);
-        if (getsockname(shared_port_->Fd(),
-                        reinterpret_cast<sockaddr *>(&sin),
-                        &sinsize) < 0) {
-            PPanic("Failed to get shared socket name");
-        }
-        auto *addr = new UDPTransportAddress(sin);
-        receiver->SetAddress(addr);
-
-        fds[receiver] = shared_port_->Fd();
-        if (replicaIdx != -1) {
-            ListenOnMulticastPort(canonicalConfig);
-        }
-        return;
-    }
 
     // Create socket
     int fd;
@@ -587,17 +536,6 @@ UDPTransport::SendMessageInternal(TransportReceiver *src,
 }
 
 bool
-UDPTransport::SendWithMeta(TransportReceiver *src,
-                           const UDPTransportAddress &dst,
-                           const Message &m,
-                           const void *meta,
-                           size_t meta_len)
-{
-    return _SendMessageInternal(src, dst, m, meta_len,
-                                const_cast<void *>(meta));
-}
-
-bool
 UDPTransport::OrderedMulticast(TransportReceiver *src,
                                const std::vector<int> &groups,
                                const Message &m)
@@ -644,33 +582,19 @@ UDPTransport::OrderedMulticast(TransportReceiver *src,
 void
 UDPTransport::Run()
 {
-    if (shared_port_ != nullptr) {
-        while (true) {
-            shared_port_->RunOnce();
-        }
-    } else {
-        event_base_dispatch(libeventBase);
-    }
+    event_base_dispatch(libeventBase);
 }
 
 void
 UDPTransport::RunOnce()
 {
-    if (shared_port_ != nullptr) {
-        shared_port_->RunOnce();
-    } else {
-        event_base_loop(libeventBase, EVLOOP_ONCE | EVLOOP_NONBLOCK);
-    }
+    event_base_loop(libeventBase, EVLOOP_ONCE | EVLOOP_NONBLOCK);
 }
 
 void
 UDPTransport::Stop()
 {
-    if (shared_port_ != nullptr) {
-        shared_port_->Stop();
-    } else {
-        event_base_loopbreak(libeventBase);
-    }
+    event_base_loopbreak(libeventBase);
 }
 
 static void
@@ -741,7 +665,6 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
     UDPTransportAddress senderAddr(sender);
     string msgType, msg;
     void *meta_data = NULL;
-    size_t meta_len = 0;
     multistamp_t stamp;
 
     // Take a peek at the first field. If it's all zeros, this is
@@ -751,9 +674,7 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
 
     if (magic == NONFRAG_MAGIC) {
         // Not a fragment. Decode the packet
-        const char *body = buf + sizeof(uint32_t);
-        meta_len = *(uint32_t *)body;
-        DecodePacket(body, sz - sizeof(uint32_t),
+        DecodePacket(buf + sizeof(uint32_t), sz - sizeof(uint32_t),
                      msgType, msg, &meta_data);
     } else if (magic == FRAG_MAGIC) {
         // This is a fragment. Decode the header
@@ -795,7 +716,6 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
         info.data.append(string(ptr, buf + sz - ptr));
         if (info.data.size() == msgLen) {
             Debug2("Completed packet reconstruction");
-            meta_len = *(uint32_t *)info.data.c_str();
             DecodePacket(info.data.c_str(), info.data.size(),
                          msgType, msg, &meta_data);
             info.msgId = 0;
@@ -805,12 +725,6 @@ UDPTransport::ProcessPacket(int fd, sockaddr_in sender, socklen_t senderSize,
         }
     } else {
         Warning("Received packet with bad magic number");
-    }
-
-    // IONIA multithread replies include 4-byte FastTransport endpoint meta.
-    // Clients use a dedicated UDP port (not SharedUDPPort); strip it here.
-    if (meta_data != NULL && FastTransportEndpointMetaValid(meta_data, meta_len)) {
-        meta_data = NULL;
     }
 
     // Currently, only ordered multicast puts meta data

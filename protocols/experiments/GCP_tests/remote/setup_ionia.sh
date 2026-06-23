@@ -63,24 +63,11 @@ install_helpers() {
 #!/usr/bin/env bash
 set -euo pipefail
 # Usage: start_ionia_replica.sh <idx>
-#   Launches ionia/vr (VRReplica + VRDurabilityReplica).
-#   Durability-replica thread count is the main IONIA-specific knob:
-#     IONIA_DURABILITY_THREADS=N  (default from config /N suffix, else 15)
 IDX="${1:?replica index 0|1|2}"
 export IONIA_DB_MODE="${IONIA_DB_MODE:-memory}"
 export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
 export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
-# Durability thread count (-j). SharedUDPPort allows many endpoints on client port 31850.
-DUR_THREADS="${IONIA_DURABILITY_THREADS:-}"
-if [[ -z "${DUR_THREADS}" ]]; then
-  DUR_THREADS="$(sed -n 's#^replica [^:]*:[0-9]*/\([0-9][0-9]*\)[[:space:]]*$#\1#p' ~/bench/ioniaconfig.client | head -n1)"
-fi
-DUR_THREADS="${DUR_THREADS:-15}"
-# Raise limits the multi-threaded durability/transport path needs (locked memory for
-# transport buffers, thread/FD count); ignore failures if not permitted.
-ulimit -l unlimited 2>/dev/null || true
-ulimit -n 1048576 2>/dev/null || true
-ulimit -u 63536 2>/dev/null || true
+DUR_THREADS="${IONIA_DURABILITY_THREADS:-1}"
 cd "${HOME}/Ionia/protocols/src/ionia"
 mkdir -p ~/bench
 pkill -f '[b]ench/replica' 2>/dev/null || true

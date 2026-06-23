@@ -52,8 +52,6 @@
 #include <netinet/in.h>
 #include <map>
 
-class SharedUDPPort;
-
 class UDPTransportAddress : public TransportAddress
 {
 public:
@@ -163,16 +161,6 @@ public:
     int ManualEvent(timer_callback_t cb) override;
     bool TriggerManualEvent(int id) override;
 
-    void SetEndpointId(uint8_t endpoint_id);
-    void EnableSharedPort(bool enable);
-    bool UsesSharedPort() const { return shared_port_ != nullptr; }
-    SharedUDPPort *SharedPort() const { return shared_port_; }
-    bool SendWithMeta(TransportReceiver *src,
-                      const UDPTransportAddress &dst,
-                      const Message &m,
-                      const void *meta,
-                      size_t meta_len);
-
 
 private:
     struct UDPTransportTimerInfo
@@ -218,12 +206,6 @@ private:
         string data;
     };
     std::map<UDPTransportAddress, UDPTransportFragInfo> fragInfo;
-
-    SharedUDPPort *shared_port_ = nullptr;
-    bool shared_port_owned_ = false;
-    bool use_shared_port_ = false;
-    uint8_t endpoint_id_ = 0;
-    TransportReceiver *registered_receiver_ = nullptr;
 
     bool _SendMessageInternal(TransportReceiver *src,
                               const UDPTransportAddress &dst,

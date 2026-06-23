@@ -51,7 +51,7 @@ SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
 
 # IONIA (ionia -m vr; two-config layout)
-SSH_USER=$SSH_USER python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json
 ```
 
 Optional: `IONIA_GIT_REF=my-branch` for a non-default branch. Local tree without push: `--rsync-from /path/to/Ionia` (skips git clone).
@@ -64,7 +64,7 @@ Skips apt, Folly, Splinter/RocksDB bootstrap. Still runs **`git pull`** (or uses
 # Push to GitHub first, then:
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
-SSH_USER=nathan python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json --skip-build
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json --skip-build
 
 # Or rsync local Ionia without push:
 IONIA_REPO_ROOT=/path/to/Ionia SSH_USER=$SSH_USER python3 setup_dyna_cluster.py \
@@ -112,9 +112,7 @@ SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.p
 
 
 # IONIA (ionia -m vr, UDP FastTransport) — open-loop.
-# Default -j 15 durability threads per replica (SharedUDPPort on client port 31850).
-# Override: IONIA_DURABILITY_THREADS=1 for single-thread smoke tests.
-SSH_USER=nathan python3 run_cluster_bench.py --protocol ionia --hosts-file cluster_hosts.json \
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol ionia --hosts-file cluster_hosts.json \
   -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
 # DYNA — WAL on tmpfs (fsync triage: if mean/p99 drop sharply, disk fsync is the bottleneck)

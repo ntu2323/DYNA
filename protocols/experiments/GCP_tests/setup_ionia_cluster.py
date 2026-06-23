@@ -44,12 +44,11 @@ _FAIL_MARKER = "~/bench/.setup_ionia_failed"
 NUM_RECEIVERS = 3
 # Internal consensus port and client-facing durability port (must differ: both run
 # on the same hosts). Client port 31850 matches the canonical IONIA harness.
-# Durability threads use SharedUDPPort (one bind, many endpoints via FastTransport meta).
 # Keep in sync with remote/setup_ionia.sh REPLICA_PORT/CLIENT_PORT.
 REPLICA_PORT = 31880
 CLIENT_PORT = 31850
-# Durability threads (-j on bench/replica). Default 15 matches canonical eRPC harness.
-DURABILITY_THREADS = int(os.environ.get("IONIA_DURABILITY_THREADS", "15"))
+# Durability threads (-j on bench/replica).
+DURABILITY_THREADS = int(os.environ.get("IONIA_DURABILITY_THREADS", "1"))
 
 
 def _load_gcp_secrets():
@@ -74,14 +73,10 @@ def _load_hosts_file(path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     return hosts, internal
 
 
-def _replica_config(ips: List[str], port: int, threads: int) -> str:
+def _replica_config(ips: List[str], port: int) -> str:
     lines = ["f 1"]
     for ip in ips:
-        # "/N" suffix documents expected durability endpoint count (SharedUDPPort).
-        if threads > 1:
-            lines.append(f"replica {ip}:{port}/{threads}")
-        else:
-            lines.append(f"replica {ip}:{port}")
+        lines.append(f"replica {ip}:{port}")
     return "\n".join(lines) + "\n"
 
 
@@ -145,8 +140,8 @@ def main() -> None:
     all_roles = receiver_roles + sender_roles
 
     receiver_ips = [receiver_internal[r] for r in receiver_roles]
-    internal_config = _replica_config(receiver_ips, REPLICA_PORT, DURABILITY_THREADS)
-    client_config = _replica_config(receiver_ips, CLIENT_PORT, DURABILITY_THREADS)
+    internal_config = _replica_config(receiver_ips, REPLICA_PORT)
+    client_config = _replica_config(receiver_ips, CLIENT_PORT)
     num_keys = int(os.environ.get("BENCH_TRACE_NUM_KEYS", bench_trace.DEFAULT_TRACE_NUM_KEYS))
     trace = bench_trace.trace_micro_bytes(bench_trace.build_write_trace_spec(num_keys))
     bundle_files = {
@@ -245,7 +240,7 @@ def main() -> None:
     print("  Senders:   ~/bench/run_ionia_client.sh <client_id> [threads] [ops] [secs] [warmup]")
     print(f"  Configs:   ~/bench/ioniaconfig (internal, port {REPLICA_PORT})")
     print(f"             ~/bench/ioniaconfig.client (client-facing, port {CLIENT_PORT})")
-    print(f"  Replicas:  -j {DURABILITY_THREADS} (SharedUDPPort multithreading on {CLIENT_PORT})")
+    print(f"  Replicas:  -j {DURABILITY_THREADS}")
     print("Open firewall UDP", REPLICA_PORT, "and", CLIENT_PORT, "between cluster VMs.")
 
 
