@@ -10,6 +10,7 @@
 #include "lib/fasttransport.h"
 
 #include "lib/assert.h"
+#include "lib/fasttransport_endpoint.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -26,17 +27,21 @@ FastTransport::FastTransport(const specpaxos::Configuration &config,
                              uint8_t numa_node,
                              uint8_t id,
                              uint64_t send_buf_size,
-                             uint64_t receive_buf_size)
+                             uint64_t receive_buf_size,
+                             bool ionia_multithread)
     : config(config),
-      udp_transport(std::make_unique<UDPTransport>(0.0, 0.0, 0, nullptr))
+      udp_transport(std::make_unique<UDPTransport>(0.0, 0.0, 0, nullptr)),
+      endpoint_id_(id),
+      nthreads_(nthreads),
+      ionia_multithread_(ionia_multithread)
 {
-    (void)nthreads;
     (void)nr_req_types;
     (void)phy_port;
     (void)numa_node;
-    (void)id;
     (void)send_buf_size;
     (void)receive_buf_size;
+    udp_transport->SetEndpointId(endpoint_id_);
+    udp_transport->EnableSharedPort(ionia_multithread_);
 }
 
 FastTransport::~FastTransport() = default;
@@ -77,20 +82,24 @@ void FastTransport::Register(TransportReceiver *receiver,
                              int groupIdx,
                              int replicaIdx)
 {
-    // Keep FastTransport's own TransportCommon caches populated.
     RegisterConfiguration(receiver, config, groupIdx, replicaIdx);
     udp_transport->Register(receiver, config, groupIdx, replicaIdx);
 }
 
 void FastTransport::Run()
 {
-    udp_transport->Run();
+    if (!ionia_multithread_) {
+        udp_transport->Run();
+        return;
+    }
+    stopped_.store(false);
+    while (!stopped_.load(std::memory_order_relaxed)) {
+        RunOnce();
+    }
 }
 
 void FastTransport::RunOnce()
 {
-    // Match deprecated FastTransport: pump the I/O loop once, then run the
-    // optional app hook (e.g. durability execution). UDP replaces eRPC here.
     udp_transport->RunOnce();
     if (on_event_loop_function) {
         on_event_loop_function();
@@ -103,6 +112,9 @@ void FastTransport::Wait()
 
 void FastTransport::Stop()
 {
+    if (ionia_multithread_) {
+        stopped_.store(true);
+    }
     udp_transport->Stop();
 }
 
@@ -140,13 +152,17 @@ bool FastTransport::SendMessageInternal(TransportReceiver *src,
                                         const UDPTransportAddress &dst,
                                         const Message &m)
 {
-    return udp_transport->SendMessage(src, dst, m);
+    if (!ionia_multithread_) {
+        return udp_transport->SendMessage(src, dst, m);
+    }
+    // Phase 1: no key-hash routing; all client requests use endpoint 0.
+    const auto meta = MakeFastTransportEndpointMeta(endpoint_id_, 0);
+    return udp_transport->SendWithMeta(src, dst, m, &meta, sizeof(meta));
 }
 
 UDPTransportAddress FastTransport::LookupAddress(const specpaxos::ReplicaAddress &addr)
 {
     struct sockaddr_in sa{};
-    sa.sin_family = AF_INET;
     inet_pton(AF_INET, addr.host.c_str(), &(sa.sin_addr));
     sa.sin_port = htons(static_cast<uint16_t>(std::stoi(addr.port)));
     return UDPTransportAddress(sa);

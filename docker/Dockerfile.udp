@@ -61,8 +61,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /work/ionia
 COPY . .
 
-RUN chmod +x docker/bootstrap_deps.sh docker/run_udp_smoke.sh docker/docker-smoke.sh && \
+RUN chmod +x docker/bootstrap_deps.sh docker/run_udp_smoke.sh docker/docker-smoke.sh docker/docker-smoke-ionia-mt.sh && \
     ./docker/bootstrap_deps.sh && \
-    make -C protocols/src/ionia
+    make -C protocols/src/ionia bench/client bench/replica
 
 CMD ["/bin/bash"]

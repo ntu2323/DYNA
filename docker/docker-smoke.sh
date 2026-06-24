@@ -15,6 +15,7 @@ exec docker run "${run_flags[@]}" \
   -v "${OUT_HOST}:/tmp/ionia-docker" \
   -e "LOW_MEMORY=${LOW_MEMORY:-1}" \
   -e "SMOKE_PROTOCOL=${SMOKE_PROTOCOL:-vr}" \
+  -e "SMOKE_DURABILITY_THREADS=${SMOKE_DURABILITY_THREADS:-1}" \
   -e "SMOKE_SHOW_LOGS=${SMOKE_SHOW_LOGS:-1}" \
   -e "SMOKE_TAIL_LINES=${SMOKE_TAIL_LINES:-40}" \
   -e "DYNA_SLOWPATH_DEBUG=${DYNA_SLOWPATH_DEBUG:-}" \
