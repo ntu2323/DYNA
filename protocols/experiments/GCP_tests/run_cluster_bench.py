@@ -34,6 +34,7 @@ from gcp_bench_common import (
     remote_sender_cleanup_cmd,
     sender_client_id,
     ssh_run,
+    wait_ionia_replica_ready,
 )
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -79,6 +80,44 @@ def _bash_word(word: str) -> str:
     if "$HOME" in word:
         return word
     return shlex.quote(word)
+
+
+def _ionia_replica_ready_timeout_sec(replica_wait_sec: int, durability_threads: int) -> int:
+    """Allow time for -j N durability thread startup on each receiver."""
+    return max(replica_wait_sec, 10 + durability_threads * 2)
+
+
+def _wait_ionia_replicas_ready(
+    receiver_roles: List[str],
+    hosts: Dict[str, str],
+    ssh_user: str,
+    ssh_key: Optional[str],
+    durability_threads: int,
+    timeout_sec: int,
+) -> None:
+    print(
+        f"Waiting up to {timeout_sec}s for IONIA_REPLICA_READY "
+        f"(durability_threads={durability_threads}) on {len(receiver_roles)} receivers..."
+    )
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:
+        futs = [
+            ex.submit(
+                wait_ionia_replica_ready,
+                r,
+                hosts[r],
+                receiver_index(r),
+                durability_threads,
+                ssh_user,
+                ssh_key,
+                timeout_sec,
+            )
+            for r in receiver_roles
+        ]
+        for fut in concurrent.futures.as_completed(futs):
+            role, ok, err = fut.result()
+            if not ok:
+                sys.exit(f"IONIA replica not ready on {role}: {err}")
+            print(f"  [{role}] IONIA_REPLICA_READY")
 
 
 def _offered_ops_per_sender(offered_ops_per_sec: float, poisson_rate: int) -> float:
@@ -467,7 +506,13 @@ def main() -> None:
         action="store_true",
         help="Shorthand: open-loop latency under load; enables --auto-max-inflight (set offered rate explicitly).",
     )
-    ap.add_argument("--replica-wait-sec", type=int, default=8)
+    ap.add_argument(
+        "--replica-wait-sec",
+        type=int,
+        default=20,
+        help="Non-IONIA: fixed sleep after replica start. IONIA: max wait for "
+        "IONIA_REPLICA_READY (actual timeout is max(this, 10 + 2*durability_threads)).",
+    )
     ap.add_argument("--client-timeout-sec", type=int, default=7200)
     ap.add_argument(
         "--no-clean-remote",
@@ -591,6 +636,14 @@ def main() -> None:
         "ionia_durability_threads": (
             args.ionia_durability_threads if args.protocol == "ionia" else None
         ),
+        "replica_wait_sec": args.replica_wait_sec,
+        "ionia_replica_ready_timeout_sec": (
+            _ionia_replica_ready_timeout_sec(
+                args.replica_wait_sec, args.ionia_durability_threads
+            )
+            if args.protocol == "ionia"
+            else None
+        ),
         "receivers": [{"role": r, "host": hosts[r], "index": receiver_index(r)} for r in receiver_roles],
         "senders": senders_meta,
         "t0_unix": None,
@@ -633,8 +686,21 @@ def main() -> None:
                     sys.exit(f"Replica start failed on {role}: {err}")
                 print(f"  [{role}] replica started")
 
-        print(f"Waiting {args.replica_wait_sec}s for replicas...")
-        time.sleep(args.replica_wait_sec)
+        if args.protocol == "ionia":
+            ready_timeout = _ionia_replica_ready_timeout_sec(
+                args.replica_wait_sec, args.ionia_durability_threads
+            )
+            _wait_ionia_replicas_ready(
+                receiver_roles,
+                hosts,
+                args.ssh_user,
+                ssh_key,
+                args.ionia_durability_threads,
+                ready_timeout,
+            )
+        else:
+            print(f"Waiting {args.replica_wait_sec}s for replicas...")
+            time.sleep(args.replica_wait_sec)
 
     if args.skip_clients:
         meta_path = os.path.join(local_run_dir, "run_meta.json")

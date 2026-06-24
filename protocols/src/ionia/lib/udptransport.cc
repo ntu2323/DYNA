@@ -345,6 +345,7 @@ UDPTransport::Register(TransportReceiver *receiver,
                        int groupIdx,
                        int replicaIdx)
 {
+    std::lock_guard<std::mutex> lock(register_mutex_);
     ASSERT(replicaIdx < config.n);
     struct sockaddr_in sin;
 

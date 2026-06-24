@@ -49,6 +49,7 @@
 #include <vector>
 #include <unordered_map>
 #include <random>
+#include <mutex>
 #include <netinet/in.h>
 #include <map>
 
@@ -224,6 +225,7 @@ private:
     bool use_shared_port_ = false;
     uint8_t endpoint_id_ = 0;
     TransportReceiver *registered_receiver_ = nullptr;
+    std::mutex register_mutex_;
 
     bool _SendMessageInternal(TransportReceiver *src,
                               const UDPTransportAddress &dst,

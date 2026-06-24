@@ -53,6 +53,8 @@
 #include <sched.h>
 #include <thread>
 #include <csignal>
+#include <atomic>
+#include <chrono>
 
 
 static void
@@ -345,12 +347,16 @@ main(int argc, char **argv)
     ht_ct = totalThreads;
     nullApp->SetNumDurabilityReplicas(ht_ct);
 
+    std::atomic<uint32_t> durability_constructed{0};
+
     auto server_thread_func = [&](specpaxos::Configuration config, uint8_t numa_node, uint8_t thread_id)
     {
         const uint8_t transport_id = thread_id;
         FastTransport client_transport(config, ht_ct, 1, physical_port, numa_node, transport_id, 0, 0, true);
 
         auto durability_replica = specpaxos::vr::VRDurabilityReplica(config, index, !recover, &client_transport, batchSize, nullApp, internalConfig, &internal_transport, thread_id);
+        (void)durability_replica;
+        durability_constructed.fetch_add(1, std::memory_order_release);
 
         client_transport.Run();
     };
@@ -362,6 +368,13 @@ main(int argc, char **argv)
         BindThreadToNumaCpu(durability_threads[i], numa_node, bind_idx);
         idx++;
     }
+
+    while (durability_constructed.load(std::memory_order_acquire) <
+           static_cast<uint32_t>(ht_ct)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    Notice("IONIA_REPLICA_READY durability_threads=%u replica_index=%d",
+           static_cast<unsigned>(ht_ct), index);
 
     for (auto &thread : durability_threads) thread.join();
     internal_transport_thread.join();

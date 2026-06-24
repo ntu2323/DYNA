@@ -11,7 +11,14 @@ from typing import Dict, List, Optional, Tuple
 NUM_RECEIVERS = 3
 
 # Bracket trick: avoid pkill -f matching the ssh remote command line (contains "bench/replica").
-PKILL_REPLICA = "pkill -f '[b]ench/replica' 2>/dev/null || true"
+PKILL_REPLICA = (
+    "pkill -f '[b]ench/replica' 2>/dev/null || true; "
+    "for _ in 1 2 3 4 5; do "
+    "pgrep -f '[b]ench/replica' >/dev/null || break; "
+    "sleep 1; "
+    "pkill -9 -f '[b]ench/replica' 2>/dev/null || true; "
+    "done"
+)
 PKILL_CLIENT = "pkill -f '[b]ench/client' 2>/dev/null || true"
 PGREP_CLIENT = "pgrep -f '[b]ench/client' >/dev/null"
 
@@ -81,6 +88,45 @@ def ssh_run(
         text=True,
         check=False,
     )
+
+
+def ionia_replica_ready_marker(replica_idx: int, durability_threads: int) -> str:
+    return (
+        f"IONIA_REPLICA_READY durability_threads={durability_threads} "
+        f"replica_index={replica_idx}"
+    )
+
+
+def wait_ionia_replica_ready(
+    role: str,
+    host: str,
+    replica_idx: int,
+    durability_threads: int,
+    ssh_user: str,
+    ssh_key: Optional[str],
+    timeout_sec: int,
+) -> tuple[str, bool, str]:
+    """Poll replica log until IONIA_REPLICA_READY or timeout / process exit."""
+    marker = ionia_replica_ready_marker(replica_idx, durability_threads)
+    log_path = f"~/bench/replica-{replica_idx}.log"
+    cmd = (
+        f"for i in $(seq 1 {timeout_sec}); do "
+        f"grep -Fq '{marker}' {log_path} 2>/dev/null && exit 0; "
+        f"pgrep -f '[b]ench/replica' >/dev/null || "
+        f"{{ echo 'replica process exited before ready'; exit 2; }}; "
+        f"sleep 1; done; "
+        f"echo 'timeout waiting for {marker}'; exit 1"
+    )
+    r = ssh_run(host, ssh_user, ssh_key, cmd)
+    ok = r.returncode == 0
+    err_parts = []
+    if (r.stderr or "").strip():
+        err_parts.append(r.stderr.strip())
+    if (r.stdout or "").strip():
+        err_parts.append(r.stdout.strip())
+    if not err_parts:
+        err_parts.append(f"ssh exit {r.returncode}")
+    return role, ok, ": ".join(err_parts)
 
 
 def scp_from_remote(
