@@ -98,6 +98,21 @@ def scp_from_remote(
     subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
+def scp_to_remote(
+    host: str,
+    ssh_user: str,
+    ssh_key: Optional[str],
+    local_path: str,
+    remote_path: str,
+) -> None:
+    """remote_path must use ~/... (scp does not expand $HOME on the remote)."""
+    cmd = ["scp", *ssh_common_opts()]
+    if ssh_key:
+        cmd.extend(["-i", ssh_key])
+    cmd.extend([local_path, f"{ssh_user}@{host}:{remote_path}"])
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+
+
 def fetch_remote_file(
     host: str,
     ssh_user: str,

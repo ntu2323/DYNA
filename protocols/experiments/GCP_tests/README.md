@@ -1,3 +1,11 @@
+
+# Deploy + configure PTP (installs ~/clock_sync.sh on each VM)
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \
+  python3 sync_cluster_clocks.py --hosts-file cluster_hosts.json
+
+# On a VM: sudo ~/clock_sync.sh status | master | follower | stop
+
+
 # GCP bench cluster (VR & DYNA)
 
 3 receivers + 1+ senders. Commands run from this directory.
