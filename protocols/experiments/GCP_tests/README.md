@@ -2,7 +2,7 @@
 
 3 receivers + 1+ senders. Commands run from this directory.
 
-**Prereqs:** `pip install -r requirements-deploy.txt`, `secrets/gcp_secrets.py` (GCP service account + GitHub deploy key for [ntu2323/IONIA](https://github.com/ntu2323/IONIA)), firewall **UDP 31880** between VMs.
+**Prereqs:** `pip install -r requirements-deploy.txt`, `secrets/gcp_secrets.py` (GCP service account + GitHub deploy key for [ntu2323/IONIA](https://github.com/ntu2323/IONIA)), firewall **UDP 31880** and **UDP 31850** between VMs (IONIA internal + client-facing durability).
 
 ```bash
 export SSH_USER=nathan
@@ -112,6 +112,8 @@ SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.p
 
 
 # IONIA (ionia -m vr, UDP FastTransport) — open-loop.
+# Default: 15 durability threads per replica (bench/replica -j 15, SharedUDPPort).
+# Rollback: --ionia-durability-threads 1 or IONIA_DURABILITY_THREADS=1
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol ionia --hosts-file cluster_hosts.json \
   -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
@@ -151,6 +153,7 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--auto-max-inflight` | `-F ≈ offered × --expected-rtt-sec × --inflight-factor` (for high-throughput latency) |
 | `--expected-rtt-sec` | Planning RTT for auto inflight (default `0.35` WAN) |
 | `--high-throughput-latency` | Enables `--auto-max-inflight`; you set offered rate (`-G` or `--poisson-rate`) |
+| `--ionia-durability-threads` | IONIA only: `bench/replica -j` per replica (default **15**; rollback: `1`) |
 
 ### WAN open-loop (VR or DYNA)
 

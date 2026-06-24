@@ -38,6 +38,10 @@ from gcp_bench_common import (
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# IONIA bench/replica -j (durability threads). Override: IONIA_DURABILITY_THREADS=1 or
+# run_cluster_bench.py --ionia-durability-threads N
+IONIA_DEFAULT_DURABILITY_THREADS = int(os.environ.get("IONIA_DURABILITY_THREADS", "15"))
+
 PROTOCOLS = {
     "vr": {
         "replica_start": "~/bench/start_paxos_vr_replica.sh {idx}",
@@ -212,6 +216,13 @@ def _dyna_replica_env_prefix(*, wal_tmpfs: bool, eager_fast_reply: bool) -> str:
     return "; ".join(parts) + "; "
 
 
+def _ionia_replica_env_prefix(durability_threads: int) -> str:
+    parts = [f"export IONIA_DURABILITY_THREADS={durability_threads}"]
+    if durability_threads > 1:
+        parts.append("ulimit -n 65536 2>/dev/null || true")
+    return "; ".join(parts) + "; "
+
+
 def _start_replica(
     role: str,
     host: str,
@@ -222,6 +233,7 @@ def _start_replica(
     clean_remote: bool,
     wal_tmpfs: bool,
     eager_fast_reply: bool,
+    ionia_durability_threads: int,
 ) -> tuple[str, bool, str]:
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
@@ -243,6 +255,8 @@ def _start_replica(
             _dyna_replica_env_prefix(wal_tmpfs=wal_tmpfs, eager_fast_reply=eager_fast_reply)
             + replica_start
         )
+    elif protocol == "ionia":
+        parts.append(_ionia_replica_env_prefix(ionia_durability_threads) + replica_start)
     else:
         parts.append(replica_start)
     cmd = "; ".join(parts)
@@ -396,7 +410,13 @@ def main() -> None:
     ap.add_argument("-w", "--warmup-sec", type=int, default=5)
     ap.add_argument("--interval-ms", type=int, default=1000, help="bench/client -i (throughput samples).")
     ap.add_argument("--trim-pad-sec", type=float, default=3.0, help="Stored in meta for aggregator.")
-    ap.add_argument("-j", "--threads", type=int, default=1, help="VR: -t threads; DYNA: -j threads per sender.")
+    ap.add_argument("-j", "--threads", type=int, default=1, help="Client threads per sender (bench/client -j).")
+    ap.add_argument(
+        "--ionia-durability-threads",
+        type=int,
+        default=IONIA_DEFAULT_DURABILITY_THREADS,
+        help="IONIA only: bench/replica -j durability threads per replica (default 15).",
+    )
     ap.add_argument(
         "--closed-loop",
         action="store_true",
@@ -568,6 +588,9 @@ def main() -> None:
         else None,
         "eager_fast_reply": eager_fast_reply if args.protocol == "dyna" else None,
         "threads": args.threads,
+        "ionia_durability_threads": (
+            args.ionia_durability_threads if args.protocol == "ionia" else None
+        ),
         "receivers": [{"role": r, "host": hosts[r], "index": receiver_index(r)} for r in receiver_roles],
         "senders": senders_meta,
         "t0_unix": None,
@@ -583,6 +606,10 @@ def main() -> None:
             print(
                 f"DYNA eager fast-reply: {'on' if eager_fast_reply else 'off (Nezha hold)'}"
             )
+        if args.protocol == "ionia":
+            print(
+                f"IONIA durability threads per replica: -j {args.ionia_durability_threads}"
+            )
         print(f"Starting {args.protocol} replicas on {len(receiver_roles)} hosts...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:
             futs = [
@@ -596,6 +623,7 @@ def main() -> None:
                     clean_remote=clean_remote,
                     wal_tmpfs=args.wal_tmpfs,
                     eager_fast_reply=eager_fast_reply,
+                    ionia_durability_threads=args.ionia_durability_threads,
                 )
                 for r in receiver_roles
             ]

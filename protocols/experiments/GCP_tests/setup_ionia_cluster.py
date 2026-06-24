@@ -47,8 +47,8 @@ NUM_RECEIVERS = 3
 # Keep in sync with remote/setup_ionia.sh REPLICA_PORT/CLIENT_PORT.
 REPLICA_PORT = 31880
 CLIENT_PORT = 31850
-# Durability threads (-j on bench/replica).
-DURABILITY_THREADS = int(os.environ.get("IONIA_DURABILITY_THREADS", "1"))
+# Durability threads (-j on bench/replica). Default matches CloudLab-class IONIA.
+DURABILITY_THREADS = int(os.environ.get("IONIA_DURABILITY_THREADS", "15"))
 
 
 def _load_gcp_secrets():
@@ -73,10 +73,13 @@ def _load_hosts_file(path: str) -> Tuple[Dict[str, str], Dict[str, str]]:
     return hosts, internal
 
 
-def _replica_config(ips: List[str], port: int) -> str:
+def _replica_config(ips: List[str], port: int, threads: int = 1) -> str:
     lines = ["f 1"]
     for ip in ips:
-        lines.append(f"replica {ip}:{port}")
+        if threads > 1:
+            lines.append(f"replica {ip}:{port}/{threads}")
+        else:
+            lines.append(f"replica {ip}:{port}")
     return "\n".join(lines) + "\n"
 
 
@@ -141,7 +144,7 @@ def main() -> None:
 
     receiver_ips = [receiver_internal[r] for r in receiver_roles]
     internal_config = _replica_config(receiver_ips, REPLICA_PORT)
-    client_config = _replica_config(receiver_ips, CLIENT_PORT)
+    client_config = _replica_config(receiver_ips, CLIENT_PORT, DURABILITY_THREADS)
     num_keys = int(os.environ.get("BENCH_TRACE_NUM_KEYS", bench_trace.DEFAULT_TRACE_NUM_KEYS))
     trace = bench_trace.trace_micro_bytes(bench_trace.build_write_trace_spec(num_keys))
     bundle_files = {

@@ -67,9 +67,12 @@ IDX="${1:?replica index 0|1|2}"
 export IONIA_DB_MODE="${IONIA_DB_MODE:-memory}"
 export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
 export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
-DUR_THREADS="${IONIA_DURABILITY_THREADS:-1}"
+DUR_THREADS="${IONIA_DURABILITY_THREADS:-15}"
 cd "${HOME}/Ionia/protocols/src/ionia"
 mkdir -p ~/bench
+if [[ "${DUR_THREADS}" -gt 1 ]]; then
+  ulimit -n 65536 2>/dev/null || true
+fi
 pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
 # -c ~/bench/ioniaconfig is the internal consensus config; the replica also reads
