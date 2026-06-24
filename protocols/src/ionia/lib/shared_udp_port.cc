@@ -250,11 +250,15 @@ SharedUDPPort::UnregisterEndpoint(uint8_t endpoint_id, TransportReceiver *receiv
 void
 SharedUDPPort::RunOnce()
 {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (evbase_ == nullptr) {
+    event_base *base = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        base = evbase_;
+    }
+    if (base == nullptr) {
         return;
     }
-    event_base_loop(evbase_, EVLOOP_ONCE | EVLOOP_NONBLOCK);
+    event_base_loop(base, EVLOOP_ONCE | EVLOOP_NONBLOCK);
 }
 
 void

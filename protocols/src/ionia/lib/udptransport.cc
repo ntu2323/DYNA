@@ -646,7 +646,9 @@ UDPTransport::Run()
 {
     if (shared_port_ != nullptr) {
         while (true) {
-            shared_port_->RunOnce();
+            if (endpoint_id_ == 0) {
+                shared_port_->RunOnce();
+            }
         }
     } else {
         event_base_dispatch(libeventBase);
@@ -657,7 +659,9 @@ void
 UDPTransport::RunOnce()
 {
     if (shared_port_ != nullptr) {
-        shared_port_->RunOnce();
+        if (endpoint_id_ == 0) {
+            shared_port_->RunOnce();
+        }
     } else {
         event_base_loop(libeventBase, EVLOOP_ONCE | EVLOOP_NONBLOCK);
     }

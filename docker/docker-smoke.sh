@@ -7,7 +7,11 @@ mkdir -p "${OUT_HOST}"
 
 IMG="${IONIA_UDP_IMAGE:-ionia-udp}"
 
-run_flags=(--rm --platform linux/amd64)
+run_flags=(--rm)
+case "$(uname -m)" in
+  arm64|aarch64) ;;
+  *) run_flags+=(--platform linux/amd64) ;;
+esac
 [[ -t 1 ]] && run_flags+=(-it)
 
 exec docker run "${run_flags[@]}" \
