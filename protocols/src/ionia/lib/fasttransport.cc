@@ -11,14 +11,50 @@
 
 #include "lib/assert.h"
 #include "lib/fasttransport_endpoint.h"
+#include "lib/fasttransport_routing.h"
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <ifaddrs.h>
 #include <net/if.h>
+#include <cstring>
 
+#include <algorithm>
 #include <string_view>
 #include <utility>
+
+namespace {
+
+int
+ReplicaIndexForDestination(const specpaxos::Configuration &config,
+                           const UDPTransportAddress &dst)
+{
+    for (int replica_idx = 0; replica_idx < config.n; ++replica_idx) {
+        const auto &rep = config.replica(0, replica_idx);
+        struct sockaddr_in expected{};
+        inet_pton(AF_INET, rep.host.c_str(), &(expected.sin_addr));
+        expected.sin_port =
+            htons(static_cast<uint16_t>(std::stoi(rep.port)));
+        if (std::memcmp(&expected, &dst.addr, sizeof(expected)) == 0) {
+            return replica_idx;
+        }
+    }
+    return -1;
+}
+
+int
+DurabilityEndpointsForDestination(const specpaxos::Configuration &config,
+                                  const UDPTransportAddress &dst,
+                                  int fallback_endpoints)
+{
+    const int replica_idx = ReplicaIndexForDestination(config, dst);
+    if (replica_idx < 0) {
+        return std::max(1, fallback_endpoints);
+    }
+    return std::max(1, config.replica(0, replica_idx).threads);
+}
+
+}  // namespace
 
 FastTransport::FastTransport(const specpaxos::Configuration &config,
                              int nthreads,
@@ -155,8 +191,16 @@ bool FastTransport::SendMessageInternal(TransportReceiver *src,
     if (!ionia_multithread_) {
         return udp_transport->SendMessage(src, dst, m);
     }
-    // Phase 1: no key-hash routing; all client requests use endpoint 0.
-    const auto meta = MakeFastTransportEndpointMeta(endpoint_id_, 0);
+
+    uint8_t dst_endpoint = 0;
+    const int num_endpoints =
+        DurabilityEndpointsForDestination(config, dst, nthreads_);
+    if (!FastTransportRouting::DurabilityEndpointForMessage(
+            m, num_endpoints, dst_endpoint)) {
+        dst_endpoint = 0;
+    }
+
+    const auto meta = MakeFastTransportEndpointMeta(endpoint_id_, dst_endpoint);
     return udp_transport->SendWithMeta(src, dst, m, &meta, sizeof(meta));
 }
 
