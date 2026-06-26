@@ -17,7 +17,6 @@
 #include <netinet/in.h>
 #include <ifaddrs.h>
 #include <net/if.h>
-#include <cstring>
 
 #include <algorithm>
 #include <string_view>
@@ -31,11 +30,10 @@ ReplicaIndexForDestination(const specpaxos::Configuration &config,
 {
     for (int replica_idx = 0; replica_idx < config.n; ++replica_idx) {
         const auto &rep = config.replica(0, replica_idx);
-        struct sockaddr_in expected{};
-        inet_pton(AF_INET, rep.host.c_str(), &(expected.sin_addr));
-        expected.sin_port =
-            htons(static_cast<uint16_t>(std::stoi(rep.port)));
-        if (std::memcmp(&expected, &dst.addr, sizeof(expected)) == 0) {
+        struct sockaddr_in sa{};
+        inet_pton(AF_INET, rep.host.c_str(), &(sa.sin_addr));
+        sa.sin_port = htons(static_cast<uint16_t>(std::stoi(rep.port)));
+        if (dst == UDPTransportAddress(sa)) {
             return replica_idx;
         }
     }

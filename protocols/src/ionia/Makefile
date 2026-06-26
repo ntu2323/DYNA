@@ -58,11 +58,15 @@ PARALLEL_HASHMAP_LDFLAGS :=
 CFLAGS += $(PARALLEL_HASHMAP_CFLAGS)
 LDFLAGS += $(PARALLEL_HASHMAP_LDFLAGS)
 
-JEMALLOC_CFLAGS := -L`jemalloc-config --libdir` -Wl,-rpath,`jemalloc-config --libdir` -ljemalloc `jemalloc-config --libs`
-JEMALLOC_LDFLAGS := 
+JEMALLOC_CONFIG := $(shell command -v jemalloc-config 2>/dev/null)
+ifneq ($(JEMALLOC_CONFIG),)
+JEMALLOC_CFLAGS := -L$(shell jemalloc-config --libdir) -Wl,-rpath,$(shell jemalloc-config --libdir) -ljemalloc $(shell jemalloc-config --libs)
+else
+JEMALLOC_CFLAGS :=
+$(warning jemalloc-config not found; building without jemalloc (install libjemalloc-dev))
+endif
 
 CFLAGS += $(JEMALLOC_CFLAGS)
-LDFLAGS += $(JEMALLOC_LDFLAGS)
 
 # Google test framework. This doesn't use pkgconfig
 GTEST_DIR := /usr/src/gtest
