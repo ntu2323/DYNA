@@ -55,6 +55,8 @@
 #include <csignal>
 #include <atomic>
 #include <chrono>
+#include <mutex>
+#include <optional>
 
 
 static void
@@ -348,13 +350,26 @@ main(int argc, char **argv)
     nullApp->SetNumDurabilityReplicas(ht_ct);
 
     std::atomic<uint32_t> durability_constructed{0};
+    std::mutex durability_register_mutex;
 
     auto server_thread_func = [&](specpaxos::Configuration config, uint8_t numa_node, uint8_t thread_id)
     {
         const uint8_t transport_id = thread_id;
         FastTransport client_transport(config, ht_ct, 1, physical_port, numa_node, transport_id, 0, 0, true);
 
-        auto durability_replica = specpaxos::vr::VRDurabilityReplica(config, index, !recover, &client_transport, batchSize, nullApp, internalConfig, &internal_transport, thread_id);
+        // All durability replicas share a single internalTransport whose
+        // TransportCommon registration tables (configurations/replicaGroups/...)
+        // are plain hash maps and are NOT thread-safe. The VRDurabilityReplica
+        // constructor is the only place a durability replica touches that shared
+        // transport (Register + SendMessageToReplica). Serialize construction so
+        // concurrent startups cannot rehash those maps out from under each other.
+        std::optional<specpaxos::vr::VRDurabilityReplica> durability_replica;
+        {
+            std::lock_guard<std::mutex> register_lock(durability_register_mutex);
+            durability_replica.emplace(config, index, !recover, &client_transport,
+                                       batchSize, nullApp, internalConfig,
+                                       &internal_transport, thread_id);
+        }
         (void)durability_replica;
         durability_constructed.fetch_add(1, std::memory_order_release);
 
