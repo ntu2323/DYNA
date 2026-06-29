@@ -38,12 +38,85 @@
 #include "lib/transport.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <cstring>
 #include <random>
+#include <string>
+#include <thread>
 
 #define RDebug(fmt, ...) Debug2("[%d] " fmt, this->replicaIdx, ##__VA_ARGS__)
 #define RNotice(fmt, ...) Notice("[%d] " fmt, this->replicaIdx, ##__VA_ARGS__)
 #define RWarning(fmt, ...) Warning("[%d] " fmt, this->replicaIdx, ##__VA_ARGS__)
 #define RPanic(fmt, ...) Panic("[%d] " fmt, this->replicaIdx, ##__VA_ARGS__)
+
+namespace {
+
+// IONIA_LEADER_STATS: per-OS-thread inbound request counters.
+// Counting by the *actual* thread that runs HandleRequest (not the logical
+// endpoint/threadIndex) is what exposes whether processing is serialized onto a
+// single pump thread (legacy shared-port mode) or spread (per-thread-socket).
+constexpr std::size_t kMaxStatSlots = 256;
+std::array<std::atomic<uint64_t>, kMaxStatSlots> g_inbound_by_os_thread{};
+std::atomic<int> g_os_slot_alloc{0};
+std::atomic<bool> g_stats_started{false};
+
+bool LeaderStatsEnabled()
+{
+    static const bool enabled = []() {
+        const char *v = std::getenv("IONIA_LEADER_STATS");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+int OsThreadSlot()
+{
+    static thread_local int slot = -1;
+    if (slot < 0) {
+        slot = g_os_slot_alloc.fetch_add(1, std::memory_order_relaxed);
+        if (slot >= static_cast<int>(kMaxStatSlots)) {
+            slot = static_cast<int>(kMaxStatSlots) - 1;
+        }
+    }
+    return slot;
+}
+
+void MaybeStartStatsPrinter()
+{
+    bool expected = false;
+    if (!g_stats_started.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    std::thread([]() {
+        std::array<uint64_t, kMaxStatSlots> last{};
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            uint64_t total = 0;
+            int active_threads = 0;
+            std::string line;
+            for (std::size_t i = 0; i < kMaxStatSlots; i++) {
+                const uint64_t cur =
+                    g_inbound_by_os_thread[i].load(std::memory_order_relaxed);
+                const uint64_t delta = cur - last[i];
+                last[i] = cur;
+                if (delta > 0) {
+                    line += " os_thr" + std::to_string(i) + "=" +
+                            std::to_string(delta);
+                    total += delta;
+                    active_threads++;
+                }
+            }
+            Notice("IONIA_LEADER_STATS inbound/s total=%lu active_os_threads=%d%s",
+                   static_cast<unsigned long>(total), active_threads,
+                   line.c_str());
+        }
+    }).detach();
+}
+
+}  // namespace
 
 namespace specpaxos {
 namespace vr {
@@ -62,6 +135,10 @@ VRDurabilityReplica:: VRDurabilityReplica(Configuration clientConfig, int myIdx,
     this->batchSize = batchSize;
 
     app->RegisterDurabilityThread();
+
+    if (LeaderStatsEnabled()) {
+        MaybeStartStatsPrinter();
+    }
 
     internalTransport->Register(this, internalConfig, -1, -1);
 
@@ -204,6 +281,11 @@ VRDurabilityReplica::HandleStatusUpdate(const TransportAddress &remote,
 
 void VRDurabilityReplica::HandleRequest(const TransportAddress &remote,
 		const RequestMessage &msg) {
+
+	if (LeaderStatsEnabled()) {
+		g_inbound_by_os_thread[OsThreadSlot()].fetch_add(
+			1, std::memory_order_relaxed);
+	}
 
 	if (status != STATUS_NORMAL) {
 		RNotice("Ignoring request due to abnormal status");

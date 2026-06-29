@@ -100,10 +100,6 @@ private:
     // Auxiliary to durability log
     ThreadSafeMap<CXID, uint64_t> cxidDurIndexMap;
 
-    // Auxiliary to durability log
-    ThreadSafeMap<std::string, uint64_t> keyInDurabilityLog;
-    ConcurrentHashMap<std::string, uint64_t> keyToDurIndex;
-
     // The lastUpdateToKey is a supporting index structure
     // It facilitates a quick way of seeing what is the latest update to a key that is being read.
     ThreadSafeMap<string, CopyableAtomic<uint64_t>> lastUpdateToKey;

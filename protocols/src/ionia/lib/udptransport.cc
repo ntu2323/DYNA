@@ -46,6 +46,7 @@
 #include <event2/thread.h>
 
 #include <random>
+#include <thread>
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -646,9 +647,14 @@ void
 UDPTransport::Run()
 {
     if (shared_port_ != nullptr) {
+        // In per-thread-socket mode every thread owns and pumps its own socket;
+        // otherwise only endpoint 0 pumps the single shared socket.
+        const bool pump = shared_port_->PerThread() || (endpoint_id_ == 0);
         while (true) {
-            if (endpoint_id_ == 0) {
+            if (pump) {
                 shared_port_->RunOnce();
+            } else {
+                std::this_thread::yield();
             }
         }
     } else {
@@ -660,7 +666,7 @@ void
 UDPTransport::RunOnce()
 {
     if (shared_port_ != nullptr) {
-        if (endpoint_id_ == 0) {
+        if (shared_port_->PerThread() || endpoint_id_ == 0) {
             shared_port_->RunOnce();
         }
     } else {

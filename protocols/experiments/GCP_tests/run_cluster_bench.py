@@ -259,8 +259,17 @@ def _dyna_replica_env_prefix(*, wal_tmpfs: bool, eager_fast_reply: bool) -> str:
     return "; ".join(parts) + "; "
 
 
-def _ionia_replica_env_prefix(durability_threads: int) -> str:
+def _ionia_replica_env_prefix(
+    durability_threads: int,
+    *,
+    per_thread_socket: bool = False,
+    leader_stats: bool = False,
+) -> str:
     parts = [f"export IONIA_DURABILITY_THREADS={durability_threads}"]
+    if per_thread_socket:
+        parts.append("export IONIA_PER_THREAD_SOCKET=1")
+    if leader_stats:
+        parts.append("export IONIA_LEADER_STATS=1")
     if durability_threads > 1:
         parts.append("ulimit -n 65536 2>/dev/null || true")
     return "; ".join(parts) + "; "
@@ -277,6 +286,8 @@ def _start_replica(
     wal_tmpfs: bool,
     eager_fast_reply: bool,
     ionia_durability_threads: int,
+    ionia_per_thread_socket: bool = False,
+    ionia_leader_stats: bool = False,
 ) -> tuple[str, bool, str]:
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
@@ -299,7 +310,14 @@ def _start_replica(
             + replica_start
         )
     elif protocol == "ionia":
-        parts.append(_ionia_replica_env_prefix(ionia_durability_threads) + replica_start)
+        parts.append(
+            _ionia_replica_env_prefix(
+                ionia_durability_threads,
+                per_thread_socket=ionia_per_thread_socket,
+                leader_stats=ionia_leader_stats,
+            )
+            + replica_start
+        )
     else:
         parts.append(replica_start)
     cmd = "; ".join(parts)
@@ -466,6 +484,19 @@ def main() -> None:
         help="IONIA only: IONIA_FAST_QUORUM=1 on clients (quorum=1, send writes to leader only).",
     )
     ap.add_argument(
+        "--ionia-per-thread-socket",
+        action="store_true",
+        help="IONIA only: IONIA_PER_THREAD_SOCKET=1 on replicas (each durability "
+        "thread gets its own SO_REUSEPORT socket + event loop instead of one "
+        "shared socket pumped by a single thread).",
+    )
+    ap.add_argument(
+        "--ionia-leader-stats",
+        action="store_true",
+        help="IONIA only: IONIA_LEADER_STATS=1 on replicas (log per-OS-thread "
+        "inbound request rate once per second to reveal pump-thread saturation).",
+    )
+    ap.add_argument(
         "--closed-loop",
         action="store_true",
         help="Closed-loop: send next request only after each completion (legacy bench).",
@@ -548,6 +579,10 @@ def main() -> None:
         sys.exit("--wal-tmpfs applies only to --protocol dyna")
     if args.ionia_fast_quorum and args.protocol != "ionia":
         sys.exit("--ionia-fast-quorum applies only to --protocol ionia")
+    if args.ionia_per_thread_socket and args.protocol != "ionia":
+        sys.exit("--ionia-per-thread-socket applies only to --protocol ionia")
+    if args.ionia_leader_stats and args.protocol != "ionia":
+        sys.exit("--ionia-leader-stats applies only to --protocol ionia")
     if args.wan_open_loop and args.closed_loop:
         sys.exit("--wan-open-loop requires open-loop (omit --closed-loop)")
     if args.high_throughput_latency and args.closed_loop:
@@ -651,6 +686,12 @@ def main() -> None:
         "ionia_fast_quorum": (
             args.ionia_fast_quorum if args.protocol == "ionia" else None
         ),
+        "ionia_per_thread_socket": (
+            args.ionia_per_thread_socket if args.protocol == "ionia" else None
+        ),
+        "ionia_leader_stats": (
+            args.ionia_leader_stats if args.protocol == "ionia" else None
+        ),
         "replica_wait_sec": args.replica_wait_sec,
         "ionia_replica_ready_timeout_sec": (
             _ionia_replica_ready_timeout_sec(
@@ -682,6 +723,16 @@ def main() -> None:
                 print(
                     "IONIA fast quorum: on (client quorum=1, writes to leader durability only)"
                 )
+            if args.ionia_per_thread_socket:
+                print(
+                    "IONIA per-thread socket: on (SO_REUSEPORT; each durability "
+                    "thread receives + processes independently)"
+                )
+            if args.ionia_leader_stats:
+                print(
+                    "IONIA leader stats: on (per-OS-thread inbound rate logged to "
+                    "replica logs once per second)"
+                )
         print(f"Starting {args.protocol} replicas on {len(receiver_roles)} hosts...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:
             futs = [
@@ -696,6 +747,8 @@ def main() -> None:
                     wal_tmpfs=args.wal_tmpfs,
                     eager_fast_reply=eager_fast_reply,
                     ionia_durability_threads=args.ionia_durability_threads,
+                    ionia_per_thread_socket=args.ionia_per_thread_socket,
+                    ionia_leader_stats=args.ionia_leader_stats,
                 )
                 for r in receiver_roles
             ]

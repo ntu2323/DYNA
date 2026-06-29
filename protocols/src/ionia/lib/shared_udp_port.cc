@@ -103,6 +103,16 @@ SharedUDPPort::SharedPortsEnabled()
     return std::strcmp(env, "0") != 0;
 }
 
+bool
+SharedUDPPort::PerThreadSocketEnabled()
+{
+    static const bool enabled = []() {
+        const char *env = std::getenv("IONIA_PER_THREAD_SOCKET");
+        return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+    }();
+    return enabled;
+}
+
 SharedUDPPort::PortKey
 SharedUDPPort::MakeKey(const std::string &host, const std::string &port)
 {
@@ -154,6 +164,20 @@ SharedUDPPort::EnsureBound()
         PWarning("SharedUDPPort: failed to set O_NONBLOCK");
     }
 
+    if (per_thread_) {
+        // Allow many sockets in this process to bind the same host:port; the
+        // kernel load-balances inbound datagrams across them by flow hash.
+        int one = 1;
+        if (setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) < 0) {
+            PWarning("SharedUDPPort: failed to set SO_REUSEADDR");
+        }
+#ifdef SO_REUSEPORT
+        if (setsockopt(fd_, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one)) < 0) {
+            PWarning("SharedUDPPort: failed to set SO_REUSEPORT");
+        }
+#endif
+    }
+
     int n = 1;
     if (setsockopt(fd_, SOL_SOCKET, SO_BROADCAST, &n, sizeof(n)) < 0) {
         PWarning("SharedUDPPort: failed to set SO_BROADCAST");
@@ -187,6 +211,15 @@ SharedUDPPort::EnsureBound()
 SharedUDPPort *
 SharedUDPPort::Acquire(const std::string &host, const std::string &port, int dscp)
 {
+    if (PerThreadSocketEnabled()) {
+        // Private, non-shared instance per caller (one per durability thread).
+        auto *created = new SharedUDPPort(host, port, dscp);
+        created->per_thread_ = true;
+        created->EnsureBound();
+        created->refcnt_ = 1;
+        return created;
+    }
+
     const PortKey key = MakeKey(host, port);
     std::lock_guard<std::mutex> lock(registry_mutex_);
     auto it = registry_.find(key);
@@ -204,6 +237,12 @@ SharedUDPPort::Acquire(const std::string &host, const std::string &port, int dsc
 void
 SharedUDPPort::Release()
 {
+    if (per_thread_) {
+        // Not registered in the shared registry; owned solely by the caller.
+        delete this;
+        return;
+    }
+
     std::lock_guard<std::mutex> lock(registry_mutex_);
     const PortKey key = MakeKey(host_, port_str_);
     auto it = registry_.find(key);
@@ -312,14 +351,23 @@ SharedUDPPort::DeliverMessage(uint8_t endpoint_id,
     TransportReceiver *receiver = nullptr;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = endpoints_.find(endpoint_id);
-        if (it != endpoints_.end()) {
-            receiver = it->second.receiver;
-        }
-        if (receiver == nullptr) {
-            auto fallback = endpoints_.find(0);
-            if (fallback != endpoints_.end()) {
-                receiver = fallback->second.receiver;
+        if (per_thread_) {
+            // Exactly one receiver is registered on this private socket. The
+            // kernel already load-balanced this flow to us, so deliver locally
+            // regardless of the routing hint in the packet meta.
+            if (!endpoints_.empty()) {
+                receiver = endpoints_.begin()->second.receiver;
+            }
+        } else {
+            auto it = endpoints_.find(endpoint_id);
+            if (it != endpoints_.end()) {
+                receiver = it->second.receiver;
+            }
+            if (receiver == nullptr) {
+                auto fallback = endpoints_.find(0);
+                if (fallback != endpoints_.end()) {
+                    receiver = fallback->second.receiver;
+                }
             }
         }
     }

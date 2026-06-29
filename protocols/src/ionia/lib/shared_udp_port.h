@@ -25,6 +25,11 @@ class SharedUDPPort {
 public:
     static bool SharedPortsEnabled();
 
+    // When IONIA_PER_THREAD_SOCKET is set, each Acquire() returns a private
+    // instance bound with SO_REUSEPORT instead of a shared singleton, so every
+    // durability thread receives and processes on its own socket + event loop.
+    static bool PerThreadSocketEnabled();
+
     static SharedUDPPort *Acquire(const std::string &host,
                                   const std::string &port,
                                   int dscp);
@@ -32,6 +37,7 @@ public:
 
     event_base *EventBase() const { return evbase_; }
     int Fd() const { return fd_; }
+    bool PerThread() const { return per_thread_; }
 
     void RegisterEndpoint(uint8_t endpoint_id, TransportReceiver *receiver);
     void UnregisterEndpoint(uint8_t endpoint_id, TransportReceiver *receiver);
@@ -82,6 +88,7 @@ private:
     std::map<uint8_t, EndpointEntry> endpoints_;
     std::mutex mutex_;
     int refcnt_;
+    bool per_thread_ = false;
 
     struct FragInfo {
         uint64_t msgId = 0;
