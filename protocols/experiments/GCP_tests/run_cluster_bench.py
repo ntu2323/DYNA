@@ -154,6 +154,7 @@ def _build_client_cmd(
     poisson_rate: int,
     offered_ops_per_sec: float,
     max_inflight: int,
+    ionia_fast_quorum: bool = False,
 ) -> str:
     run_dir = _remote_run_dir(run_id)
     cfg = PROTOCOLS[protocol]
@@ -232,9 +233,12 @@ def _build_client_cmd(
             "export DYNA_CLIENT_STATS_LOG_EVERY=${DYNA_CLIENT_STATS_LOG_EVERY:-10000}; "
             "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
         )
+    ionia_env = ""
+    if protocol == "ionia" and ionia_fast_quorum:
+        ionia_env = "export IONIA_FAST_QUORUM=1; "
     # Background subshell: SSH returns immediately; client writes done when finished.
     client_run = (
-        f"{dyna_env}{cfg['client_bin']} {quoted} "
+        f"{dyna_env}{ionia_env}{cfg['client_bin']} {quoted} "
         f"> {run_dir}/client.log 2>&1; "
         f"echo $? > {run_dir}/exit_code; "
         f"touch {run_dir}/done"
@@ -457,6 +461,11 @@ def main() -> None:
         help="IONIA only: bench/replica -j durability threads per replica (default 15).",
     )
     ap.add_argument(
+        "--ionia-fast-quorum",
+        action="store_true",
+        help="IONIA only: IONIA_FAST_QUORUM=1 on clients (quorum=1, send writes to leader only).",
+    )
+    ap.add_argument(
         "--closed-loop",
         action="store_true",
         help="Closed-loop: send next request only after each completion (legacy bench).",
@@ -537,6 +546,8 @@ def main() -> None:
         sys.exit("Set --ssh-user or SSH_USER")
     if args.wal_tmpfs and args.protocol != "dyna":
         sys.exit("--wal-tmpfs applies only to --protocol dyna")
+    if args.ionia_fast_quorum and args.protocol != "ionia":
+        sys.exit("--ionia-fast-quorum applies only to --protocol ionia")
     if args.wan_open_loop and args.closed_loop:
         sys.exit("--wan-open-loop requires open-loop (omit --closed-loop)")
     if args.high_throughput_latency and args.closed_loop:
@@ -591,6 +602,7 @@ def main() -> None:
         "poisson_rate": args.poisson_rate,
         "offered_ops_per_sec": offered_ops_per_sec,
         "max_inflight": max_inflight,
+        "ionia_fast_quorum": args.ionia_fast_quorum if args.protocol == "ionia" else False,
     }
 
     senders_meta = [
@@ -636,6 +648,9 @@ def main() -> None:
         "ionia_durability_threads": (
             args.ionia_durability_threads if args.protocol == "ionia" else None
         ),
+        "ionia_fast_quorum": (
+            args.ionia_fast_quorum if args.protocol == "ionia" else None
+        ),
         "replica_wait_sec": args.replica_wait_sec,
         "ionia_replica_ready_timeout_sec": (
             _ionia_replica_ready_timeout_sec(
@@ -663,6 +678,10 @@ def main() -> None:
             print(
                 f"IONIA durability threads per replica: -j {args.ionia_durability_threads}"
             )
+            if args.ionia_fast_quorum:
+                print(
+                    "IONIA fast quorum: on (client quorum=1, writes to leader durability only)"
+                )
         print(f"Starting {args.protocol} replicas on {len(receiver_roles)} hosts...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:
             futs = [

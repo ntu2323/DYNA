@@ -41,8 +41,26 @@
 #include "vr/client.h"
 #include "vr/vr-proto.pb.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <cstring>
+
 namespace specpaxos {
 namespace vr {
+
+namespace {
+
+bool
+IoniaFastQuorumEnabled()
+{
+    static const bool enabled = []() {
+        const char *v = std::getenv("IONIA_FAST_QUORUM");
+        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    return enabled;
+}
+
+}  // namespace
 
 VRClient::VRClient(const Configuration &config,
                    Transport *transport,
@@ -85,6 +103,15 @@ VRClient::Invoke(const string &request,
         Panic("Client only supports one pending request");
     }
 
+    const bool fast_quorum = IoniaFastQuorumEnabled();
+    if (fast_quorum) {
+        static std::atomic<bool> logged{false};
+        if (!logged.exchange(true, std::memory_order_relaxed)) {
+            Notice("IONIA_FAST_QUORUM=1: bench writes use quorum=1 and "
+                   "SendMessageToReplica(leader)");
+        }
+    }
+
     quorum = config.FastQuorumSize();
     // Notice("Sending request %s", request.c_str());
     if(request.c_str()[0] == 'r' || request.c_str()[0] == 'R'
@@ -93,7 +120,7 @@ VRClient::Invoke(const string &request,
         quorum = 1;
     }
 
-    if (IMMEDIATE_WRITE_RESPOND)
+    if (IMMEDIATE_WRITE_RESPOND || fast_quorum)
     {
         // make writes and reads quorum 1
         quorum = 1;        
@@ -123,7 +150,7 @@ VRClient::Invoke(const string &request,
     }
     else
     {
-        if (IMMEDIATE_WRITE_RESPOND)
+        if (IMMEDIATE_WRITE_RESPOND || fast_quorum)
         {
             if (!(transport->SendMessageToReplica(this,
                                                 config.GetLeaderIndex(0),

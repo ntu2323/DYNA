@@ -93,6 +93,7 @@ NUM_OPS="${3:-100000}"
 EXPERIMENT_SECS="${4:-60}"
 WARMUP_SECS="${5:-5}"
 export BENCH_INFLIGHT_LOG="${BENCH_INFLIGHT_LOG:-1}"
+# Optional: export IONIA_FAST_QUORUM=1 for quorum-1 leader-only writes (bench triage).
 cd "${HOME}/Ionia/protocols/src/ionia"
 mkdir -p ~/bench
 pkill -f '[b]ench/client' 2>/dev/null || true

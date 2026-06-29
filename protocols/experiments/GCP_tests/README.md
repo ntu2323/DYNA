@@ -53,7 +53,7 @@ Protocols: **`vr`** = paxos/src NOPaxos VR baseline; **`dyna`** = ionia/src `-m 
 
 ```bash
 # VR (paxos baseline)
-SSH_USER=$SSH_USER python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
 
 # DYNA (after VR or instead of VR — not in parallel)
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
@@ -129,6 +129,9 @@ SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py 
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
   --wal-tmpfs -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
+
 # Tune offered load (rate = mean reqs per 10ms; ~rate×100 ops/s per sender)
 SSH_USER=$SSH_USER python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
   --poisson-rate 100 -e 90 -w 5 --interval-ms 1000
@@ -162,6 +165,7 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--expected-rtt-sec` | Planning RTT for auto inflight (default `0.35` WAN) |
 | `--high-throughput-latency` | Enables `--auto-max-inflight`; you set offered rate (`-G` or `--poisson-rate`) |
 | `--ionia-durability-threads` | IONIA only: `bench/replica -j` per replica (default **15**; rollback: `1`) |
+| `--ionia-fast-quorum` | IONIA only: `IONIA_FAST_QUORUM=1` on clients — quorum **1**, writes to **leader** durability only (lower latency / less fan-out than default quorum-3) |
 
 ### WAN open-loop (VR or DYNA)
 
