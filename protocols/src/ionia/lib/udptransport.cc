@@ -650,9 +650,17 @@ UDPTransport::Run()
         // In per-thread-socket mode every thread owns and pumps its own socket;
         // otherwise only endpoint 0 pumps the single shared socket.
         const bool pump = shared_port_->PerThread() || (endpoint_id_ == 0);
+        const bool busy = SharedUDPPort::BusyPollEnabled();
         while (true) {
             if (pump) {
-                shared_port_->RunOnce();
+                if (busy) {
+                    shared_port_->RunOnce();
+                } else {
+                    // Block in epoll instead of spinning: avoids burning a core
+                    // per pump thread, which oversubscribes the CPU and inflates
+                    // reply latency when threads > cores.
+                    shared_port_->RunBlockingOnce();
+                }
             } else {
                 std::this_thread::yield();
             }
