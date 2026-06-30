@@ -23,7 +23,6 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include <sys/time.h>
 #include <unistd.h>
 
 namespace {
@@ -299,35 +298,6 @@ SharedUDPPort::RunOnce()
         return;
     }
     event_base_loop(base, EVLOOP_ONCE | EVLOOP_NONBLOCK);
-}
-
-void
-SharedUDPPort::RunBlockingOnce()
-{
-    event_base *base = nullptr;
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        base = evbase_;
-    }
-    if (base == nullptr) {
-        return;
-    }
-    // Cap the block so a thread with no inbound traffic still wakes ~1ms to
-    // honor timers/shutdown; a real packet wakes epoll immediately (sub-us), so
-    // latency is unaffected while idle CPU drops from 100% to near zero.
-    struct timeval cap = {0, 1000};
-    event_base_loopexit(base, &cap);
-    event_base_loop(base, EVLOOP_ONCE);
-}
-
-bool
-SharedUDPPort::BusyPollEnabled()
-{
-    static const bool enabled = []() {
-        const char *v = std::getenv("IONIA_BUSY_POLL");
-        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
 }
 
 void

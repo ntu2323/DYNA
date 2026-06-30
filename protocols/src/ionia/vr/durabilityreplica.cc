@@ -63,16 +63,6 @@ std::array<std::atomic<uint64_t>, kMaxStatSlots> g_inbound_by_os_thread{};
 std::atomic<int> g_os_slot_alloc{0};
 std::atomic<bool> g_stats_started{false};
 
-// IONIA_LEADER_STATS service-time histogram: recv->reply time inside
-// HandleRequest (the leader's own processing cost). Comparing this against the
-// client-observed latency localizes the gap: if service time is tiny but the
-// client sees ~150us, the time is in transport/scheduling (e.g. a busy-spin pump
-// thread not getting a core); if service time is large, it is in AppUpcall.
-constexpr int kSvcBuckets = 32;  // log2 microseconds: bucket b => [2^b, 2^(b+1)) us
-std::array<std::atomic<uint64_t>, kSvcBuckets> g_svc_buckets{};
-std::atomic<uint64_t> g_svc_count{0};
-std::atomic<uint64_t> g_svc_sum_us{0};
-
 bool LeaderStatsEnabled()
 {
     static const bool enabled = []() {
@@ -80,22 +70,6 @@ bool LeaderStatsEnabled()
         return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
     }();
     return enabled;
-}
-
-inline uint64_t NowUs()
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-inline void RecordServiceUs(uint64_t us)
-{
-    int b = us == 0 ? 0 : 63 - __builtin_clzll(us);
-    if (b >= kSvcBuckets) b = kSvcBuckets - 1;
-    g_svc_buckets[b].fetch_add(1, std::memory_order_relaxed);
-    g_svc_count.fetch_add(1, std::memory_order_relaxed);
-    g_svc_sum_us.fetch_add(us, std::memory_order_relaxed);
 }
 
 int OsThreadSlot()
@@ -118,8 +92,6 @@ void MaybeStartStatsPrinter()
     }
     std::thread([]() {
         std::array<uint64_t, kMaxStatSlots> last{};
-        std::array<uint64_t, kSvcBuckets> last_svc{};
-        uint64_t last_svc_count = 0, last_svc_sum = 0;
         while (true) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             uint64_t total = 0;
@@ -140,38 +112,6 @@ void MaybeStartStatsPrinter()
             Notice("IONIA_LEADER_STATS inbound/s total=%lu active_os_threads=%d%s",
                    static_cast<unsigned long>(total), active_threads,
                    line.c_str());
-
-            // Service-time (recv->reply) percentiles over the last second.
-            std::array<uint64_t, kSvcBuckets> dsvc{};
-            const uint64_t cur_count =
-                g_svc_count.load(std::memory_order_relaxed);
-            const uint64_t cur_sum =
-                g_svc_sum_us.load(std::memory_order_relaxed);
-            const uint64_t dcount = cur_count - last_svc_count;
-            const uint64_t dsum = cur_sum - last_svc_sum;
-            last_svc_count = cur_count;
-            last_svc_sum = cur_sum;
-            for (int b = 0; b < kSvcBuckets; b++) {
-                const uint64_t cur =
-                    g_svc_buckets[b].load(std::memory_order_relaxed);
-                dsvc[b] = cur - last_svc[b];
-                last_svc[b] = cur;
-            }
-            auto pctile = [&](double p) -> uint64_t {
-                if (dcount == 0) return 0;
-                const uint64_t target = static_cast<uint64_t>(p * dcount);
-                uint64_t cum = 0;
-                for (int b = 0; b < kSvcBuckets; b++) {
-                    cum += dsvc[b];
-                    if (cum >= target) return uint64_t{1} << b;
-                }
-                return uint64_t{1} << (kSvcBuckets - 1);
-            };
-            Notice("IONIA_LEADER_STATS svc_us n=%lu med~%lu p99~%lu avg=%lu",
-                   static_cast<unsigned long>(dcount),
-                   static_cast<unsigned long>(pctile(0.50)),
-                   static_cast<unsigned long>(pctile(0.99)),
-                   static_cast<unsigned long>(dcount ? dsum / dcount : 0));
         }
     }).detach();
 }
@@ -342,9 +282,7 @@ VRDurabilityReplica::HandleStatusUpdate(const TransportAddress &remote,
 void VRDurabilityReplica::HandleRequest(const TransportAddress &remote,
 		const RequestMessage &msg) {
 
-	const bool leaderStats = LeaderStatsEnabled();
-	const uint64_t svcStartUs = leaderStats ? NowUs() : 0;
-	if (leaderStats) {
+	if (LeaderStatsEnabled()) {
 		g_inbound_by_os_thread[OsThreadSlot()].fetch_add(
 			1, std::memory_order_relaxed);
 	}
@@ -558,7 +496,6 @@ void VRDurabilityReplica::HandleRequest(const TransportAddress &remote,
             reply.set_clientreqid(msg.req().clientreqid());
             reply.set_replicaidx(this->replicaIdx);
             transport->SendMessage(this, remote, reply);
-            if (leaderStats) RecordServiceUs(NowUs() - svcStartUs);
 		}
 
 		return;
@@ -571,7 +508,6 @@ void VRDurabilityReplica::HandleRequest(const TransportAddress &remote,
 		reply.set_clientreqid(msg.req().clientreqid());
 		reply.set_replicaidx(this->replicaIdx);
 		transport->SendMessage(this, remote, reply);
-		if (leaderStats) RecordServiceUs(NowUs() - svcStartUs);
 	}
 	
 	if (AmLeader()) {

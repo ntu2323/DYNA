@@ -41,14 +41,9 @@
 #include "vr/client.h"
 #include "vr/vr-proto.pb.h"
 
-#include <array>
 #include <atomic>
-#include <chrono>
-#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <string>
-#include <thread>
 
 namespace specpaxos {
 namespace vr {
@@ -65,129 +60,6 @@ IoniaFastQuorumEnabled()
     return enabled;
 }
 
-// IONIA_CLIENT_TIMING: split each completed write into
-//   leader  = leader-ack arrival - send
-//   quorum  = quorum-completing reply - send  (end-to-end)
-//   tail    = quorum - leader  (extra time waiting on the slowest follower)
-// A large `tail` means normal quorum is bound by the follower tail; a small
-// `tail` (quorum ~ leader) means it is bound by the leader itself.
-bool
-ClientTimingEnabled()
-{
-    static const bool enabled = []() {
-        const char *v = std::getenv("IONIA_CLIENT_TIMING");
-        return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
-}
-
-inline uint64_t
-NowUs()
-{
-    return std::chrono::duration_cast<std::chrono::microseconds>(
-               std::chrono::steady_clock::now().time_since_epoch())
-        .count();
-}
-
-constexpr int kTimingBuckets = 32;  // log2 microseconds: bucket b => [2^b, 2^(b+1)) us
-
-struct TimingHist
-{
-    std::array<std::atomic<uint64_t>, kTimingBuckets> buckets{};
-    std::atomic<uint64_t> count{0};
-    std::atomic<uint64_t> sum_us{0};
-};
-
-TimingHist g_leader_hist;
-TimingHist g_quorum_hist;
-TimingHist g_tail_hist;
-std::atomic<bool> g_timing_started{false};
-
-inline int
-TimingBucket(uint64_t us)
-{
-    if (us == 0) {
-        return 0;
-    }
-    int b = 63 - __builtin_clzll(us);
-    if (b >= kTimingBuckets) {
-        b = kTimingBuckets - 1;
-    }
-    return b;
-}
-
-inline void
-RecordTiming(TimingHist &h, uint64_t us)
-{
-    h.buckets[TimingBucket(us)].fetch_add(1, std::memory_order_relaxed);
-    h.count.fetch_add(1, std::memory_order_relaxed);
-    h.sum_us.fetch_add(us, std::memory_order_relaxed);
-}
-
-// Approximate percentile (lower edge of the bucket) from a delta snapshot.
-uint64_t
-PercentileFromDelta(const std::array<uint64_t, kTimingBuckets> &delta,
-                    uint64_t total, double pct)
-{
-    if (total == 0) {
-        return 0;
-    }
-    const uint64_t target = static_cast<uint64_t>(pct * total);
-    uint64_t cum = 0;
-    for (int b = 0; b < kTimingBuckets; b++) {
-        cum += delta[b];
-        if (cum >= target) {
-            return uint64_t{1} << b;  // lower edge, microseconds
-        }
-    }
-    return uint64_t{1} << (kTimingBuckets - 1);
-}
-
-void
-MaybeStartTimingPrinter()
-{
-    bool expected = false;
-    if (!g_timing_started.compare_exchange_strong(expected, true)) {
-        return;
-    }
-    std::thread([]() {
-        struct Snap {
-            std::array<uint64_t, kTimingBuckets> buckets{};
-            uint64_t count = 0;
-            uint64_t sum_us = 0;
-        };
-        Snap last_leader, last_quorum, last_tail;
-        auto snapshot = [](TimingHist &h, Snap &last, const char *label) {
-            std::array<uint64_t, kTimingBuckets> delta{};
-            uint64_t cur_count = h.count.load(std::memory_order_relaxed);
-            uint64_t cur_sum = h.sum_us.load(std::memory_order_relaxed);
-            uint64_t dcount = cur_count - last.count;
-            uint64_t dsum = cur_sum - last.sum_us;
-            for (int b = 0; b < kTimingBuckets; b++) {
-                uint64_t cur = h.buckets[b].load(std::memory_order_relaxed);
-                delta[b] = cur - last.buckets[b];
-                last.buckets[b] = cur;
-            }
-            last.count = cur_count;
-            last.sum_us = cur_sum;
-            const uint64_t med = PercentileFromDelta(delta, dcount, 0.50);
-            const uint64_t p99 = PercentileFromDelta(delta, dcount, 0.99);
-            const uint64_t avg = dcount ? dsum / dcount : 0;
-            Notice("IONIA_CLIENT_TIMING %-6s n=%lu med~%luus p99~%luus avg=%luus",
-                   label, static_cast<unsigned long>(dcount),
-                   static_cast<unsigned long>(med),
-                   static_cast<unsigned long>(p99),
-                   static_cast<unsigned long>(avg));
-        };
-        while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-            snapshot(g_leader_hist, last_leader, "leader");
-            snapshot(g_quorum_hist, last_quorum, "quorum");
-            snapshot(g_tail_hist, last_tail, "tail");
-        }
-    }).detach();
-}
-
 }  // namespace
 
 VRClient::VRClient(const Configuration &config,
@@ -199,10 +71,6 @@ VRClient::VRClient(const Configuration &config,
     pendingUnloggedRequest = NULL;
     lastReqId = 0;
     quorum = 0;
-
-    if (ClientTimingEnabled()) {
-        MaybeStartTimingPrinter();
-    }
 
     /*
     requestTimeout = new Timeout(transport, 7000, [this]() {
@@ -266,10 +134,6 @@ VRClient::Invoke(const string &request,
     auto& pending_request = pending_requests[reqId];
     pending_request.clientReqId = reqId;
     pending_request.continuation = std::move(continuation);
-    if (ClientTimingEnabled()) {
-        pending_request.t_send_us = NowUs();
-        pending_request.t_leader_us = 0;
-    }
 
     proto::RequestMessage request_message;
     request_message.mutable_req()->set_op(std::move(request));
@@ -385,9 +249,7 @@ VRClient::HandleReply(const TransportAddress &remote,
     // proxy to check whether the responses are from the same view.
     assert(msg.view() == 0); 
 
-    const bool from_leader =
-        (uint64_t) config.GetLeaderIndex(msg.view()) == msg.replicaidx();
-    if (from_leader) {
+    if((uint64_t) config.GetLeaderIndex(msg.view()) == msg.replicaidx()) {
         leader_acked[clientreqid] = 1;
     }
 
@@ -398,33 +260,13 @@ VRClient::HandleReply(const TransportAddress &remote,
         return;
     }
 
-    const bool timing = ClientTimingEnabled();
-    if (timing && from_leader && pending_request.t_leader_us == 0) {
-        pending_request.t_leader_us = NowUs();
-    }
-
     Debug2("Client received reply");
 
     if(responses[clientreqid] >= quorum
         && leader_acked[clientreqid]) {
         //requestTimeout->Stop();
         //pending_request.continuation(pending_request.request, msg.reply());
-
-        if (timing && pending_request.t_send_us != 0) {
-            const uint64_t now = NowUs();
-            const uint64_t d_quorum = now - pending_request.t_send_us;
-            RecordTiming(g_quorum_hist, d_quorum);
-            if (pending_request.t_leader_us != 0) {
-                const uint64_t d_leader =
-                    pending_request.t_leader_us - pending_request.t_send_us;
-                RecordTiming(g_leader_hist, d_leader);
-                const uint64_t d_tail = now >= pending_request.t_leader_us
-                                            ? now - pending_request.t_leader_us
-                                            : 0;
-                RecordTiming(g_tail_hist, d_tail);
-            }
-        }
-
+        
         // return nothing since the client doesn't use the parameters anyways...
         pending_request.continuation("", "");
         responses.erase(clientreqid);

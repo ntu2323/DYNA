@@ -79,9 +79,6 @@ protected:
         uint64_t clientReqId;
         continuation_t continuation;
         timeout_continuation_t timeoutContinuation;
-        // IONIA_CLIENT_TIMING: per-request latency split (microseconds, steady clock).
-        uint64_t t_send_us = 0;
-        uint64_t t_leader_us = 0;
         // proto::RequestMessage request_message;
         inline PendingRequest() = default;
         inline PendingRequest(string request, uint64_t clientReqId,

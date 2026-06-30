@@ -155,7 +155,6 @@ def _build_client_cmd(
     offered_ops_per_sec: float,
     max_inflight: int,
     ionia_fast_quorum: bool = False,
-    ionia_client_timing: bool = False,
 ) -> str:
     run_dir = _remote_run_dir(run_id)
     cfg = PROTOCOLS[protocol]
@@ -237,8 +236,6 @@ def _build_client_cmd(
     ionia_env = ""
     if protocol == "ionia" and ionia_fast_quorum:
         ionia_env = "export IONIA_FAST_QUORUM=1; "
-    if protocol == "ionia" and ionia_client_timing:
-        ionia_env += "export IONIA_CLIENT_TIMING=1; "
     # Background subshell: SSH returns immediately; client writes done when finished.
     client_run = (
         f"{dyna_env}{ionia_env}{cfg['client_bin']} {quoted} "
@@ -500,13 +497,6 @@ def main() -> None:
         "inbound request rate once per second to reveal pump-thread saturation).",
     )
     ap.add_argument(
-        "--ionia-client-timing",
-        action="store_true",
-        help="IONIA only: IONIA_CLIENT_TIMING=1 on clients (log per-2s latency "
-        "split into leader-ack, quorum, and follower-tail components to reveal "
-        "whether normal quorum is leader- or tail-bound).",
-    )
-    ap.add_argument(
         "--closed-loop",
         action="store_true",
         help="Closed-loop: send next request only after each completion (legacy bench).",
@@ -593,8 +583,6 @@ def main() -> None:
         sys.exit("--ionia-per-thread-socket applies only to --protocol ionia")
     if args.ionia_leader_stats and args.protocol != "ionia":
         sys.exit("--ionia-leader-stats applies only to --protocol ionia")
-    if args.ionia_client_timing and args.protocol != "ionia":
-        sys.exit("--ionia-client-timing applies only to --protocol ionia")
     if args.wan_open_loop and args.closed_loop:
         sys.exit("--wan-open-loop requires open-loop (omit --closed-loop)")
     if args.high_throughput_latency and args.closed_loop:
@@ -650,7 +638,6 @@ def main() -> None:
         "offered_ops_per_sec": offered_ops_per_sec,
         "max_inflight": max_inflight,
         "ionia_fast_quorum": args.ionia_fast_quorum if args.protocol == "ionia" else False,
-        "ionia_client_timing": args.ionia_client_timing if args.protocol == "ionia" else False,
     }
 
     senders_meta = [
@@ -705,9 +692,6 @@ def main() -> None:
         "ionia_leader_stats": (
             args.ionia_leader_stats if args.protocol == "ionia" else None
         ),
-        "ionia_client_timing": (
-            args.ionia_client_timing if args.protocol == "ionia" else None
-        ),
         "replica_wait_sec": args.replica_wait_sec,
         "ionia_replica_ready_timeout_sec": (
             _ionia_replica_ready_timeout_sec(
@@ -748,11 +732,6 @@ def main() -> None:
                 print(
                     "IONIA leader stats: on (per-OS-thread inbound rate logged to "
                     "replica logs once per second)"
-                )
-            if args.ionia_client_timing:
-                print(
-                    "IONIA client timing: on (per-2s leader/quorum/tail latency "
-                    "split logged to client logs)"
                 )
         print(f"Starting {args.protocol} replicas on {len(receiver_roles)} hosts...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(receiver_roles)) as ex:

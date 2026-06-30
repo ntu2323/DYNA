@@ -43,14 +43,6 @@ public:
     void UnregisterEndpoint(uint8_t endpoint_id, TransportReceiver *receiver);
 
     void RunOnce();
-    // Blocking pump: sleeps in the event loop (epoll) until an event/timer
-    // fires or a short cap elapses, instead of returning immediately. The
-    // per-thread pump loop uses this so each thread does not burn a whole core
-    // spinning; busy-spinning every thread oversubscribes the CPU and adds tens
-    // to hundreds of microseconds of scheduling latency to replies.
-    void RunBlockingOnce();
-    // IONIA_BUSY_POLL=1 restores the old non-blocking spin pump (for A/B).
-    static bool BusyPollEnabled();
     void Stop();
 
 private:
