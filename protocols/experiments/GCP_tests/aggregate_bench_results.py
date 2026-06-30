@@ -40,7 +40,10 @@ class IntervalSample:
 def _parse_log(path: str, sender: str) -> Tuple[List[IntervalSample], Optional[Tuple[int, float]], Dict[str, int]]:
     intervals: List[IntervalSample] = []
     finish: Optional[Tuple[int, float]] = None
-    latencies: Dict[str, int] = {}
+    # One client process prints a latency summary PER benchmark thread (--threads),
+    # so collect every per-thread value and summarize, rather than letting the last
+    # line win (which silently reports a single arbitrary thread).
+    latency_lists: Dict[str, List[int]] = {}
 
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
@@ -57,9 +60,33 @@ def _parse_log(path: str, sender: str) -> Tuple[List[IntervalSample], Optional[T
             m = LATENCY_LINE_RE.search(line)
             if m:
                 key = m.group(1).lower().replace(" percentile", "")
-                latencies[key] = int(m.group(2))
+                latency_lists.setdefault(key, []).append(int(m.group(2)))
 
-    return intervals, finish, latencies
+    return intervals, finish, _summarize_thread_latencies(latency_lists)
+
+
+def _summarize_thread_latencies(latency_lists: Dict[str, List[int]]) -> Dict[str, int]:
+    """Collapse per-thread latency lines into per-sender stats.
+
+    For back-compat, `median`/`average`/`99th` remain scalars but are now the mean
+    across threads. Per-metric `<key>_min`/`<key>_max`/`<key>_threads` expose the
+    cross-thread spread so a bimodal per-flow distribution is visible instead of
+    being hidden behind one arbitrary thread's value.
+    """
+    out: Dict[str, int] = {}
+    thread_count = 0
+    for key, vals in latency_lists.items():
+        if not vals:
+            continue
+        thread_count = max(thread_count, len(vals))
+        svals = sorted(vals)
+        out[key] = sum(svals) // len(svals)
+        out[f"{key}_min"] = svals[0]
+        out[f"{key}_max"] = svals[-1]
+        out[f"{key}_threads"] = len(svals)
+    if thread_count:
+        out["thread_count"] = thread_count
+    return out
 
 
 def _parse_client_diagnostics(path: str) -> dict:
@@ -360,7 +387,14 @@ def _print_summary(summary: dict) -> None:
         avg = lats.get("average")
         p99 = lats.get("99th")
         if med is not None:
-            print(f"    {role}: median={med} avg={avg} p99={p99}")
+            nthreads = lats.get("thread_count", lats.get("median_threads", 1))
+            spread = ""
+            if nthreads and nthreads > 1:
+                spread = (
+                    f" [across {nthreads} threads: median min={lats.get('median_min')} "
+                    f"max={lats.get('median_max')}]"
+                )
+            print(f"    {role}: median={med} avg={avg} p99={p99}{spread}")
         else:
             print(f"    {role}: (no percentile lines in log)")
     cross = summary.get("latency_across_senders_ns") or {}
