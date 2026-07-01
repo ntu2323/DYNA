@@ -144,6 +144,72 @@ nohup ./bench/client \
 echo "Started DYNA client client_id=${CLIENT_ID} threads=${THREADS} pid=$!"
 EOF
   chmod +x ~/bench/run_dyna_client.sh
+
+  # --- dyna_new (rewritten DYNA, bench/replica -m dyna_new) --------------------
+  # Reuses the same binary, ~/bench/dynaconfig and ~/bench/trace.micro as dyna.
+  # No WAL / SplinterDB (InMemoryBackend); only deadline + resend env apply.
+  cat > ~/bench/start_dyna_new_replica.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: start_dyna_new_replica.sh <idx>
+IDX="${1:?replica index 0|1|2}"
+# dyna_new uses an in-memory backend; IONIA_DB_MODE is set for safety only.
+export IONIA_DB_MODE="${IONIA_DB_MODE:-memory}"
+# Deadline / OWD (deadline.h). Steady-state bound is OWD-driven; INITIAL_BOUND
+# only matters for the first few ops; MAX_OWD caps OWD spikes.
+export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
+export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
+export DYNA_OWD_PERCENTILE="${DYNA_OWD_PERCENTILE:-50}"
+export DYNA_OWD_WINDOW_LEN="${DYNA_OWD_WINDOW_LEN:-100}"
+cd "${HOME}/Ionia/protocols/src/ionia"
+pkill -f '[b]ench/replica' 2>/dev/null || true
+sleep 1
+nohup ./bench/replica -i "${IDX}" -j 1 -b 1 -c ~/bench/dynaconfig -m dyna_new \
+  > ~/bench/replica-"${IDX}".log 2>&1 &
+echo "Started dyna_new replica index=${IDX} pid=$!"
+EOF
+  chmod +x ~/bench/start_dyna_new_replica.sh
+
+  cat > ~/bench/run_dyna_new_client.sh << 'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+# Usage: ./run_dyna_new_client.sh <client_id> [threads] [poisson_rate] [experiment_secs] [warmup_secs]
+# Open-loop Poisson (~poisson_rate*100 offered ops/s per sender) over the shared
+# 1000-key trace.micro (bench picks a uniformly random key per request).
+CLIENT_ID="${1:-1}"
+THREADS="${2:-1}"
+POISSON_RATE="${3:-30}"
+EXPERIMENT_SECS="${4:-60}"
+WARMUP_SECS="${5:-5}"
+export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
+export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
+export DYNA_NEW_RESEND_TIMEOUT_MS="${DYNA_NEW_RESEND_TIMEOUT_MS:-20}"
+export BENCH_INFLIGHT_LOG="${BENCH_INFLIGHT_LOG:-1}"
+cd "${HOME}/Ionia/protocols/src/ionia"
+mkdir -p ~/bench
+pkill -f '[b]ench/client' 2>/dev/null || true
+sleep 1
+if [[ ! -f ~/bench/trace.micro ]]; then
+  echo "Missing ~/bench/trace.micro" >&2
+  exit 1
+fi
+nohup ./bench/client \
+  -s ~/bench/dynaconfig \
+  -c ~/bench/dynaconfig \
+  -m dyna_new \
+  -k ~/bench/trace.micro \
+  -O -R "${POISSON_RATE}" \
+  -n 0 \
+  -e "${EXPERIMENT_SECS}" \
+  -w "${WARMUP_SECS}" \
+  -t "${CLIENT_ID}" \
+  -j "${THREADS}" \
+  -i 1000 \
+  -l ~/bench/latencies \
+  > ~/bench/client-"${CLIENT_ID}".log 2>&1 &
+echo "Started dyna_new client client_id=${CLIENT_ID} threads=${THREADS} rate=${POISSON_RATE} pid=$!"
+EOF
+  chmod +x ~/bench/run_dyna_new_client.sh
 }
 
 install_apt_deps() {

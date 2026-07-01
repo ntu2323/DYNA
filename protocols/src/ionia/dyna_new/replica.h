@@ -9,6 +9,7 @@
 #include "dyna_new/deadline.h"
 #include "dyna_new/partition_orderer.h"
 #include "dyna_new/partition_state.h"
+#include "dyna_new/request_dedup.h"
 #include "dyna_new/storage_backend.h"
 #include "dyna_new/wall_clock.h"
 
@@ -60,6 +61,15 @@ private:
     // sampled on the transport thread and read on orderer release threads.
     std::mutex owd_mu_;
     ReplicaOwdEstimator owd_;
+
+    // At-most-once dedup (spec §1.6). One per partition — a ⟨client,req⟩ always
+    // routes to the same partition by key, so this needs no global lock. Written
+    // on the transport thread (OnReceive) and on release threads (OnReply).
+    struct PartitionDedup {
+        std::mutex mu;
+        RequestDedup dedup;
+    };
+    std::vector<std::unique_ptr<PartitionDedup>> dedup_;
 };
 
 } // namespace dyna_new

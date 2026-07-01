@@ -21,8 +21,10 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
     : Client(config, transport, clientid),
       num_partitions_(static_cast<uint32_t>(std::max(1, config.n))),
       write_quorum_(static_cast<size_t>(config.f + 1)),
+      resend_ms_(DeadlineConfig::EnvU64("DYNA_NEW_RESEND_TIMEOUT_MS", 20)),
       bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
+    if (resend_ms_ == 0) resend_ms_ = 1;
 }
 
 DynaNewClient::~DynaNewClient() {}
@@ -61,8 +63,6 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
 {
     ++last_req_id_;
     const uint64_t request_id = last_req_id_;
-    const uint64_t send_us = NowMicros();
-    const uint64_t deadline = send_us + bound_tracker_.bound_us();   // §2: curr + s + d
 
     const std::string key = KeyOf(request);
     const bool is_read = IsReadCommand(request);
@@ -74,24 +74,62 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         request,
         partition_id,
         request_id,
-        send_us,
+        /*send_us=*/0,
         is_read,
         std::move(continuation),
         CommitQuorum(leader_id, write_quorum_),
+        /*resend_timer=*/nullptr,
     };
-    pending_.emplace(request_id, std::move(pending));
+    auto res = pending_.emplace(request_id, std::move(pending));
+
+    // Arm the retransmission timer (spec §5): if the request has not committed by
+    // resend_ms_, resend it (fresh send_time + deadline, same request_id) so a
+    // dropped request/reply on best-effort UDP recovers.
+    res.first->second.resend_timer = std::make_unique<Timeout>(
+        transport, resend_ms_,
+        [this, request_id]() { OnResendTimeout(request_id); });
+    res.first->second.resend_timer->Start();
+
+    SendRequestProto(request_id);
+}
+
+void
+DynaNewClient::SendRequestProto(uint64_t request_id)
+{
+    auto it = pending_.find(request_id);
+    if (it == pending_.end()) {
+        return;
+    }
+    PendingRequest &p = it->second;
+
+    const uint64_t send_us = NowMicros();
+    const uint64_t deadline = send_us + bound_tracker_.bound_us();  // §2: curr + s + d
+    p.send_us = send_us;
 
     proto::Request req;
     req.set_client_id(clientid);
     req.set_request_id(request_id);
-    req.set_type(is_read ? proto::READ_ONLY : proto::BLIND_WRITE);
-    req.set_key(key);
-    req.set_command(ValueOf(request));
+    req.set_type(p.is_read ? proto::READ_ONLY : proto::BLIND_WRITE);
+    req.set_key(KeyOf(p.request));
+    req.set_command(ValueOf(p.request));
     req.set_send_time(send_us);
     req.set_deadline(deadline);
 
     if (!transport->SendMessageToAll(this, req)) {
         Warning("Failed to multicast dyna_new request");
+    }
+}
+
+void
+DynaNewClient::OnResendTimeout(uint64_t request_id)
+{
+    auto it = pending_.find(request_id);
+    if (it == pending_.end()) {
+        return;   // already committed and erased
+    }
+    SendRequestProto(request_id);
+    if (it->second.resend_timer) {
+        it->second.resend_timer->Reset();
     }
 }
 
@@ -149,6 +187,9 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         return;
     }
 
+    if (p.resend_timer) {
+        p.resend_timer->Stop();   // committed: stop retransmitting
+    }
     continuation_t cont = std::move(p.continuation);
     std::string result = p.is_read ? p.quorum.result() : std::string();
     pending_.erase(it);

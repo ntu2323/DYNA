@@ -216,7 +216,9 @@ def main() -> None:
     print(f"Remote setup log (each VM): {_REMOTE_LOG}")
     print("  Receivers: ~/bench/start_dyna_replica.sh <0|1|2>")
     print("  Senders:   ~/bench/run_dyna_client.sh <client_id> [threads] [ops] [secs]")
-    print(f"  Config:    ~/bench/dynaconfig (port {REPLICA_PORT}, internal IPs)")
+    print("  dyna_new:  ~/bench/start_dyna_new_replica.sh <0|1|2>  /  "
+          "~/bench/run_dyna_new_client.sh <client_id> [threads] [rate] [secs]")
+    print(f"  Config:    ~/bench/dynaconfig (port {REPLICA_PORT}, internal IPs) — shared by dyna & dyna_new")
     print("Open GCP firewall UDP", REPLICA_PORT, "between cluster VMs.")
 
 

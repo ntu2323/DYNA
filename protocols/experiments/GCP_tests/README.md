@@ -2,10 +2,6 @@
 # Deploy + configure PTP (installs ~/clock_sync.sh on each VM)
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \
   python3 sync_cluster_clocks.py --hosts-file cluster_hosts.json
-
-# On a VM: sudo ~/clock_sync.sh status | master | follower | stop
-
-
 # GCP bench cluster (VR & DYNA)
 
 3 receivers + 1+ senders. Commands run from this directory.
@@ -44,18 +40,14 @@ python3 create_cluster.py 4 --hosts-file cluster_hosts.json --spread-replica-zon
 ---
 
 ## 2. Setup VMs
-
-Run **one protocol at a time** (VR/DYNA use UDP port 31880; IONIA uses 31880 internal + 31850 client, matching the canonical IONIA CloudLab harness). First install on all VMs uses full deps; day-to-day use **`--skip-build`** after pushing to GitHub.
-
-Protocols: **`vr`** = paxos/src NOPaxos VR baseline; **`dyna`** = ionia/src `-m dyna`; **`ionia`** = ionia/src `-m vr` (VRReplica + VRDurabilityReplica — the IONIA system, *not* the `vr` baseline). `dyna` and `ionia` share the same `protocols/src/ionia` build.
-
 ### First time (full build)
 
 ```bash
 # VR (paxos baseline)
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
 
-# DYNA (after VR or instead of VR — not in parallel)
+# DYNA (after VR or instead of VR — not in parallel). Also installs the
+# dyna_new helpers (start_dyna_new_replica.sh / run_dyna_new_client.sh).
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
 
 # IONIA (ionia -m vr; two-config layout)
@@ -66,17 +58,12 @@ Optional: `IONIA_GIT_REF=my-branch` for a non-default branch. Local tree without
 
 ### After code changes (`--skip-build`)
 
-Skips apt, Folly, Splinter/RocksDB bootstrap. Still runs **`git pull`** (or uses rsync tree) and **`make bench/replica bench/client`** so edits like `replica.cc` are recompiled.
-
 ```bash
 # Push to GitHub first, then:
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json --skip-build
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --skip-build
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.py --hosts-file cluster_hosts.json --skip-build
 
-# Or rsync local Ionia without push:
-IONIA_REPO_ROOT=/path/to/Ionia SSH_USER=$SSH_USER python3 setup_dyna_cluster.py \
-  --hosts-file cluster_hosts.json --skip-build --rsync-from "$IONIA_REPO_ROOT"
 ```
 
 Logs: `~/paxos_vr_setup.log` / `~/dyna_setup.log` / `~/ionia_setup.log` on each VM. Success markers: `~/bench/.setup_paxos_done` / `.setup_dyna_done` / `.setup_ionia_done`.
@@ -166,6 +153,29 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--high-throughput-latency` | Enables `--auto-max-inflight`; you set offered rate (`-G` or `--poisson-rate`) |
 | `--ionia-durability-threads` | IONIA only: `bench/replica -j` per replica (default **15**; rollback: `1`) |
 | `--ionia-fast-quorum` | IONIA only: `IONIA_FAST_QUORUM=1` on clients — quorum **1**, writes to **leader** durability only (lower latency / less fan-out than default quorum-3) |
+
+### dyna_new (rewritten DYNA)
+
+`dyna_new` is the rewrite in `protocols/src/ionia/dyna_new/` (`bench/replica -m dyna_new`). It reuses the **same** ionia binary, `~/bench/dynaconfig`, and `~/bench/trace.micro` (1000 keys) as `dyna` — the bench picks a **uniformly random key per request**, so load spreads over the 1000-key space exactly like `dyna`. Differences: **InMemoryBackend** (no WAL, no SplinterDB/RocksDB — nothing to wipe between runs), client-side **retransmission** (`DYNA_NEW_RESEND_TIMEOUT_MS`, default 20ms) + at-most-once dedup, and it ignores the old-DYNA knobs (`DYNA_STATS`, `DYNA_EAGER_FAST_REPLY`, `DYNA_FAST_REPLY_SHARDS`, replication budgets, `--wal-tmpfs`).
+
+**Setup:** no separate command — `setup_dyna_cluster.py` also installs the `dyna_new` helpers. Deploy your local tree (which must contain the `dyna_new` code) via `--rsync-from` or push to GitHub first:
+
+```bash
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py \
+  --hosts-file cluster_hosts.json --rsync-from /path/to/Ionia
+```
+
+**Run (open-loop Poisson, same defaults as DYNA):**
+
+```bash
+SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna_new --hosts-file cluster_hosts.json \
+  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
+
+# Thread sweep
+SSH_USER=nathan python3 run_throughput_sweep.py --protocol dyna_new --threads 1 4 8 -e 120
+```
+
+**Manual (SSH):** receivers `~/bench/start_dyna_new_replica.sh <0|1|2>`; sender `~/bench/run_dyna_new_client.sh <client_id> [threads] [poisson-rate] [secs] [warmup]` (open-loop Poisson over `trace.micro`). Deadline env (`DYNA_INITIAL_BOUND_US`, `DYNA_MAX_OWD_US`, `DYNA_OWD_PERCENTILE`) applies to both replicas and senders, same as DYNA.
 
 ### WAN open-loop (VR or DYNA)
 

@@ -9,7 +9,8 @@ GTEST_SRCS += $(addprefix $(d), \
 		orderer_test.cc \
 		quorum_test.cc \
 		recon_test.cc \
-		commit_test.cc)
+		commit_test.cc \
+		dedup_flow_test.cc)
 
 $(d)dyna-new-types-test: $(o)types_test.o \
 	.obj/dyna_new/dyna-new-proto.o \
@@ -52,3 +53,9 @@ $(d)dyna-new-commit-test: $(o)commit_test.o \
 	$(GTEST_MAIN)
 
 TEST_BINS += $(d)dyna-new-commit-test
+
+$(d)dyna-new-dedup-flow-test: $(o)dedup_flow_test.o \
+	.obj/dyna_new/dyna-new-proto.o \
+	$(GTEST_MAIN)
+
+TEST_BINS += $(d)dyna-new-dedup-flow-test

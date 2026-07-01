@@ -54,6 +54,14 @@ PROTOCOLS = {
         "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
         "client_bin": "./bench/client",
     },
+    # dyna_new = the rewritten DYNA (bench/replica -m dyna_new). Same ionia binary,
+    # config (dynaconfig) and trace (trace.micro, 1000 keys) as dyna; only the -m
+    # flag, a smaller env set, and no WAL/SplinterDB (InMemoryBackend) differ.
+    "dyna_new": {
+        "replica_start": "~/bench/start_dyna_new_replica.sh {idx}",
+        "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
+        "client_bin": "./bench/client",
+    },
     # IONIA = ionia/vr (VRReplica + VRDurabilityReplica), distinct from the "vr"
     # baseline which is the paxos/src NOPaxos VR. Same ionia binary as dyna, but
     # launched with -m vr and a two-config setup (internal + .client).
@@ -205,10 +213,11 @@ def _build_client_cmd(
             if max_inflight > 0:
                 args.extend(["-F", str(max_inflight)])
     else:
+        # dyna and dyna_new: identical arg layout, single dynaconfig, shared trace.
         args = [
             "-s", "$HOME/bench/dynaconfig",
             "-c", "$HOME/bench/dynaconfig",
-            "-m", "dyna",
+            "-m", protocol,
             "-k", "$HOME/bench/trace.micro",
             "-n", str(num_ops),
             "-e", str(experiment_sec),
@@ -232,6 +241,16 @@ def _build_client_cmd(
         dyna_env = (
             "export DYNA_CLIENT_STATS=${DYNA_CLIENT_STATS:-1}; "
             "export DYNA_CLIENT_STATS_LOG_EVERY=${DYNA_CLIENT_STATS_LOG_EVERY:-10000}; "
+            "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
+        )
+    elif protocol == "dyna_new":
+        # dyna_new ignores DYNA_CLIENT_STATS (not implemented). It reads the shared
+        # deadline vars (deadline.h) plus its own retransmission timeout (spec §5).
+        # BENCH_INFLIGHT_LOG surfaces inflight/submitted on throughput lines.
+        dyna_env = (
+            "export DYNA_INITIAL_BOUND_US=${DYNA_INITIAL_BOUND_US:-50}; "
+            "export DYNA_MAX_OWD_US=${DYNA_MAX_OWD_US:-2000}; "
+            "export DYNA_NEW_RESEND_TIMEOUT_MS=${DYNA_NEW_RESEND_TIMEOUT_MS:-20}; "
             "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
         )
     ionia_env = ""

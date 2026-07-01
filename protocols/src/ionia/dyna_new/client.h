@@ -4,10 +4,12 @@
 #define _DYNA_NEW_CLIENT_H_
 
 #include "common/client.h"
+#include "lib/transport.h"
 #include "dyna_new/deadline.h"
 #include "dyna_new/commit_quorum.h"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -42,16 +44,24 @@ private:
         bool is_read = false;
         continuation_t continuation;
         CommitQuorum quorum;
+        // Retransmission timer (spec §5): fires if the request has not committed.
+        std::unique_ptr<Timeout> resend_timer;
     };
 
     uint64_t NowMicros() const;
     bool IsReadCommand(const std::string &request) const;
     std::string KeyOf(const std::string &request) const;
     std::string ValueOf(const std::string &request) const;
+    // (Re)build and multicast the request proto for a pending request, with a
+    // fresh send_time and recomputed deadline; keeps the same request_id.
+    void SendRequestProto(uint64_t request_id);
+    // Resend timer callback: resend + reschedule while the request is pending.
+    void OnResendTimeout(uint64_t request_id);
 
     uint64_t last_req_id_ = 0;
     uint32_t num_partitions_;
     size_t write_quorum_;
+    uint64_t resend_ms_;
     ClientBoundTracker bound_tracker_;
     std::unordered_map<uint64_t, PendingRequest> pending_;
 };

@@ -28,8 +28,10 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // partition's release loop.
     clocks_.reserve(numPartitions_);
     orderers_.reserve(numPartitions_);
+    dedup_.reserve(numPartitions_);
     for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
         clocks_.push_back(std::make_unique<RealClock>());
+        dedup_.push_back(std::make_unique<PartitionDedup>());
         const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
         auto role = is_leader ? PartitionOrderer::Role::kLeader
                               : PartitionOrderer::Role::kFollower;
@@ -79,16 +81,37 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
             return;
         }
 
-        // OWD sample (§2): one-way delay = receive_time - send_time.
+        const uint32_t pid = PartitionOf(req.key(), numPartitions_);
+        if (pid >= orderers_.size()) {
+            return;
+        }
+
+        // At-most-once dedup (spec §1.6/§6.1): a retried request (spec §5) that
+        // already released is answered from cache; one still in flight is dropped
+        // so the orderer never holds two entries for the same ⟨client,req⟩.
+        const ClientAndReqId key{req.client_id(), req.request_id()};
+        {
+            std::unique_lock<std::mutex> dlk(dedup_[pid]->mu);
+            switch (dedup_[pid]->dedup.OnReceive(key)) {
+            case RequestDedup::Decision::kResend: {
+                proto::Reply cached = *dedup_[pid]->dedup.CachedReply(key);
+                dlk.unlock();
+                transport->SendMessage(this, remote, cached);
+                return;
+            }
+            case RequestDedup::Decision::kDrop:
+                return;
+            case RequestDedup::Decision::kSubmit:
+                break;
+            }
+        }
+
+        // OWD sample (§2): one-way delay = receive_time - send_time. Only sampled
+        // for genuinely-new requests so retries don't skew the estimate.
         const uint64_t now = WallClockMicros();
         if (now > req.send_time()) {
             std::lock_guard<std::mutex> lk(owd_mu_);
             owd_.sample(req.client_id(), now - req.send_time());
-        }
-
-        const uint32_t pid = PartitionOf(req.key(), numPartitions_);
-        if (pid >= orderers_.size()) {
-            return;
         }
 
         LogEntry e;
@@ -280,6 +303,15 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     {
         std::lock_guard<std::mutex> lk(owd_mu_);
         reply.set_owd_estimate(owd_.estimate_us(e.client_id));
+    }
+
+    // Cache for at-most-once (spec §6.1): a later retry is answered from here.
+    // A corrected reply (§6.4) overwrites the speculative one. Also clears the
+    // in-flight mark set at receive time.
+    if (pid < dedup_.size()) {
+        const ClientAndReqId key{e.client_id, e.request_id};
+        std::lock_guard<std::mutex> dlk(dedup_[pid]->mu);
+        dedup_[pid]->dedup.OnReply(key, reply);
     }
 
     transport->SendMessage(this, *e.client_addr, reply);

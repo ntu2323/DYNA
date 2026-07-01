@@ -22,7 +22,7 @@ _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sweep client threads and aggregate throughput/latency.")
-    ap.add_argument("--protocol", choices=["vr", "dyna", "ionia"], required=True)
+    ap.add_argument("--protocol", choices=["vr", "dyna", "dyna_new", "ionia"], required=True)
     ap.add_argument("--hosts-file", default=os.path.join(_SCRIPT_DIR, "cluster_hosts.json"))
     ap.add_argument("--threads", type=int, nargs="+", default=[1, 2, 4, 8])
     ap.add_argument("-n", "--num-ops", type=int, default=0, help="0 = unlimited (open-loop default).")
