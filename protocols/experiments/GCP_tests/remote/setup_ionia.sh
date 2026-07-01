@@ -68,6 +68,10 @@ export IONIA_DB_MODE="${IONIA_DB_MODE:-memory}"
 export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
 export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
 DUR_THREADS="${IONIA_DURABILITY_THREADS:-15}"
+# Consensus batch size (bench/replica -b). -b 1 = no batching: every write does an
+# individual Prepare/Commit round on the single ordering thread, which back-pressures
+# the fast path and caps throughput. Raise for higher offered loads.
+BATCH_SIZE="${IONIA_BATCH_SIZE:-1}"
 cd "${HOME}/Ionia/protocols/src/ionia"
 mkdir -p ~/bench
 if [[ "${DUR_THREADS}" -gt 1 ]]; then
@@ -77,9 +81,9 @@ pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
 # -c ~/bench/ioniaconfig is the internal consensus config; the replica also reads
 # ~/bench/ioniaconfig.client (client-facing durability) by appending ".client".
-nohup ./bench/replica -i "${IDX}" -j "${DUR_THREADS}" -b 1 -c ~/bench/ioniaconfig -m vr \
+nohup ./bench/replica -i "${IDX}" -j "${DUR_THREADS}" -b "${BATCH_SIZE}" -c ~/bench/ioniaconfig -m vr \
   > ~/bench/replica-"${IDX}".log 2>&1 &
-echo "Started IONIA replica index=${IDX} durability_threads=${DUR_THREADS} pid=$!"
+echo "Started IONIA replica index=${IDX} durability_threads=${DUR_THREADS} batch_size=${BATCH_SIZE} pid=$!"
 EOF
   chmod +x ~/bench/start_ionia_replica.sh
 

@@ -39,7 +39,14 @@ class IntervalSample:
 
 def _parse_log(path: str, sender: str) -> Tuple[List[IntervalSample], Optional[Tuple[int, float]], Dict[str, int]]:
     intervals: List[IntervalSample] = []
-    finish: Optional[Tuple[int, float]] = None
+    # One client process prints a finish summary PER benchmark thread (--threads),
+    # so collect every per-thread finish line and aggregate (sum completed/submitted,
+    # max wall time) instead of letting the last line win (which silently reported a
+    # single thread's count as if it were the whole sender).
+    finish_completed = 0
+    finish_submitted = 0
+    finish_secs: List[float] = []
+    finish_threads = 0
     # One client process prints a latency summary PER benchmark thread (--threads),
     # so collect every per-thread value and summarize, rather than letting the last
     # line win (which silently reports a single arbitrary thread).
@@ -55,14 +62,28 @@ def _parse_log(path: str, sender: str) -> Tuple[List[IntervalSample], Optional[T
                 continue
             m = FINISH_LINE_RE.search(line)
             if m and "warm" not in line.lower():
-                finish = (int(m.group(1)), float(m.group(2)))
+                finish_completed += int(m.group(1))
+                finish_secs.append(float(m.group(2)))
+                if m.group(3) is not None:
+                    finish_submitted += int(m.group(3))
+                finish_threads += 1
                 continue
             m = LATENCY_LINE_RE.search(line)
             if m:
                 key = m.group(1).lower().replace(" percentile", "")
                 latency_lists.setdefault(key, []).append(int(m.group(2)))
 
-    return intervals, finish, _summarize_thread_latencies(latency_lists)
+    finish: Optional[Tuple[int, float]] = None
+    if finish_threads:
+        # Wall time is the longest-running thread (threads run concurrently, so the
+        # sender's elapsed time is the max, not the sum).
+        finish = (finish_completed, max(finish_secs))
+    summary = _summarize_thread_latencies(latency_lists)
+    summary["_finish_completed"] = finish_completed
+    summary["_finish_submitted"] = finish_submitted
+    summary["_finish_threads"] = finish_threads
+    summary["_finish_secs"] = int(max(finish_secs) * 1000) if finish_secs else 0
+    return intervals, finish, summary
 
 
 def _summarize_thread_latencies(latency_lists: Dict[str, List[int]]) -> Dict[str, int]:
@@ -312,6 +333,10 @@ def aggregate_run(run_dir: str, trim_pad_sec: Optional[float]) -> dict:
             continue
         intervals, finish, lats = _parse_log(log_path, role)
         all_intervals.extend(intervals)
+        completed = lats.pop("_finish_completed", 0)
+        submitted = lats.pop("_finish_submitted", 0)
+        finish_threads = lats.pop("_finish_threads", 0)
+        lats.pop("_finish_secs", 0)
         per_sender_latency[role] = lats
         if meta.get("protocol") == "dyna":
             diag = _parse_client_diagnostics(log_path)
@@ -319,11 +344,17 @@ def aggregate_run(run_dir: str, trim_pad_sec: Optional[float]) -> dict:
                 per_sender_diagnostics[role] = diag
         if finish:
             ops, sec = finish
-            per_sender_finish[role] = {
+            entry = {
                 "ops": ops,
                 "seconds": sec,
                 "ops_per_sec": ops / sec if sec > 0 else 0.0,
+                "threads": finish_threads,
             }
+            if submitted > 0:
+                entry["submitted"] = submitted
+                entry["submitted_per_sec"] = submitted / sec if sec > 0 else 0.0
+                entry["complete_frac"] = completed / submitted if submitted > 0 else 0.0
+            per_sender_finish[role] = entry
 
     if meta.get("t0_unix") is not None:
         window_start, window_end = _measurement_window_ms(meta, pad)
@@ -410,9 +441,32 @@ def _print_summary(summary: dict) -> None:
         print(f"    Across {n_lat} sender(s): " + "  ".join(parts))
     elif cross.get("note"):
         print(f"    Across senders: ({cross['note']})")
-    print("  Per-sender finish line:")
+    print("  Per-sender finish line (summed across threads):")
+    tot_completed_rate = 0.0
+    tot_offered_rate = 0.0
     for role, fin in summary["per_sender_finish"].items():
-        print(f"    {role}: {fin['ops']} ops in {fin['seconds']:.2f}s => {fin['ops_per_sec']:.1f} ops/s")
+        nthreads = fin.get("threads", 0)
+        thr = f" [{nthreads} threads]" if nthreads else ""
+        line = (
+            f"    {role}: {fin['ops']} ops in {fin['seconds']:.2f}s "
+            f"=> {fin['ops_per_sec']:.1f} ops/s{thr}"
+        )
+        tot_completed_rate += fin["ops_per_sec"]
+        if "submitted" in fin:
+            line += (
+                f"  (offered {fin['submitted_per_sec']:.1f} ops/s, "
+                f"completed {100.0 * fin['complete_frac']:.1f}%)"
+            )
+            tot_offered_rate += fin["submitted_per_sec"]
+        print(line)
+    if tot_completed_rate > 0:
+        agg = f"    All senders: completed {tot_completed_rate:.1f} ops/s"
+        if tot_offered_rate > 0:
+            agg += (
+                f"  offered {tot_offered_rate:.1f} ops/s "
+                f"({100.0 * tot_completed_rate / tot_offered_rate:.1f}% of offered)"
+            )
+        print(agg)
     diag_all = summary.get("per_sender_diagnostics") or {}
     if diag_all:
         print("  Per-sender diagnostics (DYNA):")

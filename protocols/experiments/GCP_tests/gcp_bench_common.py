@@ -228,7 +228,8 @@ INTERVAL_LINE_RE = re.compile(
     re.IGNORECASE,
 )
 FINISH_LINE_RE = re.compile(
-    r"Completed\s+(\d+)\s+requests\s+in\s+([\d.]+)\s+seconds",
+    r"Completed\s+(\d+)\s+requests\s+in\s+([\d.]+)\s+seconds"
+    r"(?:\s*\(submitted=(\d+)\))?",
     re.IGNORECASE,
 )
 LATENCY_LINE_RE = re.compile(

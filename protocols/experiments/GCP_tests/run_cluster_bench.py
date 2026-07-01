@@ -267,8 +267,10 @@ def _ionia_replica_env_prefix(
     *,
     per_thread_socket: bool = False,
     leader_stats: bool = False,
+    batch_size: int = 1,
 ) -> str:
     parts = [f"export IONIA_DURABILITY_THREADS={durability_threads}"]
+    parts.append(f"export IONIA_BATCH_SIZE={int(batch_size)}")
     if per_thread_socket:
         parts.append("export IONIA_PER_THREAD_SOCKET=1")
     if leader_stats:
@@ -291,6 +293,7 @@ def _start_replica(
     ionia_durability_threads: int,
     ionia_per_thread_socket: bool = False,
     ionia_leader_stats: bool = False,
+    ionia_batch_size: int = 1,
 ) -> tuple[str, bool, str]:
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
@@ -313,11 +316,19 @@ def _start_replica(
             + replica_start
         )
     elif protocol == "ionia":
+        # Force the consensus batch size (bench/replica -b) in the remote helper.
+        # Matches both the legacy literal (`-b 1`) and the env form (`-b "${BATCH_SIZE}"`),
+        # so no re-deploy of start_ionia_replica.sh is required.
+        parts.append(
+            f"sed -i -E 's#-b [^ ]+#-b {int(ionia_batch_size)}#' "
+            "~/bench/start_ionia_replica.sh 2>/dev/null || true"
+        )
         parts.append(
             _ionia_replica_env_prefix(
                 ionia_durability_threads,
                 per_thread_socket=ionia_per_thread_socket,
                 leader_stats=ionia_leader_stats,
+                batch_size=ionia_batch_size,
             )
             + replica_start
         )
@@ -480,6 +491,14 @@ def main() -> None:
         type=int,
         default=IONIA_DEFAULT_DURABILITY_THREADS,
         help="IONIA only: bench/replica -j durability threads per replica (default 15).",
+    )
+    ap.add_argument(
+        "--ionia-batch-size",
+        type=int,
+        default=1,
+        help="IONIA only: bench/replica -b consensus batch size (default 1 = no "
+        "batching). The single ordering thread commits up to this many ops per "
+        "Prepare round; raise it (e.g. 64/128) to lift the write-throughput ceiling.",
     )
     ap.add_argument(
         "--ionia-fast-quorum",
@@ -696,6 +715,9 @@ def main() -> None:
         "ionia_durability_threads": (
             args.ionia_durability_threads if args.protocol == "ionia" else None
         ),
+        "ionia_batch_size": (
+            args.ionia_batch_size if args.protocol == "ionia" else None
+        ),
         "ionia_fast_quorum": (
             args.ionia_fast_quorum if args.protocol == "ionia" else None
         ),
@@ -735,6 +757,12 @@ def main() -> None:
             print(
                 f"IONIA durability threads per replica: -j {args.ionia_durability_threads}"
             )
+            print(f"IONIA consensus batch size: -b {args.ionia_batch_size}")
+            if args.ionia_batch_size <= 1:
+                print(
+                    "  (note: -b 1 = no batching; single ordering thread commits one "
+                    "op per consensus round and back-pressures the fast path)"
+                )
             if args.ionia_fast_quorum:
                 print(
                     "IONIA fast quorum: on (client quorum=1, writes to leader durability only)"
@@ -770,6 +798,7 @@ def main() -> None:
                     ionia_durability_threads=args.ionia_durability_threads,
                     ionia_per_thread_socket=args.ionia_per_thread_socket,
                     ionia_leader_stats=args.ionia_leader_stats,
+                    ionia_batch_size=args.ionia_batch_size,
                 )
                 for r in receiver_roles
             ]
