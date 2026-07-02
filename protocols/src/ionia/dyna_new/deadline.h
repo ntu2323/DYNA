@@ -64,39 +64,46 @@ public:
         } else {
             w[next_[client_id] % cfg_.owd_window_len] = clamped;
         }
-        ++next_[client_id];
+        const uint64_t n = ++next_[client_id];
+        // Refresh the cached percentile periodically instead of sorting on every
+        // estimate_us() call (the reply hot path — one sort per reply was a top
+        // latency cost). Every sample while warming up (small window, cheap, keeps
+        // tests exact), then every kRecomputeEvery once the window is full.
+        static constexpr uint64_t kRecomputeEvery = 16;
+        if (w.size() < cfg_.owd_window_len || (n % kRecomputeEvery) == 0 ||
+            cache_.find(client_id) == cache_.end()) {
+            cache_[client_id] = PercentileOf(w);
+        }
     }
 
     // Worst per-client OWD estimate (this is what drives a client's max-over-
     // replicas bound). Diagnostic only.
     uint64_t max_estimate_us() const {
         uint64_t m = 0;
-        for (const auto &kv : windows_) {
-            if (kv.second.empty()) continue;
-            std::vector<uint64_t> sorted(kv.second);
-            std::sort(sorted.begin(), sorted.end());
-            size_t idx = (static_cast<size_t>(cfg_.owd_percentile_percent) *
-                          (sorted.size() - 1)) / 100;
-            if (sorted[idx] > m) m = sorted[idx];
-        }
+        for (const auto &kv : cache_) if (kv.second > m) m = kv.second;
         return m;
     }
 
-    // 0 means "not enough samples yet" (matches the protobuf default sentinel).
+    // O(1) cache lookup (0 = not enough samples yet, the protobuf default sentinel).
     uint64_t estimate_us(uint64_t client_id) const {
-        auto it = windows_.find(client_id);
-        if (it == windows_.end() || it->second.empty()) return 0;
-        std::vector<uint64_t> sorted(it->second);
+        auto it = cache_.find(client_id);
+        return it == cache_.end() ? 0 : it->second;
+    }
+
+private:
+    uint64_t PercentileOf(const std::vector<uint64_t> &w) const {
+        if (w.empty()) return 0;
+        std::vector<uint64_t> sorted(w);
         std::sort(sorted.begin(), sorted.end());
         size_t idx = (static_cast<size_t>(cfg_.owd_percentile_percent) *
                       (sorted.size() - 1)) / 100;
         return sorted[idx];
     }
 
-private:
     DeadlineConfig cfg_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> windows_;
     std::unordered_map<uint64_t, uint64_t> next_;
+    std::unordered_map<uint64_t, uint64_t> cache_;   // client -> cached percentile
 };
 
 // Client-side deadline bound: max over the latest per-replica OWD, clamped.
