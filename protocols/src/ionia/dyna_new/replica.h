@@ -38,6 +38,11 @@ private:
     // Fired by partition `pid`'s orderer when an entry releases: sends the client
     // reply and, for the leader, broadcasts the sync to followers.
     void OnRelease(uint32_t pid, bool is_leader, const LogEntry &e);
+    // Self-healing: re-broadcast Sync for the leader's unconfirmed entries and
+    // resend the follower's pending fetches (recovers lost control messages).
+    void OnMaintenance(uint32_t pid,
+                       const std::vector<LogEntry> &resync,
+                       const std::vector<ReconAction> &fetches);
     void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
     void BroadcastSync(uint32_t pid, const LogEntry &e);
     void BroadcastCommit(uint32_t pid, uint64_t client_id, uint64_t request_id);
@@ -51,6 +56,7 @@ private:
     std::unique_ptr<StorageBackend> backend_;
 
     uint32_t numPartitions_;
+    uint64_t reconIntervalUs_;   // self-healing re-sync/re-fetch cadence
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

@@ -21,6 +21,7 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     : config(config), replicaIdx(replicaIdx), transport(transport),
       backend_(std::make_unique<InMemoryBackend>(InMemoryBackend::LatencyFromEnv())),
       numPartitions_(static_cast<uint32_t>(config.n)),
+      reconIntervalUs_(DeadlineConfig::EnvU64("DYNA_NEW_RECON_INTERVAL_MS", 5) * 1000),
       owd_(DeadlineConfig::FromEnv())
 {
     // One orderer per partition: leader of our own range, follower of the rest
@@ -40,7 +41,12 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
             [this, pid, is_leader](const LogEntry &e) {
                 OnRelease(pid, is_leader, e);
             },
-            /*commit_quorum=*/static_cast<uint32_t>(config.f) + 1);
+            /*commit_quorum=*/static_cast<uint32_t>(config.f) + 1,
+            /*recon_interval_us=*/reconIntervalUs_,
+            [this, pid](const std::vector<LogEntry> &resync,
+                        const std::vector<ReconAction> &fetches) {
+                OnMaintenance(pid, resync, fetches);
+            });
         orderer->Start();
         orderers_.push_back(std::move(orderer));
     }
@@ -214,6 +220,22 @@ DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
     // Reads are not logged or synced (§6.3); only writes are reconciled.
     if (is_leader && e.type != proto::READ_ONLY) {
         BroadcastSync(pid, e);   // followers reconcile against this (§6.4)
+    }
+}
+
+void
+DynaNewReplica::OnMaintenance(uint32_t pid,
+                              const std::vector<LogEntry> &resync,
+                              const std::vector<ReconAction> &fetches)
+{
+    // Leader: re-broadcast Sync for entries still awaiting confirmations (a fresh
+    // Sync is idempotent and re-elicits a lost SyncConfirm). Follower: resend the
+    // pending fetches (ExecuteReconActions handles kFetch).
+    for (const LogEntry &e : resync) {
+        BroadcastSync(pid, e);
+    }
+    if (!fetches.empty()) {
+        ExecuteReconActions(pid, fetches);
     }
 }
 

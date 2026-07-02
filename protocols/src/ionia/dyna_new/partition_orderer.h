@@ -66,10 +66,20 @@ public:
     // partition lock released. The replica uses it to send the reply.
     using OnRelease = std::function<void(const LogEntry &)>;
 
+    // Periodic self-healing (recovers lost Sync/Fetch/SyncConfirm — otherwise a
+    // single dropped control message leaves a permanent reconciliation gap that
+    // stalls all later commits). Invoked with the lock released:
+    //   * resync  — leader: unconfirmed entries to re-broadcast as Sync;
+    //   * fetches — follower: kFetch retries for bodies still missing.
+    using OnMaintenance = std::function<void(const std::vector<LogEntry> &resync,
+                                             const std::vector<ReconAction> &fetches)>;
+
     PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                      StorageBackend *backend, Clock *clock,
                      Role role = Role::kLeader, OnRelease on_release = nullptr,
-                     uint32_t commit_quorum = 1);
+                     uint32_t commit_quorum = 1,
+                     uint64_t recon_interval_us = 0,
+                     OnMaintenance on_maintenance = nullptr);
     ~PartitionOrderer();
 
     PartitionOrderer(const PartitionOrderer &) = delete;
@@ -130,6 +140,14 @@ public:
     size_t late_buffer_size() const;
     uint64_t loop_wakeups() const { return loop_wakeups_.load(); }
 
+    // Test hook: synchronously collect the self-healing work the release loop
+    // would emit this tick (leader re-syncs / follower re-fetches).
+    void CollectMaintenanceForTest(std::vector<LogEntry> &resync,
+                                   std::vector<ReconAction> &fetches) {
+        std::lock_guard<std::mutex> lk(mu_);
+        CollectMaintenanceLocked(resync, fetches);
+    }
+
 private:
     void ReleaseLoop();
     // Releases all due entries into `out` (appends to the log + mem_apply under
@@ -138,6 +156,10 @@ private:
     void ReleaseEntryLocked(LogEntry &e);
     // Apply contiguous buffered syncs starting at sync_point (requires mu_).
     void DrainSyncsLocked(std::vector<ReconAction> &out);
+    // Collect self-healing work: leader re-syncs of entries uncommitted for at
+    // least one interval; follower re-fetches of still-missing bodies (requires mu_).
+    void CollectMaintenanceLocked(std::vector<LogEntry> &resync,
+                                  std::vector<ReconAction> &fetches);
     // Persist a committed synced entry and advance commit_point (requires mu_).
     void CommitLocked(const ClientAndReqId &key);
 
@@ -148,6 +170,9 @@ private:
     const Role role_;
     OnRelease on_release_;
     const uint32_t commit_quorum_;
+    const uint64_t recon_interval_us_;   // 0 = self-healing disabled
+    OnMaintenance on_maintenance_;
+    uint64_t last_maint_us_ = 0;
 
     mutable std::mutex mu_;
     PartitionState state_;
@@ -171,6 +196,7 @@ private:
         uint64_t deadline = 0;
         std::unordered_set<uint32_t> confirmers; // follower replica_ids
         bool committed = false;
+        uint64_t released_us = 0;                // when appended (for re-sync aging)
     };
     HashMap<ClientAndReqId, ConfirmState> confirm_state_; // leader only
     std::unordered_set<uint64_t> committed_positions_;    // committed but not yet folded into commit_point

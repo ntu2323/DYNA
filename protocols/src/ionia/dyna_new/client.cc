@@ -21,7 +21,7 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
     : Client(config, transport, clientid),
       num_partitions_(static_cast<uint32_t>(std::max(1, config.n))),
       write_quorum_(static_cast<size_t>(config.f + 1)),
-      resend_ms_(DeadlineConfig::EnvU64("DYNA_NEW_RESEND_TIMEOUT_MS", 20)),
+      resend_ms_(DeadlineConfig::EnvU64("DYNA_NEW_RESEND_TIMEOUT_MS", 5)),
       bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
     if (resend_ms_ == 0) resend_ms_ = 1;

@@ -11,11 +11,15 @@ namespace dyna_new {
 PartitionOrderer::PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                                    StorageBackend *backend, Clock *clock,
                                    Role role, OnRelease on_release,
-                                   uint32_t commit_quorum)
+                                   uint32_t commit_quorum,
+                                   uint64_t recon_interval_us,
+                                   OnMaintenance on_maintenance)
     : partition_id_(partition_id), view_id_(view_id),
       backend_(backend), clock_(clock), role_(role),
       on_release_(std::move(on_release)),
-      commit_quorum_(commit_quorum == 0 ? 1 : commit_quorum)
+      commit_quorum_(commit_quorum == 0 ? 1 : commit_quorum),
+      recon_interval_us_(recon_interval_us),
+      on_maintenance_(std::move(on_maintenance))
 {
     state_.view_id = view_id;
 }
@@ -125,6 +129,7 @@ PartitionOrderer::ReleaseEntryLocked(LogEntry &e)
         // already committed, so persist it now; otherwise wait for sync_confirms.
         ConfirmState &cs = confirm_state_[e.Key()];
         cs.deadline = e.deadline;
+        cs.released_us = clock_->Now();
         if (commit_quorum_ <= 1) {
             cs.committed = true;
             CommitLocked(e.Key());
@@ -380,11 +385,73 @@ PartitionOrderer::ReleaseLoop()
             if (on_release_) on_release_(e);
         }
 
+        // Periodic self-healing: re-send Sync/Fetch so a lost control message
+        // can't leave a permanent reconciliation gap. Off when interval is 0.
+        if (on_maintenance_ && recon_interval_us_ > 0) {
+            const uint64_t now = clock_->Now();
+            if (now - last_maint_us_ >= recon_interval_us_) {
+                last_maint_us_ = now;
+                std::vector<LogEntry> resync;
+                std::vector<ReconAction> fetches;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    CollectMaintenanceLocked(resync, fetches);
+                }
+                if (!resync.empty() || !fetches.empty()) {
+                    on_maintenance_(resync, fetches);
+                }
+            }
+            // Wake at least once per interval so healing keeps making progress.
+            const uint64_t maint_next = last_maint_us_ + recon_interval_us_;
+            if (maint_next < next) next = maint_next;
+        }
+
         if (!running_.load()) {
             break;
         }
         // Blocks until the clock reaches `next` or Submit/Stop interrupts us.
         clock_->SleepUntil(next);
+    }
+}
+
+void
+PartitionOrderer::CollectMaintenanceLocked(std::vector<LogEntry> &resync,
+                                           std::vector<ReconAction> &fetches)
+{
+    // Bound per-tick work; leftovers are picked up on subsequent ticks.
+    static constexpr size_t kMaxPerTick = 256;
+    const uint64_t now = clock_->Now();
+
+    if (role_ == Role::kLeader) {
+        // Re-broadcast Sync for entries still awaiting f+1 confirmations that have
+        // been uncommitted for at least one interval (i.e. a Sync or SyncConfirm
+        // was likely lost — a fresh Sync is idempotent and also re-elicits a
+        // confirm). Skip very recent entries whose first Sync is still in flight.
+        size_t budget = kMaxPerTick;
+        for (const auto &kv : confirm_state_) {
+            if (budget == 0) break;
+            if (kv.second.committed) continue;
+            if (now - kv.second.released_us < recon_interval_us_) continue;
+            auto it = synced_index_.find(kv.first);
+            if (it == synced_index_.end()) continue;
+            resync.push_back(state_.synced_log[it->second]);
+            --budget;
+        }
+    } else {
+        // Re-fetch bodies we are still blocked on (a fetch_resp was lost).
+        size_t budget = kMaxPerTick;
+        for (uint64_t log_id : fetch_inflight_) {
+            if (budget == 0) break;
+            auto sit = pending_syncs_.find(log_id);
+            if (sit == pending_syncs_.end()) continue;
+            ReconAction a;
+            a.kind = ReconAction::Kind::kFetch;
+            a.entry.client_id = sit->second.client_id;
+            a.entry.request_id = sit->second.request_id;
+            a.log_id = log_id;
+            fetches.push_back(std::move(a));
+            --budget;
+        }
     }
 }
 

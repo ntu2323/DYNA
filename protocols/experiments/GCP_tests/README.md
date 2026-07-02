@@ -165,15 +165,58 @@ SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py
   --hosts-file cluster_hosts.json --rsync-from /path/to/Ionia
 ```
 
-**Run (open-loop Poisson, same defaults as DYNA):**
+**Run (open-loop Poisson):** client concurrency is **`--threads` / `-j`** (bench threads **per sender**; default **`1`**). The sweep script runs `run_cluster_bench.py` once per value in `--threads`.
 
 ```bash
-SSH_USER=nathan python3 run_cluster_bench.py --protocol dyna_new --hosts-file cluster_hosts.json \
-  -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
+# Single run — all common flags shown (values match prior examples where noted)
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \
+python3 run_cluster_bench.py \
+  --protocol dyna_new \
+  --hosts-file cluster_hosts.json \
+  -n 0 \
+  -e 150 \
+  -w 5 \
+  --interval-ms 1000 \
+  --trim-pad-sec 10 \
+  -j 1 \
+  --poisson-rate 30 \
+  --offered-ops-per-sec 0 \
+  --max-inflight 0 \
+  --replica-wait-sec 20
+# Defaults not shown (unchanged unless set): open-loop load (omit --closed-loop);
+# --run-id / --results-dir auto; remote clean each run (omit --no-clean-remote);
+# --poisson-rate 60 if omitted (~6000 offered ops/s per sender at -j 1).
 
-# Thread sweep
-SSH_USER=nathan python3 run_throughput_sweep.py --protocol dyna_new --threads 1 4 8 -e 120
+# Thread sweep — runs one bench per -j value; default sweep list is 1 2 4 8
+SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \
+python3 run_throughput_sweep.py \
+  --protocol dyna_new \
+  --hosts-file cluster_hosts.json \
+  --threads 1 4 8 \
+  -n 0 \
+  -e 120 \
+  -w 5 \
+  --interval-ms 1000 \
+  --trim-pad-sec 3.0 \
+  --poisson-rate 60 \
+  --offered-ops-per-sec 0 \
+  --max-inflight 0
+# Sweep writes results/sweep_dyna_new_<id>/t<threads>/ and sweep.csv
 ```
+
+| Flag | Default | Meaning |
+|------|---------|---------|
+| `-j` / `--threads` | `1` | Client threads **per sender** (`bench/client -j`) |
+| `-n` / `--num-ops` | `0` | Max submissions (`0` = unlimited in open-loop) |
+| `-e` / `--experiment-sec` | `60` | Measured window after warmup |
+| `-w` / `--warmup-sec` | `5` | Warmup before measured window |
+| `--interval-ms` | `1000` | Throughput sample interval (`bench/client -i`) |
+| `--trim-pad-sec` | `3.0` | Aggregator trims this many seconds from each end |
+| `--poisson-rate` | `60` | Open-loop: mean reqs per 10 ms **per sender** (~`rate×100` ops/s at `-j 1`) |
+| `--offered-ops-per-sec` | `0` | If `>0`, use `-G` instead of `--poisson-rate` (precise offered load) |
+| `--max-inflight` | `0` | Open-loop outstanding cap per sender (`0` = unlimited) |
+| `--replica-wait-sec` | `20` | Sleep after starting replicas before clients |
+| `--threads` (sweep only) | `1 2 4 8` | List of `-j` values to run sequentially |
 
 **Manual (SSH):** receivers `~/bench/start_dyna_new_replica.sh <0|1|2>`; sender `~/bench/run_dyna_new_client.sh <client_id> [threads] [poisson-rate] [secs] [warmup]` (open-loop Poisson over `trace.micro`). Deadline env (`DYNA_INITIAL_BOUND_US`, `DYNA_MAX_OWD_US`, `DYNA_OWD_PERCENTILE`) applies to both replicas and senders, same as DYNA.
 

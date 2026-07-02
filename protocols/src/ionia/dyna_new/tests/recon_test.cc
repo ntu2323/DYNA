@@ -199,3 +199,66 @@ TEST(Reconciliation, AllSyncedLogsIdenticalAfterReconcile)
         EXPECT_EQ(b.deadline, l.deadline);
     }
 }
+
+// Self-healing (recovers a lost Sync/SyncConfirm): the leader re-syncs an entry
+// that stays unconfirmed for at least one interval, and stops once it commits.
+TEST(SelfHealing, LeaderResyncsUnconfirmedEntryUntilCommitted)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    PartitionOrderer ldr(0, 0, &backend, &clock, PartitionOrderer::Role::kLeader,
+                         nullptr, /*commit_quorum=*/2, /*recon_interval_us=*/1000);
+
+    ldr.Submit(Write(1, 1, 100));
+    clock.Set(100);
+    ldr.ReleaseDue();   // released at t=100; awaits a follower confirm (quorum 2)
+
+    // Too recent (first Sync still plausibly in flight) -> no re-sync.
+    std::vector<LogEntry> rs;
+    std::vector<ReconAction> f;
+    ldr.CollectMaintenanceForTest(rs, f);
+    EXPECT_TRUE(rs.empty());
+
+    // Uncommitted for a full interval -> re-broadcast its Sync.
+    clock.Set(100 + 1000);
+    rs.clear(); f.clear();
+    ldr.CollectMaintenanceForTest(rs, f);
+    ASSERT_EQ(rs.size(), 1u);
+    EXPECT_EQ(rs[0].request_id, 1u);
+    EXPECT_EQ(rs[0].deadline, 100u);
+
+    // Once the confirm lands and it commits, it is no longer re-synced.
+    EXPECT_TRUE(ldr.HandleSyncConfirm(/*replica_id=*/1, 1, 1, /*deadline=*/100));
+    clock.Set(100 + 5000);
+    rs.clear(); f.clear();
+    ldr.CollectMaintenanceForTest(rs, f);
+    EXPECT_TRUE(rs.empty());
+}
+
+// Self-healing (recovers a lost fetch_resp): a follower still missing a body it
+// fetched re-emits the fetch on maintenance, and stops once the body arrives.
+TEST(SelfHealing, FollowerRefetchesMissingBody)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    PartitionOrderer fol(0, 0, &backend, &clock, PartitionOrderer::Role::kFollower);
+
+    // Sync for a request whose body we never received -> a fetch (now in flight).
+    auto a = fol.HandleSync(Sync(0, 1, 5, 100));
+    ASSERT_EQ(CountKind(a, ReconAction::Kind::kFetch), 1);
+
+    // fetch_resp lost -> maintenance re-emits the fetch for the same request.
+    std::vector<LogEntry> rs;
+    std::vector<ReconAction> f;
+    fol.CollectMaintenanceForTest(rs, f);
+    ASSERT_EQ(CountKind(f, ReconAction::Kind::kFetch), 1);
+    EXPECT_EQ(f[0].entry.client_id, 1u);
+    EXPECT_EQ(f[0].entry.request_id, 5u);
+
+    // Body arrives and the entry syncs -> nothing left to re-fetch.
+    fol.HandleFetchResp(Write(1, 5, 100));
+    ASSERT_EQ(fol.sync_point(), 1u);
+    rs.clear(); f.clear();
+    fol.CollectMaintenanceForTest(rs, f);
+    EXPECT_EQ(CountKind(f, ReconAction::Kind::kFetch), 0);
+}
