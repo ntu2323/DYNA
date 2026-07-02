@@ -41,8 +41,10 @@ PartitionOrderer::Submit(LogEntry entry)
         }
         if (entry.deadline > state_.deadline_counter) {
             // On time: ordered by deadline in the early buffer (§6.1).
+            fast_submits_.fetch_add(1, std::memory_order_relaxed);
             state_.early_buffer.push(std::move(entry));
         } else {
+            slow_submits_.fetch_add(1, std::memory_order_relaxed);
             // Slow path (§6.2): late relative to the counter. Stage in the late
             // buffer, then reassign a deadline strictly past the counter (and
             // not in the past) so it is appended after already-released entries
@@ -332,6 +334,7 @@ PartitionOrderer::CommitLocked(const ClientAndReqId &key)
     if (it == synced_index_.end()) {
         return;
     }
+    commit_count_.fetch_add(1, std::memory_order_relaxed);
     const uint64_t pos = it->second;
     const LogEntry &e = state_.synced_log[pos];
     if (e.type != proto::READ_ONLY) {
@@ -435,6 +438,7 @@ PartitionOrderer::CollectMaintenanceLocked(std::vector<LogEntry> &resync,
             auto it = synced_index_.find(kv.first);
             if (it == synced_index_.end()) continue;
             resync.push_back(state_.synced_log[it->second]);
+            resync_count_.fetch_add(1, std::memory_order_relaxed);
             --budget;
         }
     } else {
@@ -450,6 +454,7 @@ PartitionOrderer::CollectMaintenanceLocked(std::vector<LogEntry> &resync,
             a.entry.request_id = sit->second.request_id;
             a.log_id = log_id;
             fetches.push_back(std::move(a));
+            refetch_count_.fetch_add(1, std::memory_order_relaxed);
             --budget;
         }
     }
@@ -516,6 +521,20 @@ PartitionOrderer::late_buffer_size() const
 {
     std::lock_guard<std::mutex> lk(mu_);
     return state_.late_buffer.size();
+}
+
+size_t
+PartitionOrderer::confirm_state_size() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return confirm_state_.size();
+}
+
+size_t
+PartitionOrderer::pending_syncs_size() const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return pending_syncs_.size();
 }
 
 } // namespace dyna_new

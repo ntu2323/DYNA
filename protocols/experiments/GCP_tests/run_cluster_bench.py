@@ -250,7 +250,9 @@ def _build_client_cmd(
         dyna_env = (
             "export DYNA_INITIAL_BOUND_US=${DYNA_INITIAL_BOUND_US:-50}; "
             "export DYNA_MAX_OWD_US=${DYNA_MAX_OWD_US:-2000}; "
-            "export DYNA_NEW_RESEND_TIMEOUT_MS=${DYNA_NEW_RESEND_TIMEOUT_MS:-20}; "
+            "export DYNA_NEW_RESEND_TIMEOUT_MS=${DYNA_NEW_RESEND_TIMEOUT_MS:-5}; "
+            "export DYNA_NEW_CLIENT_STATS=${DYNA_NEW_CLIENT_STATS:-1}; "
+            "export DYNA_NEW_CLIENT_STATS_LOG_EVERY=${DYNA_NEW_CLIENT_STATS_LOG_EVERY:-10000}; "
             "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
         )
     ionia_env = ""

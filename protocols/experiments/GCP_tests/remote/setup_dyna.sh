@@ -161,6 +161,11 @@ export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
 export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
 export DYNA_OWD_PERCENTILE="${DYNA_OWD_PERCENTILE:-50}"
 export DYNA_OWD_WINDOW_LEN="${DYNA_OWD_WINDOW_LEN:-100}"
+export DYNA_NEW_RECON_INTERVAL_MS="${DYNA_NEW_RECON_INTERVAL_MS:-5}"
+# Diagnostics: per-second "DYNA_NEW stats" line (grep the replica log). On by
+# default during perf tuning; set DYNA_NEW_STATS=0 to silence.
+export DYNA_NEW_STATS="${DYNA_NEW_STATS:-1}"
+export DYNA_NEW_STATS_INTERVAL_MS="${DYNA_NEW_STATS_INTERVAL_MS:-1000}"
 cd "${HOME}/Ionia/protocols/src/ionia"
 pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
@@ -183,7 +188,9 @@ EXPERIMENT_SECS="${4:-60}"
 WARMUP_SECS="${5:-5}"
 export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
 export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
-export DYNA_NEW_RESEND_TIMEOUT_MS="${DYNA_NEW_RESEND_TIMEOUT_MS:-20}"
+export DYNA_NEW_RESEND_TIMEOUT_MS="${DYNA_NEW_RESEND_TIMEOUT_MS:-5}"
+export DYNA_NEW_CLIENT_STATS="${DYNA_NEW_CLIENT_STATS:-1}"
+export DYNA_NEW_CLIENT_STATS_LOG_EVERY="${DYNA_NEW_CLIENT_STATS_LOG_EVERY:-10000}"
 export BENCH_INFLIGHT_LOG="${BENCH_INFLIGHT_LOG:-1}"
 cd "${HOME}/Ionia/protocols/src/ionia"
 mkdir -p ~/bench

@@ -13,6 +13,7 @@
 #include "dyna_new/storage_backend.h"
 #include "dyna_new/wall_clock.h"
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -45,6 +46,8 @@ private:
                        const std::vector<ReconAction> &fetches);
     void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
     void BroadcastSync(uint32_t pid, const LogEntry &e);
+    // DYNA_NEW_STATS: periodic per-partition stats dump (re-arms itself).
+    void StatsDump();
     void BroadcastCommit(uint32_t pid, uint64_t client_id, uint64_t request_id);
     // Executes the messages a follower's reconciliation asked us to send.
     void ExecuteReconActions(uint32_t pid, const std::vector<ReconAction> &actions);
@@ -57,6 +60,13 @@ private:
 
     uint32_t numPartitions_;
     uint64_t reconIntervalUs_;   // self-healing re-sync/re-fetch cadence
+
+    // DYNA_NEW_STATS diagnostics (off unless the env var is set).
+    bool statsEnabled_ = false;
+    uint64_t statsIntervalMs_ = 1000;
+    std::atomic<uint64_t> reqIn_{0}, syncIn_{0}, confirmIn_{0}, commitIn_{0},
+        fetchReqIn_{0}, fetchRespIn_{0};
+    std::atomic<uint64_t> dedupSubmit_{0}, dedupDrop_{0}, dedupResend_{0};
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

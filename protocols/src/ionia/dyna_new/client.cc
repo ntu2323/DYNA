@@ -25,6 +25,11 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
       bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
     if (resend_ms_ == 0) resend_ms_ = 1;
+    const char *sv = std::getenv("DYNA_NEW_CLIENT_STATS");
+    client_stats_enabled_ = (sv != nullptr && *sv != '\0' && *sv != '0');
+    client_stats_every_ =
+        DeadlineConfig::EnvU64("DYNA_NEW_CLIENT_STATS_LOG_EVERY", 10000);
+    if (client_stats_every_ == 0) client_stats_every_ = 10000;
 }
 
 DynaNewClient::~DynaNewClient() {}
@@ -75,6 +80,8 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         partition_id,
         request_id,
         /*send_us=*/0,
+        /*first_submit_us=*/NowMicros(),
+        /*resends=*/0,
         is_read,
         std::move(continuation),
         CommitQuorum(leader_id, write_quorum_),
@@ -127,6 +134,7 @@ DynaNewClient::OnResendTimeout(uint64_t request_id)
     if (it == pending_.end()) {
         return;   // already committed and erased
     }
+    ++it->second.resends;
     SendRequestProto(request_id);
     if (it->second.resend_timer) {
         it->second.resend_timer->Reset();
@@ -190,10 +198,45 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
     if (p.resend_timer) {
         p.resend_timer->Stop();   // committed: stop retransmitting
     }
+    if (client_stats_enabled_) {
+        RecordCommitStat(NowMicros() - p.first_submit_us, p.resends);
+    }
     continuation_t cont = std::move(p.continuation);
     std::string result = p.is_read ? p.quorum.result() : std::string();
     pending_.erase(it);
     cont(std::string(), result);
+}
+
+void
+DynaNewClient::RecordCommitStat(uint64_t latency_us, uint32_t resends)
+{
+    stat_latencies_us_.push_back(latency_us);
+    stat_resends_.push_back(resends);
+    if (stat_latencies_us_.size() < client_stats_every_) {
+        return;
+    }
+
+    std::vector<uint64_t> lat = stat_latencies_us_;
+    std::sort(lat.begin(), lat.end());
+    auto pct = [&](double p) {
+        size_t idx = static_cast<size_t>(p * (lat.size() - 1));
+        return lat[idx];
+    };
+    uint64_t resend_sum = 0, max_resends = 0;
+    for (uint32_t r : stat_resends_) {
+        resend_sum += r;
+        if (r > max_resends) max_resends = r;
+    }
+    // p50 ≫ target => deadline-hold floor; large resends/max => loss+heal tail.
+    Notice("DYNA_NEW client stats [n=%zu]: latency_us p50=%lu p90=%lu p99=%lu max=%lu; "
+           "resends avg=%.2f max=%lu; bound_us=%lu pending=%zu",
+           lat.size(), (unsigned long)pct(0.5), (unsigned long)pct(0.9),
+           (unsigned long)pct(0.99), (unsigned long)lat.back(),
+           static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
+           (unsigned long)bound_tracker_.bound_us(), pending_.size());
+
+    stat_latencies_us_.clear();
+    stat_resends_.clear();
 }
 
 } // namespace dyna_new

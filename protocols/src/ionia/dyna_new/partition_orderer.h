@@ -140,6 +140,15 @@ public:
     size_t late_buffer_size() const;
     uint64_t loop_wakeups() const { return loop_wakeups_.load(); }
 
+    // --- diagnostics (DYNA_NEW_STATS); all cheap atomic reads ---
+    uint64_t fast_submits() const { return fast_submits_.load(std::memory_order_relaxed); }
+    uint64_t slow_submits() const { return slow_submits_.load(std::memory_order_relaxed); }
+    uint64_t resync_count() const { return resync_count_.load(std::memory_order_relaxed); }
+    uint64_t refetch_count() const { return refetch_count_.load(std::memory_order_relaxed); }
+    uint64_t commit_count() const { return commit_count_.load(std::memory_order_relaxed); }
+    size_t confirm_state_size() const;   // leader: uncommitted backlog
+    size_t pending_syncs_size() const;   // follower: reconciliation gap depth
+
     // Test hook: synchronously collect the self-healing work the release loop
     // would emit this tick (leader re-syncs / follower re-fetches).
     void CollectMaintenanceForTest(std::vector<LogEntry> &resync,
@@ -204,6 +213,13 @@ private:
     std::atomic<bool> running_{false};
     std::atomic<uint64_t> loop_wakeups_{0};
     std::thread thread_;
+
+    // Diagnostic counters (DYNA_NEW_STATS).
+    std::atomic<uint64_t> fast_submits_{0};   // admitted on-time (§6.1)
+    std::atomic<uint64_t> slow_submits_{0};   // reassigned, slow path (§6.2)
+    std::atomic<uint64_t> resync_count_{0};   // leader re-broadcast Syncs (healing)
+    std::atomic<uint64_t> refetch_count_{0};  // follower re-fetches (healing)
+    std::atomic<uint64_t> commit_count_{0};
 };
 
 } // namespace dyna_new

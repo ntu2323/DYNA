@@ -52,6 +52,14 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     }
 
     transport->Register(this, config, 0, replicaIdx);
+
+    const char *sv = std::getenv("DYNA_NEW_STATS");
+    statsEnabled_ = (sv != nullptr && *sv != '\0' && *sv != '0');
+    statsIntervalMs_ = DeadlineConfig::EnvU64("DYNA_NEW_STATS_INTERVAL_MS", 1000);
+    if (statsIntervalMs_ == 0) statsIntervalMs_ = 1000;
+    if (statsEnabled_) {
+        transport->Timer(statsIntervalMs_, [this]() { StatsDump(); });
+    }
 }
 
 DynaNewReplica::~DynaNewReplica()
@@ -86,6 +94,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         if (!req.ParseFromArray(data.data(), data.size())) {
             return;
         }
+        reqIn_.fetch_add(1, std::memory_order_relaxed);
 
         const uint32_t pid = PartitionOf(req.key(), numPartitions_);
         if (pid >= orderers_.size()) {
@@ -102,12 +111,15 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
             case RequestDedup::Decision::kResend: {
                 proto::Reply cached = *dedup_[pid]->dedup.CachedReply(key);
                 dlk.unlock();
+                dedupResend_.fetch_add(1, std::memory_order_relaxed);
                 transport->SendMessage(this, remote, cached);
                 return;
             }
             case RequestDedup::Decision::kDrop:
+                dedupDrop_.fetch_add(1, std::memory_order_relaxed);
                 return;
             case RequestDedup::Decision::kSubmit:
+                dedupSubmit_.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
         }
@@ -137,6 +149,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     if (type == syncName) {
         proto::Sync s;
         if (!s.ParseFromArray(data.data(), data.size())) return;
+        syncIn_.fetch_add(1, std::memory_order_relaxed);
         const uint32_t pid = s.partition_id();
         if (pid >= orderers_.size()) return;
         SyncIn in;
@@ -155,6 +168,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         // Commit (§7).
         proto::SyncConfirm c;
         if (!c.ParseFromArray(data.data(), data.size())) return;
+        confirmIn_.fetch_add(1, std::memory_order_relaxed);
         const uint32_t pid = c.partition_id();
         if (pid >= orderers_.size()) return;
         if (orderers_[pid]->HandleSyncConfirm(c.replica_id(), c.client_id(),
@@ -168,6 +182,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         // Background commit from the partition leader: persist our own copy (§7).
         proto::Commit cm;
         if (!cm.ParseFromArray(data.data(), data.size())) return;
+        commitIn_.fetch_add(1, std::memory_order_relaxed);
         const uint32_t pid = cm.partition_id();
         if (pid >= orderers_.size()) return;
         orderers_[pid]->HandleCommit(cm.client_id(), cm.request_id());
@@ -177,6 +192,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     if (type == fetchReqName) {
         proto::FetchRequest fr;
         if (!fr.ParseFromArray(data.data(), data.size())) return;
+        fetchReqIn_.fetch_add(1, std::memory_order_relaxed);
         const uint32_t pid = fr.partition_id();
         if (pid >= orderers_.size()) return;
         LogEntry body;
@@ -197,6 +213,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     if (type == fetchRespName) {
         proto::FetchResponse resp;
         if (!resp.ParseFromArray(data.data(), data.size())) return;
+        fetchRespIn_.fetch_add(1, std::memory_order_relaxed);
         const uint32_t pid = resp.partition_id();
         if (pid >= orderers_.size()) return;
         LogEntry body;
@@ -337,6 +354,43 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     }
 
     transport->SendMessage(this, *e.client_addr, reply);
+}
+
+void
+DynaNewReplica::StatsDump()
+{
+    uint64_t fast = 0, slow = 0, resync = 0, refetch = 0, commits = 0;
+    size_t confirmBacklog = 0, syncGaps = 0, earlyBuf = 0;
+    for (auto &o : orderers_) {
+        fast += o->fast_submits();
+        slow += o->slow_submits();
+        resync += o->resync_count();
+        refetch += o->refetch_count();
+        commits += o->commit_count();
+        confirmBacklog += o->confirm_state_size();
+        syncGaps += o->pending_syncs_size();
+        earlyBuf += o->early_buffer_size();
+    }
+    // Cumulative counters (diff consecutive lines for rates) + instantaneous
+    // gauges. slow/(fast+slow) = slow-path ratio; resync/refetch = healing (loss);
+    // confirmBacklog/syncGaps = commit/reconciliation backlog behind the tail.
+    Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
+           "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
+           "heal[resync=%lu refetch=%lu] commits=%lu "
+           "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
+           replicaIdx,
+           (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
+           (unsigned long)confirmIn_.load(), (unsigned long)commitIn_.load(),
+           (unsigned long)fetchReqIn_.load(), (unsigned long)fetchRespIn_.load(),
+           (unsigned long)dedupSubmit_.load(), (unsigned long)dedupDrop_.load(),
+           (unsigned long)dedupResend_.load(),
+           (unsigned long)fast, (unsigned long)slow,
+           (unsigned long)resync, (unsigned long)refetch, (unsigned long)commits,
+           confirmBacklog, syncGaps, earlyBuf);
+
+    if (statsEnabled_) {
+        transport->Timer(statsIntervalMs_, [this]() { StatsDump(); });
+    }
 }
 
 } // namespace dyna_new

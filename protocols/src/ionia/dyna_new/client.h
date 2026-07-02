@@ -12,6 +12,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace specpaxos {
 namespace dyna_new {
@@ -41,6 +42,8 @@ private:
         uint32_t partition_id = 0;
         uint64_t request_id = 0;
         uint64_t send_us = 0;
+        uint64_t first_submit_us = 0;   // for end-to-end commit latency (stats)
+        uint32_t resends = 0;           // retransmit count for this request (stats)
         bool is_read = false;
         continuation_t continuation;
         CommitQuorum quorum;
@@ -57,6 +60,8 @@ private:
     void SendRequestProto(uint64_t request_id);
     // Resend timer callback: resend + reschedule while the request is pending.
     void OnResendTimeout(uint64_t request_id);
+    // DYNA_NEW_CLIENT_STATS: record a commit and periodically log percentiles.
+    void RecordCommitStat(uint64_t latency_us, uint32_t resends);
 
     uint64_t last_req_id_ = 0;
     uint32_t num_partitions_;
@@ -64,6 +69,12 @@ private:
     uint64_t resend_ms_;
     ClientBoundTracker bound_tracker_;
     std::unordered_map<uint64_t, PendingRequest> pending_;
+
+    // Client-side diagnostics (off unless DYNA_NEW_CLIENT_STATS is set).
+    bool client_stats_enabled_ = false;
+    uint64_t client_stats_every_ = 10000;
+    std::vector<uint64_t> stat_latencies_us_;   // commit latency this window
+    std::vector<uint32_t> stat_resends_;        // resends per commit this window
 };
 
 } // namespace dyna_new
