@@ -217,7 +217,7 @@ TEST(PartitionState, InitialValues)
     EXPECT_TRUE(st.early_buffer.empty());
     EXPECT_TRUE(st.late_buffer.empty());
     EXPECT_TRUE(st.synced_log.empty());
-    EXPECT_TRUE(st.unsynced_log.empty());
+    EXPECT_EQ(st.unsynced_count, 0u);
 }
 
 // ---------------------------------------------------------------------------

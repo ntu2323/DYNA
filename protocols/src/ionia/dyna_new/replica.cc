@@ -31,6 +31,13 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // so cv/scheduler wakeup latency doesn't dominate commit latency.
     const char *bp = std::getenv("DYNA_NEW_BUSY_POLL");
     const bool busyPoll = (bp == nullptr) || (*bp != '0');
+    // LRU cap for the per-partition dedup reply-cache (bounds a latency-drift
+    // driver at scale). Must exceed the client retry window; 0 = unbounded.
+    // Per-partition cap (each partition sees ~1/N of traffic). At a few hundred
+    // ops/s/partition, 8192 ≈ tens of seconds of history — far longer than the
+    // client retry window, so a retried request is never evicted early.
+    const size_t dedupCap =
+        static_cast<size_t>(DeadlineConfig::EnvU64("DYNA_NEW_DEDUP_CAP", 8192));
 
     clocks_.reserve(numPartitions_);
     orderers_.reserve(numPartitions_);
@@ -39,6 +46,7 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
         clocks_.push_back(std::make_unique<RealClock>(busyPoll));
         dedup_.push_back(std::make_unique<PartitionDedup>());
+        dedup_.back()->dedup.set_cap(dedupCap);
         const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
         auto role = is_leader ? PartitionOrderer::Role::kLeader
                               : PartitionOrderer::Role::kFollower;

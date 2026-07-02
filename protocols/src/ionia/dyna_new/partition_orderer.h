@@ -147,8 +147,7 @@ public:
     uint64_t commit_point() const;
     size_t synced_log_size() const;
     LogEntry synced_log_at(size_t i) const;
-    size_t unsynced_log_size() const;
-    LogEntry unsynced_log_at(size_t i) const;
+    size_t unsynced_log_size() const;   // count of speculative (unsynced) releases
     size_t early_buffer_size() const;
     size_t late_buffer_size() const;
     uint64_t loop_wakeups() const { return loop_wakeups_.load(); }

@@ -80,6 +80,30 @@ TEST(RequestDedup, CorrectedReplyOverwritesCache)
     EXPECT_EQ(d.CachedReply(k)->deadline(), 200u);
 }
 
+// The reply cache is LRU-bounded: once the cap is exceeded the oldest reply is
+// evicted (a retry that old would re-execute — cap must exceed the retry window).
+TEST(RequestDedup, LruCapEvictsOldest)
+{
+    RequestDedup d;
+    d.set_cap(2);
+    ClientAndReqId a{1, 1}, b{1, 2}, c{1, 3};
+    proto::Reply r;
+
+    ASSERT_EQ(d.OnReceive(a), D::kSubmit);
+    d.OnReply(a, r);
+    ASSERT_EQ(d.OnReceive(b), D::kSubmit);
+    d.OnReply(b, r);
+    EXPECT_EQ(d.cached_size(), 2u);
+
+    ASSERT_EQ(d.OnReceive(c), D::kSubmit);
+    d.OnReply(c, r);                       // exceeds cap -> evict oldest (a)
+    EXPECT_EQ(d.cached_size(), 2u);
+
+    EXPECT_EQ(d.OnReceive(a), D::kSubmit); // a evicted -> treated as new
+    EXPECT_EQ(d.OnReceive(b), D::kResend); // b, c still cached
+    EXPECT_EQ(d.OnReceive(c), D::kResend);
+}
+
 // Distinct requests are tracked independently.
 TEST(RequestDedup, DistinctKeysIndependent)
 {

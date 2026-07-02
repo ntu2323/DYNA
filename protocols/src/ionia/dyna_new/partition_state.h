@@ -90,9 +90,12 @@ struct PartitionState {
     uint64_t deadline_counter = 0;
 
     // §3.3: synced/unsynced split. Leader appends straight to synced_log;
-    // followers stage speculative releases in unsynced_log until reconciled.
+    // followers speculatively release into the unsynced region. Only the *count*
+    // of unsynced releases is used (for a follower read's log_pos) — reconciliation
+    // rebuilds synced_log from the received bodies (known_) — so we keep a counter
+    // instead of a growing vector of dead entries.
     std::vector<LogEntry> synced_log;
-    std::vector<LogEntry> unsynced_log;
+    uint64_t unsynced_count = 0;
     // §3.3: log position confirmed equal to the leader's.
     uint64_t sync_point = 0;
     // §3.3: log entries up to here are committed/stable (bounds background

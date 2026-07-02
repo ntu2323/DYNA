@@ -39,6 +39,8 @@ public:
         table_[key] = reply;
     }
 
+    void Erase(const ClientAndReqId &key) { table_.erase(key); }
+
     size_t Size() const { return table_.size(); }
 
 private:

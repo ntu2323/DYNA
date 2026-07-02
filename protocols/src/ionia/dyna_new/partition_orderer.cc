@@ -115,7 +115,7 @@ PartitionOrderer::ReleaseEntryLocked(LogEntry &e)
             e.result = v.value_or(std::string());
             e.has_result = true;
         } else {
-            e.log_pos = state_.unsynced_log.size();
+            e.log_pos = state_.unsynced_count;
         }
         return;
     }
@@ -144,8 +144,8 @@ PartitionOrderer::ReleaseEntryLocked(LogEntry &e)
         // Follower: speculative release. Stage in unsynced_log without applying
         // to authoritative memory; reconciliation against the leader's sync
         // promotes/repositions and applies.
-        e.log_pos = state_.unsynced_log.size();
-        state_.unsynced_log.push_back(e);
+        e.log_pos = state_.unsynced_count;
+        state_.unsynced_count++;
         replied_deadline_[e.Key()] = e.deadline;   // we just replied at this deadline
     }
 }
@@ -538,14 +538,7 @@ size_t
 PartitionOrderer::unsynced_log_size() const
 {
     std::lock_guard<std::mutex> lk(mu_);
-    return state_.unsynced_log.size();
-}
-
-LogEntry
-PartitionOrderer::unsynced_log_at(size_t i) const
-{
-    std::lock_guard<std::mutex> lk(mu_);
-    return state_.unsynced_log.at(i);
+    return state_.unsynced_count;
 }
 
 size_t

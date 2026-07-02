@@ -22,6 +22,8 @@
 #include "dyna_new/dedup_table.h"        // DedupTable (reply cache)
 #include "dyna_new/dyna-new-proto.pb.h"  // proto::Reply
 
+#include <cstddef>
+#include <deque>
 #include <unordered_set>
 
 namespace specpaxos {
@@ -55,10 +57,25 @@ public:
 
     // Record the reply we just sent. Overwrites any prior reply, so a corrected
     // reply (§6.4) supersedes the speculative one in the cache. Clears in-flight.
+    // The cache is LRU-bounded (cap_ > 0): the oldest reply is evicted once the
+    // cap is exceeded. cap must exceed the client's retry window so a retried
+    // request is never evicted before its (rare) retransmit (else it re-executes).
     void OnReply(const ClientAndReqId &key, const proto::Reply &reply) {
+        const bool is_new = !cache_.Contains(key);
         cache_.Record(key, reply);
         inflight_.erase(key);
+        if (is_new && cap_ > 0) {
+            fifo_.push_back(key);   // each key inserted once (request_ids unique)
+            while (cache_.Size() > cap_ && !fifo_.empty()) {
+                cache_.Erase(fifo_.front());
+                fifo_.pop_front();
+            }
+        }
     }
+
+    // 0 = unbounded (default, for tests). Bounded in production to keep the cache
+    // from growing with total ops (a latency-drift driver at scale).
+    void set_cap(size_t cap) { cap_ = cap; }
 
     size_t inflight_size() const { return inflight_.size(); }
     size_t cached_size() const { return cache_.Size(); }
@@ -66,6 +83,8 @@ public:
 private:
     std::unordered_set<ClientAndReqId> inflight_;
     DedupTable cache_;
+    std::deque<ClientAndReqId> fifo_;   // insertion order for LRU eviction
+    size_t cap_ = 0;
 };
 
 } // namespace dyna_new
