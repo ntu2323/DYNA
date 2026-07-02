@@ -14,14 +14,16 @@ PartitionOrderer::PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                                    uint32_t commit_quorum,
                                    uint64_t recon_interval_us,
                                    OnMaintenance on_maintenance,
-                                   OnPostDrain on_post_drain)
+                                   OnPostDrain on_post_drain,
+                                   uint64_t log_keep)
     : partition_id_(partition_id), view_id_(view_id),
       backend_(backend), clock_(clock), role_(role),
       on_release_(std::move(on_release)),
       commit_quorum_(commit_quorum == 0 ? 1 : commit_quorum),
       recon_interval_us_(recon_interval_us),
       on_maintenance_(std::move(on_maintenance)),
-      on_post_drain_(std::move(on_post_drain))
+      on_post_drain_(std::move(on_post_drain)),
+      log_keep_(log_keep)
 {
     state_.view_id = view_id;
 }
@@ -110,7 +112,7 @@ PartitionOrderer::ReleaseEntryLocked(LogEntry &e)
         // the read. Writes ordered before this read have already released (we
         // release in deadline order), so the read sees them in memory.
         if (role_ == Role::kLeader) {
-            e.log_pos = state_.synced_log.size();
+            e.log_pos = state_.sync_point;   // logical: writes ordered before it
             auto v = backend_->mem_read(e.key);
             e.result = v.value_or(std::string());
             e.has_result = true;
@@ -123,11 +125,11 @@ PartitionOrderer::ReleaseEntryLocked(LogEntry &e)
     if (role_ == Role::kLeader) {
         // Leader is the source of truth: appended entries go straight to
         // synced_log and writes hit authoritative memory (§3.3, §6.1).
-        e.log_pos = state_.synced_log.size();
+        e.log_pos = state_.sync_point;   // logical log_id
         backend_->mem_apply(e.key, e.command);
         state_.synced_log.push_back(e);
         synced_index_[e.Key()] = e.log_pos;
-        state_.sync_point = state_.synced_log.size();
+        state_.sync_point = state_.synced_base + state_.synced_log.size();
 
         // Start the §7 confirmation tally: the leader's own append is the first
         // (implicit) confirmation. With a single replica (quorum 1) the write is
@@ -229,7 +231,7 @@ PartitionOrderer::DrainSyncsLocked(std::vector<ReconAction> &out)
         }
         state_.synced_log.push_back(body);
         synced_index_[key] = sync.log_id;
-        state_.sync_point = state_.synced_log.size();
+        state_.sync_point = state_.synced_base + state_.synced_log.size();
 
         fetch_inflight_.erase(sync.log_id);
         pending_syncs_.erase(sit);
@@ -273,10 +275,14 @@ PartitionOrderer::LeaderFetch(uint64_t client_id, uint64_t request_id,
 {
     std::lock_guard<std::mutex> lk(mu_);
     auto it = synced_index_.find(ClientAndReqId{client_id, request_id});
-    if (it == synced_index_.end()) {
+    if (it == synced_index_.end() || it->second < state_.synced_base) {
+        return false;   // unknown or GC'd from the trailing window
+    }
+    const uint64_t idx = it->second - state_.synced_base;
+    if (idx >= state_.synced_log.size()) {
         return false;
     }
-    out = state_.synced_log[it->second];
+    out = state_.synced_log[idx];
     return true;
 }
 
@@ -340,16 +346,42 @@ PartitionOrderer::CommitLocked(const ClientAndReqId &key)
     }
     commit_count_.fetch_add(1, std::memory_order_relaxed);
     const uint64_t pos = it->second;
-    const LogEntry &e = state_.synced_log[pos];
-    if (e.type != proto::READ_ONLY) {
-        // Off the critical path: enqueue the durable write (invariant 2). Reads
-        // are never logged, so this is always a write.
-        backend_->disk_persist(e.key, e.command);
+    if (const LogEntry *e = SyncedAtLocked(pos)) {
+        if (e->type != proto::READ_ONLY) {
+            // Off the critical path: enqueue the durable write (invariant 2). Reads
+            // are never logged, so this is always a write.
+            backend_->disk_persist(e->key, e->command);
+        }
     }
     // Advance commit_point over the contiguous committed prefix (§3.3).
     committed_positions_.insert(pos);
     while (committed_positions_.erase(state_.commit_point) > 0) {
         state_.commit_point++;
+    }
+    GcSyncedLogLocked();   // drop entries far below commit_point from memory
+}
+
+LogEntry *
+PartitionOrderer::SyncedAtLocked(uint64_t log_id)
+{
+    if (log_id < state_.synced_base) return nullptr;
+    const uint64_t idx = log_id - state_.synced_base;
+    if (idx >= state_.synced_log.size()) return nullptr;
+    return &state_.synced_log[idx];
+}
+
+void
+PartitionOrderer::GcSyncedLogLocked()
+{
+    if (log_keep_ == 0) return;                        // GC disabled (tests)
+    if (state_.commit_point <= log_keep_) return;      // nothing safely evictable
+    const uint64_t evict_below = state_.commit_point - log_keep_;
+    while (state_.synced_base < evict_below && !state_.synced_log.empty()) {
+        const ClientAndReqId key = state_.synced_log.front().Key();
+        synced_index_.erase(key);        // bounded alongside the log
+        replied_deadline_.erase(key);
+        state_.synced_log.pop_front();
+        state_.synced_base++;
     }
 }
 
@@ -443,14 +475,16 @@ PartitionOrderer::CollectMaintenanceLocked(std::vector<LogEntry> &resync,
         const uint64_t end =
             std::min<uint64_t>(state_.sync_point, state_.commit_point + kHeadWindow);
         for (uint64_t pos = state_.commit_point; pos < end; ++pos) {
-            const ClientAndReqId key = state_.synced_log[pos].Key();
+            LogEntry *entry = SyncedAtLocked(pos);
+            if (entry == nullptr) continue;
+            const ClientAndReqId key = entry->Key();
             auto it = confirm_state_.find(key);
             if (it == confirm_state_.end() || it->second.committed) continue;
             if (now - it->second.released_us < recon_interval_us_) continue;
             if (it->second.last_resync_us != 0 &&
                 now - it->second.last_resync_us < kResyncBackoffUs) continue;
             it->second.last_resync_us = now;
-            resync.push_back(state_.synced_log[pos]);
+            resync.push_back(*entry);
             resync_count_.fetch_add(1, std::memory_order_relaxed);
         }
     } else {
@@ -492,10 +526,12 @@ PartitionOrderer::LeaderCollectResync(uint64_t from_log_id, size_t max,
 {
     std::lock_guard<std::mutex> lk(mu_);
     if (role_ != Role::kLeader) return;
-    const uint64_t end =
-        std::min<uint64_t>(state_.synced_log.size(), from_log_id + max);
-    for (uint64_t pos = from_log_id; pos < end; ++pos) {
-        out.push_back(state_.synced_log[pos]);
+    // Serve logical ids [start, end) still in the trailing window (a follower that
+    // lagged below synced_base can't be fully recovered — out of scope for v1).
+    const uint64_t start = std::max(from_log_id, state_.synced_base);
+    const uint64_t end = std::min<uint64_t>(state_.sync_point, from_log_id + max);
+    for (uint64_t log_id = start; log_id < end; ++log_id) {
+        out.push_back(state_.synced_log[log_id - state_.synced_base]);
     }
 }
 

@@ -201,3 +201,28 @@ TEST(Commit, CommitPointAdvancesContiguously)
     EXPECT_TRUE(leader.HandleSyncConfirm(1, 1, 1, 100));
     EXPECT_EQ(leader.commit_point(), 2u);
 }
+
+// Trailing-window GC: durably-committed entries far below commit_point are dropped
+// from memory (synced_log bounded to ~log_keep); recent entries stay fetchable.
+TEST(BackgroundPersistence, TrailingWindowGcBoundsLog)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    PartitionOrderer ldr(0, 0, &backend, &clock, PartitionOrderer::Role::kLeader,
+                         nullptr, /*commit_quorum=*/1, /*recon_interval_us=*/0,
+                         nullptr, nullptr, /*log_keep=*/4);
+
+    for (uint64_t r = 1; r <= 10; ++r) {
+        ldr.Submit(Write(1, r, r * 10));   // strictly increasing deadlines
+    }
+    clock.Set(1000);
+    ldr.ReleaseDue();   // releases + self-commits all 10 (quorum 1)
+
+    EXPECT_EQ(ldr.commit_point(), 10u);
+    EXPECT_EQ(ldr.synced_log_size(), 4u);   // GC'd below commit_point-keep=6
+
+    LogEntry out;
+    EXPECT_TRUE(ldr.LeaderFetch(1, 8, out)); // log 7, still in the window
+    EXPECT_EQ(out.request_id, 8u);
+    EXPECT_FALSE(ldr.LeaderFetch(1, 1, out)); // log 0, evicted
+}

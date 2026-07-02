@@ -87,7 +87,8 @@ public:
                      uint32_t commit_quorum = 1,
                      uint64_t recon_interval_us = 0,
                      OnMaintenance on_maintenance = nullptr,
-                     OnPostDrain on_post_drain = nullptr);
+                     OnPostDrain on_post_drain = nullptr,
+                     uint64_t log_keep = 0);   // 0 = never GC the synced_log
     ~PartitionOrderer();
 
     PartitionOrderer(const PartitionOrderer &) = delete;
@@ -181,6 +182,11 @@ private:
     // least one interval; follower re-fetches of still-missing bodies (requires mu_).
     void CollectMaintenanceLocked(std::vector<LogEntry> &resync,
                                   std::vector<ReconAction> &fetches);
+    // Physical accessor into the trailing-window synced_log by logical log_id;
+    // nullptr if the entry was GC'd (below synced_base) or not yet present.
+    LogEntry *SyncedAtLocked(uint64_t log_id);
+    // Drop durably-committed entries far below commit_point from memory (GC).
+    void GcSyncedLogLocked();
     // Persist a committed synced entry and advance commit_point (requires mu_).
     void CommitLocked(const ClientAndReqId &key);
 
@@ -194,6 +200,7 @@ private:
     const uint64_t recon_interval_us_;   // 0 = self-healing disabled
     OnMaintenance on_maintenance_;
     OnPostDrain on_post_drain_;
+    const uint64_t log_keep_;            // GC margin below commit_point (0 = off)
     uint64_t last_maint_us_ = 0;
     uint64_t last_resend_req_us_ = 0;   // follower: backoff for gap-resend requests
 

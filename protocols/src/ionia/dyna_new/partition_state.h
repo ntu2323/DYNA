@@ -15,6 +15,7 @@
 #include "dyna_new/dyna-new-proto.pb.h"  // proto::RequestType
 
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <queue>
 #include <string>
@@ -94,7 +95,13 @@ struct PartitionState {
     // of unsynced releases is used (for a follower read's log_pos) — reconciliation
     // rebuilds synced_log from the received bodies (known_) — so we keep a counter
     // instead of a growing vector of dead entries.
-    std::vector<LogEntry> synced_log;
+    //
+    // synced_log is a trailing window: durably-committed entries far below
+    // commit_point are dropped from memory (GC). `synced_base` is the logical
+    // log_id of synced_log.front(), so physical index = log_id - synced_base and
+    // sync_point = synced_base + synced_log.size().
+    std::deque<LogEntry> synced_log;
+    uint64_t synced_base = 0;
     uint64_t unsynced_count = 0;
     // §3.3: log position confirmed equal to the leader's.
     uint64_t sync_point = 0;

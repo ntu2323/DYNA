@@ -38,6 +38,9 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // client retry window, so a retried request is never evicted early.
     const size_t dedupCap =
         static_cast<size_t>(DeadlineConfig::EnvU64("DYNA_NEW_DEDUP_CAP", 8192));
+    // Trailing-window log GC: keep this many entries below commit_point in memory,
+    // drop older (durably-committed) ones. Must exceed any healthy follower's lag.
+    const uint64_t logKeep = DeadlineConfig::EnvU64("DYNA_NEW_LOG_KEEP", 4096);
 
     clocks_.reserve(numPartitions_);
     orderers_.reserve(numPartitions_);
@@ -61,7 +64,8 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
                         const std::vector<ReconAction> &fetches) {
                 OnMaintenance(pid, resync, fetches);
             },
-            [this, pid]() { OnPostDrain(pid); });
+            [this, pid]() { OnPostDrain(pid); },
+            logKeep);
         orderer->Start();
         orderers_.push_back(std::move(orderer));
     }
