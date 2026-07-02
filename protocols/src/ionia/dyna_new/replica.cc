@@ -115,6 +115,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         if (!req.ParseFromArray(data.data(), data.size())) {
             return;
         }
+        const uint64_t recv_arrival = WallClockMicros();   // stamp at arrival (§Step1)
         reqIn_.fetch_add(1, std::memory_order_relaxed);
 
         const uint32_t pid = PartitionOf(req.key(), numPartitions_);
@@ -145,12 +146,17 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
             }
         }
 
-        // OWD sample (§2): one-way delay = receive_time - send_time. Only sampled
-        // for genuinely-new requests so retries don't skew the estimate.
+        // OWD sample (§2): one-way delay = arrival_time - send_time (stamped at the
+        // top, before parse/dedup, so it reflects the wire+pickup, not our own
+        // processing). Only sampled for genuinely-new requests so retries don't skew.
+        // proc_delay = how long our own receive-path processing (parse/PartitionOf/
+        // dedup-lock) took before this point — a hop-latency breakdown (Step 1).
         const uint64_t now = WallClockMicros();
-        if (now > req.send_time()) {
+        procDelaySumUs_.fetch_add(now - recv_arrival, std::memory_order_relaxed);
+        procDelayCount_.fetch_add(1, std::memory_order_relaxed);
+        if (recv_arrival > req.send_time()) {
             std::lock_guard<std::mutex> lk(owd_mu_);
-            owd_.sample(req.client_id(), now - req.send_time());
+            owd_.sample(req.client_id(), recv_arrival - req.send_time());
         }
 
         LogEntry e;
@@ -293,7 +299,13 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
 void
 DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
 {
+    const uint64_t t0 = WallClockMicros();
     SendReply(pid, is_leader, e);
+    const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
+    replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
+    replySendCount_.fetch_add(1, std::memory_order_relaxed);
+    for (uint64_t cur = replySendMaxUs_.load(std::memory_order_relaxed);
+         dt > cur && !replySendMaxUs_.compare_exchange_weak(cur, dt); ) {}
     // Reads are not logged or synced (§6.3); only writes are reconciled. Accumulate
     // the sync; OnPostDrain flushes one SyncBatch for the whole drain (§9 batching,
     // zero added latency). Runs on this partition's release thread only.
@@ -471,9 +483,14 @@ DynaNewReplica::StatsDump()
         std::lock_guard<std::mutex> lk(owd_mu_);
         owdMax = owd_.max_estimate_us();
     }
+    const uint64_t pc = procDelayCount_.load(std::memory_order_relaxed);
+    const uint64_t procAvg = pc ? procDelaySumUs_.load() / pc : 0;
+    const uint64_t rc = replySendCount_.load(std::memory_order_relaxed);
+    const uint64_t replyAvg = rc ? replySendSumUs_.load() / rc : 0;
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
+           "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -484,6 +501,8 @@ DynaNewReplica::StatsDump()
            (unsigned long)fast, (unsigned long)slow,
            (unsigned long)resync, (unsigned long)refetch, (unsigned long)commits,
            (unsigned long)owdMax,
+           (unsigned long)procAvg, (unsigned long)replyAvg,
+           (unsigned long)replySendMaxUs_.load(std::memory_order_relaxed),
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {

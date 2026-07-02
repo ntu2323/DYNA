@@ -126,6 +126,10 @@ DynaNewClient::SendRequestProto(uint64_t request_id)
     if (!transport->SendMessageToAll(this, req)) {
         Warning("Failed to multicast dyna_new request");
     }
+    if (client_stats_enabled_) {
+        stat_send_issue_sum_us_ += NowMicros() - send_us;   // stamp → sent (Step 1)
+        stat_send_issue_count_++;
+    }
 }
 
 void
@@ -239,19 +243,24 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     }
     // Phase split: to_first p50 ≈ hold + 1 one-way; (total-to_first) ≈ quorum/
     // correction wait. bound_us is the deadline hold. p50 ≫ target => hold floor.
+    const uint64_t send_issue_avg =
+        stat_send_issue_count_ ? stat_send_issue_sum_us_ / stat_send_issue_count_ : 0;
     Notice("DYNA_NEW client stats [n=%zu]: total_us p50=%lu p90=%lu p99=%lu max=%lu; "
-           "to_first_us p50=%lu p90=%lu; quorum_wait_us p50=%lu; "
+           "to_first_us p50=%lu p90=%lu; quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
            "resends avg=%.2f max=%lu; bound_us=%lu pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
            (unsigned long)pct(tf, 0.5), (unsigned long)pct(tf, 0.9),
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
+           (unsigned long)send_issue_avg,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
            (unsigned long)bound_tracker_.bound_us(), pending_.size());
 
     stat_latencies_us_.clear();
     stat_to_first_us_.clear();
     stat_resends_.clear();
+    stat_send_issue_sum_us_ = 0;
+    stat_send_issue_count_ = 0;
 }
 
 } // namespace dyna_new

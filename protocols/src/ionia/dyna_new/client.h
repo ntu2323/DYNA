@@ -79,6 +79,10 @@ private:
     std::vector<uint64_t> stat_latencies_us_;   // total commit latency this window
     std::vector<uint64_t> stat_to_first_us_;    // submit→first-reply this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
+    // Client send-issue cost: send_time stamp → after SendMessageToAll (3x
+    // serialize+sendto). Cumulative; a hop-latency breakdown (Step 1).
+    uint64_t stat_send_issue_sum_us_ = 0;
+    uint64_t stat_send_issue_count_ = 0;
 };
 
 } // namespace dyna_new

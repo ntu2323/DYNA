@@ -72,6 +72,10 @@ private:
     std::atomic<uint64_t> reqIn_{0}, syncIn_{0}, confirmIn_{0}, commitIn_{0},
         fetchReqIn_{0}, fetchRespIn_{0};
     std::atomic<uint64_t> dedupSubmit_{0}, dedupDrop_{0}, dedupResend_{0};
+    // Hop-latency breakdown (Step 1): replica receive-processing (arrival→post-dedup)
+    // and reply-send (OnRelease→after SendMessage), to localize the ~85µs/hop.
+    std::atomic<uint64_t> procDelaySumUs_{0}, procDelayCount_{0};
+    std::atomic<uint64_t> replySendSumUs_{0}, replySendCount_{0}, replySendMaxUs_{0};
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.
