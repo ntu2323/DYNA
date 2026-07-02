@@ -426,20 +426,27 @@ PartitionOrderer::CollectMaintenanceLocked(std::vector<LogEntry> &resync,
     const uint64_t now = clock_->Now();
 
     if (role_ == Role::kLeader) {
-        // Re-broadcast Sync for entries still awaiting f+1 confirmations that have
-        // been uncommitted for at least one interval (i.e. a Sync or SyncConfirm
-        // was likely lost — a fresh Sync is idempotent and also re-elicits a
-        // confirm). Skip very recent entries whose first Sync is still in flight.
-        size_t budget = kMaxPerTick;
-        for (const auto &kv : confirm_state_) {
-            if (budget == 0) break;
-            if (kv.second.committed) continue;
-            if (now - kv.second.released_us < recon_interval_us_) continue;
-            auto it = synced_index_.find(kv.first);
-            if (it == synced_index_.end()) continue;
-            resync.push_back(state_.synced_log[it->second]);
+        // Re-sync ONLY the head-of-line unconfirmed entries. A follower drains
+        // syncs contiguously, so it blocks at the lowest missing log_id; re-sending
+        // later entries can't unblock it and just floods pending_syncs_ (that blind
+        // re-sync-everything caused a healing storm — millions of re-syncs/s). The
+        // uncommitted head sits at commit_point, so re-send a small window from
+        // there, each entry at most once per backoff. Genuinely-stuck entries heal
+        // in a few attempts; healthy in-flight entries are never touched.
+        static constexpr uint64_t kHeadWindow = 16;
+        static constexpr uint64_t kResyncBackoffUs = 20000;   // 20ms per entry
+        const uint64_t end =
+            std::min<uint64_t>(state_.sync_point, state_.commit_point + kHeadWindow);
+        for (uint64_t pos = state_.commit_point; pos < end; ++pos) {
+            const ClientAndReqId key = state_.synced_log[pos].Key();
+            auto it = confirm_state_.find(key);
+            if (it == confirm_state_.end() || it->second.committed) continue;
+            if (now - it->second.released_us < recon_interval_us_) continue;
+            if (it->second.last_resync_us != 0 &&
+                now - it->second.last_resync_us < kResyncBackoffUs) continue;
+            it->second.last_resync_us = now;
+            resync.push_back(state_.synced_log[pos]);
             resync_count_.fetch_add(1, std::memory_order_relaxed);
-            --budget;
         }
     } else {
         // Re-fetch bodies we are still blocked on (a fetch_resp was lost).

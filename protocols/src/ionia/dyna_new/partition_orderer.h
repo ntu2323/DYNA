@@ -206,6 +206,7 @@ private:
         std::unordered_set<uint32_t> confirmers; // follower replica_ids
         bool committed = false;
         uint64_t released_us = 0;                // when appended (for re-sync aging)
+        uint64_t last_resync_us = 0;             // last heal re-sync (per-entry backoff)
     };
     HashMap<ClientAndReqId, ConfirmState> confirm_state_; // leader only
     std::unordered_set<uint64_t> committed_positions_;    // committed but not yet folded into commit_point
