@@ -3,10 +3,12 @@
 #ifndef _DYNA_NEW_WALL_CLOCK_H_
 #define _DYNA_NEW_WALL_CLOCK_H_
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <thread>
 
 namespace specpaxos {
 namespace dyna_new {
@@ -41,34 +43,45 @@ public:
 
 class RealClock : public Clock {
 public:
+    // busy_poll: spin to a finite deadline instead of cv.wait_until, for
+    // µs-precise release. Once the transport busy-polls, cv/scheduler wakeup
+    // latency (~100s of µs on virtualized hosts) dominates commit latency.
+    explicit RealClock(bool busy_poll = false) : busy_poll_(busy_poll) {}
+
     uint64_t Now() override { return WallClockMicros(); }
 
     void SleepUntil(uint64_t until_us) override {
+        if (busy_poll_ && until_us != kNever) {
+            while (WallClockMicros() < until_us) {
+                if (interrupted_.exchange(false)) return;  // Submit/Stop woke us
+                std::this_thread::yield();                 // cooperative spin
+            }
+            interrupted_.store(false);
+            return;
+        }
+        // Idle (kNever) or non-busy: park on the condition variable.
         std::unique_lock<std::mutex> lk(mu_);
         if (until_us == kNever) {
-            cv_.wait(lk, [this] { return interrupted_; });
+            cv_.wait(lk, [this] { return interrupted_.load(); });
         } else {
             std::chrono::system_clock::time_point tp{
                 std::chrono::microseconds(until_us)};
-            // Returns on interrupt or when real time reaches tp; the caller
-            // re-checks Now(), so a plain timeout return is fine.
-            cv_.wait_until(lk, tp, [this] { return interrupted_; });
+            cv_.wait_until(lk, tp, [this] { return interrupted_.load(); });
         }
-        interrupted_ = false;
+        interrupted_.store(false);
     }
 
     void Interrupt() override {
-        {
-            std::lock_guard<std::mutex> lk(mu_);
-            interrupted_ = true;
-        }
+        interrupted_.store(true);
+        { std::lock_guard<std::mutex> lk(mu_); }   // barrier vs a cv waiter
         cv_.notify_all();
     }
 
 private:
     std::mutex mu_;
     std::condition_variable cv_;
-    bool interrupted_ = false;
+    std::atomic<bool> interrupted_{false};
+    bool busy_poll_ = false;
 };
 
 // Controllable clock for tests: virtual time only moves when told to, and every

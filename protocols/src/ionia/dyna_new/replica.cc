@@ -27,12 +27,17 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // One orderer per partition: leader of our own range, follower of the rest
     // (spec §1.2, §3). Each gets its own clock so a Submit only wakes that
     // partition's release loop.
+    // Busy-poll the release loop (spin to deadline) when the transport busy-polls,
+    // so cv/scheduler wakeup latency doesn't dominate commit latency.
+    const char *bp = std::getenv("DYNA_NEW_BUSY_POLL");
+    const bool busyPoll = (bp == nullptr) || (*bp != '0');
+
     clocks_.reserve(numPartitions_);
     orderers_.reserve(numPartitions_);
     dedup_.reserve(numPartitions_);
     pendingSync_.resize(numPartitions_);
     for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
-        clocks_.push_back(std::make_unique<RealClock>());
+        clocks_.push_back(std::make_unique<RealClock>(busyPoll));
         dedup_.push_back(std::make_unique<PartitionDedup>());
         const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
         auto role = is_leader ? PartitionOrderer::Role::kLeader

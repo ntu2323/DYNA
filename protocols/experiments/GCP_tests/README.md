@@ -179,7 +179,7 @@ python3 run_cluster_bench.py \
   --interval-ms 1000 \
   --trim-pad-sec 10 \
   -j 1 \
-  --poisson-rate 30 \
+  --poisson-rate 1 \
   --offered-ops-per-sec 0 \
   --max-inflight 0 \
   --replica-wait-sec 20
