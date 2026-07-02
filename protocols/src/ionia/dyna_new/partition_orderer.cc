@@ -233,6 +233,7 @@ PartitionOrderer::DrainSyncsLocked(std::vector<ReconAction> &out)
 
         fetch_inflight_.erase(sync.log_id);
         pending_syncs_.erase(sit);
+        known_.erase(bit);   // body now in synced_log; free the recon body-cache
 
         // A Commit may have raced ahead of this sync; apply it now (§7).
         if (pending_commits_.erase(key) > 0) {
