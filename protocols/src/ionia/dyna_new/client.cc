@@ -81,6 +81,7 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         request_id,
         /*send_us=*/0,
         /*first_submit_us=*/NowMicros(),
+        /*first_reply_us=*/0,
         /*resends=*/0,
         is_read,
         std::move(continuation),
@@ -181,6 +182,9 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
     if (reply.partition_id() != p.partition_id) {
         return;
     }
+    if (p.first_reply_us == 0) {
+        p.first_reply_us = NowMicros();   // phase split: submit→first reply
+    }
 
     // OWD feedback (ignored when 0 = insufficient samples).
     bound_tracker_.on_owd_sample(reply.replica_id(), reply.owd_estimate());
@@ -199,7 +203,10 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         p.resend_timer->Stop();   // committed: stop retransmitting
     }
     if (client_stats_enabled_) {
-        RecordCommitStat(NowMicros() - p.first_submit_us, p.resends);
+        const uint64_t now = NowMicros();
+        const uint64_t to_first = (p.first_reply_us > p.first_submit_us)
+                                      ? p.first_reply_us - p.first_submit_us : 0;
+        RecordCommitStat(now - p.first_submit_us, to_first, p.resends);
     }
     continuation_t cont = std::move(p.continuation);
     std::string result = p.is_read ? p.quorum.result() : std::string();
@@ -208,9 +215,11 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
 }
 
 void
-DynaNewClient::RecordCommitStat(uint64_t latency_us, uint32_t resends)
+DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
+                                uint32_t resends)
 {
-    stat_latencies_us_.push_back(latency_us);
+    stat_latencies_us_.push_back(total_us);
+    stat_to_first_us_.push_back(to_first_reply_us);
     stat_resends_.push_back(resends);
     if (stat_latencies_us_.size() < client_stats_every_) {
         return;
@@ -218,24 +227,30 @@ DynaNewClient::RecordCommitStat(uint64_t latency_us, uint32_t resends)
 
     std::vector<uint64_t> lat = stat_latencies_us_;
     std::sort(lat.begin(), lat.end());
-    auto pct = [&](double p) {
-        size_t idx = static_cast<size_t>(p * (lat.size() - 1));
-        return lat[idx];
+    std::vector<uint64_t> tf = stat_to_first_us_;
+    std::sort(tf.begin(), tf.end());
+    auto pct = [](const std::vector<uint64_t> &v, double p) {
+        return v[static_cast<size_t>(p * (v.size() - 1))];
     };
     uint64_t resend_sum = 0, max_resends = 0;
     for (uint32_t r : stat_resends_) {
         resend_sum += r;
         if (r > max_resends) max_resends = r;
     }
-    // p50 ≫ target => deadline-hold floor; large resends/max => loss+heal tail.
-    Notice("DYNA_NEW client stats [n=%zu]: latency_us p50=%lu p90=%lu p99=%lu max=%lu; "
+    // Phase split: to_first p50 ≈ hold + 1 one-way; (total-to_first) ≈ quorum/
+    // correction wait. bound_us is the deadline hold. p50 ≫ target => hold floor.
+    Notice("DYNA_NEW client stats [n=%zu]: total_us p50=%lu p90=%lu p99=%lu max=%lu; "
+           "to_first_us p50=%lu p90=%lu; quorum_wait_us p50=%lu; "
            "resends avg=%.2f max=%lu; bound_us=%lu pending=%zu",
-           lat.size(), (unsigned long)pct(0.5), (unsigned long)pct(0.9),
-           (unsigned long)pct(0.99), (unsigned long)lat.back(),
+           lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
+           (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
+           (unsigned long)pct(tf, 0.5), (unsigned long)pct(tf, 0.9),
+           (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
            (unsigned long)bound_tracker_.bound_us(), pending_.size());
 
     stat_latencies_us_.clear();
+    stat_to_first_us_.clear();
     stat_resends_.clear();
 }
 

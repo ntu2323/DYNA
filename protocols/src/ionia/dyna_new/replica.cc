@@ -466,9 +466,14 @@ DynaNewReplica::StatsDump()
     // Cumulative counters (diff consecutive lines for rates) + instantaneous
     // gauges. slow/(fast+slow) = slow-path ratio; resync/refetch = healing (loss);
     // confirmBacklog/syncGaps = commit/reconciliation backlog behind the tail.
+    uint64_t owdMax = 0;
+    {
+        std::lock_guard<std::mutex> lk(owd_mu_);
+        owdMax = owd_.max_estimate_us();
+    }
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
-           "heal[resync=%lu refetch=%lu] commits=%lu "
+           "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -478,6 +483,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)dedupResend_.load(),
            (unsigned long)fast, (unsigned long)slow,
            (unsigned long)resync, (unsigned long)refetch, (unsigned long)commits,
+           (unsigned long)owdMax,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {

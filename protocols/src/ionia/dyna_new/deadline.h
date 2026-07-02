@@ -67,6 +67,21 @@ public:
         ++next_[client_id];
     }
 
+    // Worst per-client OWD estimate (this is what drives a client's max-over-
+    // replicas bound). Diagnostic only.
+    uint64_t max_estimate_us() const {
+        uint64_t m = 0;
+        for (const auto &kv : windows_) {
+            if (kv.second.empty()) continue;
+            std::vector<uint64_t> sorted(kv.second);
+            std::sort(sorted.begin(), sorted.end());
+            size_t idx = (static_cast<size_t>(cfg_.owd_percentile_percent) *
+                          (sorted.size() - 1)) / 100;
+            if (sorted[idx] > m) m = sorted[idx];
+        }
+        return m;
+    }
+
     // 0 means "not enough samples yet" (matches the protobuf default sentinel).
     uint64_t estimate_us(uint64_t client_id) const {
         auto it = windows_.find(client_id);

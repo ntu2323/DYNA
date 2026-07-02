@@ -43,6 +43,7 @@ private:
         uint64_t request_id = 0;
         uint64_t send_us = 0;
         uint64_t first_submit_us = 0;   // for end-to-end commit latency (stats)
+        uint64_t first_reply_us = 0;    // when the first reply arrived (phase split)
         uint32_t resends = 0;           // retransmit count for this request (stats)
         bool is_read = false;
         continuation_t continuation;
@@ -61,7 +62,9 @@ private:
     // Resend timer callback: resend + reschedule while the request is pending.
     void OnResendTimeout(uint64_t request_id);
     // DYNA_NEW_CLIENT_STATS: record a commit and periodically log percentiles.
-    void RecordCommitStat(uint64_t latency_us, uint32_t resends);
+    // total = submit→commit; to_first_reply = submit→first reply (hold + 1 one-way).
+    void RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
+                          uint32_t resends);
 
     uint64_t last_req_id_ = 0;
     uint32_t num_partitions_;
@@ -73,7 +76,8 @@ private:
     // Client-side diagnostics (off unless DYNA_NEW_CLIENT_STATS is set).
     bool client_stats_enabled_ = false;
     uint64_t client_stats_every_ = 10000;
-    std::vector<uint64_t> stat_latencies_us_;   // commit latency this window
+    std::vector<uint64_t> stat_latencies_us_;   // total commit latency this window
+    std::vector<uint64_t> stat_to_first_us_;    // submit→first-reply this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
 };
 
