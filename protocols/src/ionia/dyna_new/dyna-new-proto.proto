@@ -79,6 +79,16 @@ message CommitBatch {
     repeated Commit entries      = 2;
 }
 
+// follower → leader when it is stuck at a missing Sync (never received the Sync
+// for its sync_point, so it can't Fetch a body it doesn't know). The leader
+// re-sends Syncs from that position to just this follower — targeted gap recovery
+// that heals a follower which fell behind (head-of-line re-sync can't reach it).
+message SyncResendRequest {
+    required uint32 partition_id = 1;
+    required uint32 replica_id   = 2;
+    required uint64 from_log_id  = 3;
+}
+
 // follower → leader when sync arrives for a request the follower never saw  (§4)
 message FetchRequest {
     required uint32 partition_id = 1;

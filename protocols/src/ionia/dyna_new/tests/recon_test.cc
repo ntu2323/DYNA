@@ -262,3 +262,49 @@ TEST(SelfHealing, FollowerRefetchesMissingBody)
     fol.CollectMaintenanceForTest(rs, f);
     EXPECT_EQ(CountKind(f, ReconAction::Kind::kFetch), 0);
 }
+
+// Targeted gap recovery: a follower stuck at a MISSING Sync (has later syncs but
+// not the one at sync_point) asks the leader to re-send from sync_point.
+TEST(SelfHealing, FollowerRequestsResendWhenStuckAtMissingSync)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    PartitionOrderer fol(0, 0, &backend, &clock, PartitionOrderer::Role::kFollower);
+
+    // Sync for log 1 arrives; log 0's Sync was lost -> can't drain, stuck at 0.
+    fol.HandleSync(Sync(1, 1, 2, 200));
+    ASSERT_EQ(fol.sync_point(), 0u);
+
+    std::vector<LogEntry> rs;
+    std::vector<ReconAction> f;
+    fol.CollectMaintenanceForTest(rs, f);
+    ASSERT_EQ(CountKind(f, ReconAction::Kind::kSyncResend), 1);
+    for (const auto &a : f) {
+        if (a.kind == ReconAction::Kind::kSyncResend) EXPECT_EQ(a.log_id, 0u);
+    }
+}
+
+// The leader answers a resend request with the requested window of synced entries.
+TEST(SelfHealing, LeaderCollectResyncReturnsWindow)
+{
+    InMemoryBackend backend;
+    MockClock clock(0);
+    PartitionOrderer ldr(0, 0, &backend, &clock, PartitionOrderer::Role::kLeader);
+
+    ldr.Submit(Write(1, 1, 100));
+    ldr.Submit(Write(1, 2, 200));
+    clock.Set(200);
+    ldr.ReleaseDue();   // both appended to synced_log (quorum 1 self-commits)
+
+    std::vector<LogEntry> out;
+    ldr.LeaderCollectResync(0, 64, out);
+    ASSERT_EQ(out.size(), 2u);
+    EXPECT_EQ(out[0].request_id, 1u);
+    EXPECT_EQ(out[0].log_pos, 0u);
+    EXPECT_EQ(out[1].request_id, 2u);
+    EXPECT_EQ(out[1].log_pos, 1u);
+
+    std::vector<LogEntry> beyond;
+    ldr.LeaderCollectResync(5, 64, beyond);
+    EXPECT_TRUE(beyond.empty());
+}

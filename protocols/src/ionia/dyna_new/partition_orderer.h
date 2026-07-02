@@ -46,7 +46,9 @@ struct SyncIn {
 
 // What the replica should send after a follower processes a sync / fetch_resp.
 struct ReconAction {
-    enum class Kind { kConfirm, kReply, kCorrectedReply, kFetch };
+    // kSyncResend: follower asks the leader to re-send Syncs from log_id (it is
+    // stuck at a missing Sync it cannot Fetch). entry unused; log_id = from.
+    enum class Kind { kConfirm, kReply, kCorrectedReply, kFetch, kSyncResend };
     Kind kind;
     LogEntry entry;        // body for replies (deadline set to the leader's); for
                            // confirm/fetch only client_id/request_id are used
@@ -119,6 +121,11 @@ public:
     // Look up a synced entry by ⟨client,req⟩ so the leader can answer a fetch.
     bool LeaderFetch(uint64_t client_id, uint64_t request_id, LogEntry &out) const;
 
+    // Leader: gather synced_log entries [from_log_id, from_log_id+max) to re-send
+    // to a follower stuck at a missing Sync (targeted gap recovery).
+    void LeaderCollectResync(uint64_t from_log_id, size_t max,
+                             std::vector<LogEntry> &out) const;
+
     // --- background ordering / persistence (spec §7) ---
     // Leader: record a follower's sync_confirm for a synced write. When the
     // request reaches commit_quorum confirmations (the leader's own append plus
@@ -189,6 +196,7 @@ private:
     OnMaintenance on_maintenance_;
     OnPostDrain on_post_drain_;
     uint64_t last_maint_us_ = 0;
+    uint64_t last_resend_req_us_ = 0;   // follower: backoff for gap-resend requests
 
     mutable std::mutex mu_;
     PartitionState state_;

@@ -468,6 +468,33 @@ PartitionOrderer::CollectMaintenanceLocked(std::vector<LogEntry> &resync,
             refetch_count_.fetch_add(1, std::memory_order_relaxed);
             --budget;
         }
+        // Stuck at a MISSING Sync: pending_syncs_ has later entries but not the one
+        // at sync_point (we never received it, so we can't Fetch a body we don't
+        // know). Ask the leader to re-send Syncs from sync_point. Backoff-limited.
+        static constexpr uint64_t kResendReqBackoffUs = 10000;   // 10ms
+        if (!pending_syncs_.empty() &&
+            pending_syncs_.find(state_.sync_point) == pending_syncs_.end() &&
+            (last_resend_req_us_ == 0 ||
+             now - last_resend_req_us_ >= kResendReqBackoffUs)) {
+            last_resend_req_us_ = now;
+            ReconAction a;
+            a.kind = ReconAction::Kind::kSyncResend;
+            a.log_id = state_.sync_point;
+            fetches.push_back(std::move(a));
+        }
+    }
+}
+
+void
+PartitionOrderer::LeaderCollectResync(uint64_t from_log_id, size_t max,
+                                      std::vector<LogEntry> &out) const
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    if (role_ != Role::kLeader) return;
+    const uint64_t end =
+        std::min<uint64_t>(state_.synced_log.size(), from_log_id + max);
+    for (uint64_t pos = from_log_id; pos < end; ++pos) {
+        out.push_back(state_.synced_log[pos]);
     }
 }
 

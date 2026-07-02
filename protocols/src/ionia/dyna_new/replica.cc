@@ -91,6 +91,8 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         proto::SyncConfirmBatch::default_instance().GetDescriptor()->full_name();
     const static auto commitName =
         proto::CommitBatch::default_instance().GetDescriptor()->full_name();
+    const static auto syncResendName =
+        proto::SyncResendRequest::default_instance().GetDescriptor()->full_name();
     const static auto fetchReqName =
         proto::FetchRequest::default_instance().GetDescriptor()->full_name();
     const static auto fetchRespName =
@@ -205,6 +207,32 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         commitIn_.fetch_add(cb.entries_size(), std::memory_order_relaxed);
         for (const proto::Commit &cm : cb.entries()) {
             orderers_[pid]->HandleCommit(cm.client_id(), cm.request_id());
+        }
+        return;
+    }
+
+    if (type == syncResendName) {
+        // A follower is stuck at a missing Sync; re-send Syncs from there to it
+        // only (targeted gap recovery). Leader-role orderer answers; others no-op.
+        proto::SyncResendRequest rr;
+        if (!rr.ParseFromArray(data.data(), data.size())) return;
+        const uint32_t pid = rr.partition_id();
+        if (pid >= orderers_.size()) return;
+        std::vector<LogEntry> entries;
+        orderers_[pid]->LeaderCollectResync(rr.from_log_id(), /*max=*/64, entries);
+        if (!entries.empty()) {
+            proto::SyncBatch batch;
+            batch.set_partition_id(pid);
+            for (const LogEntry &e : entries) {
+                proto::Sync *s = batch.add_entries();
+                s->set_view_id(0);
+                s->set_partition_id(pid);
+                s->set_log_id(e.log_pos);
+                s->set_client_id(e.client_id);
+                s->set_request_id(e.request_id);
+                s->set_deadline(e.deadline);
+            }
+            transport->SendMessageToReplica(this, rr.replica_id(), batch);
         }
         return;
     }
@@ -350,6 +378,14 @@ DynaNewReplica::ExecuteReconActions(uint32_t pid,
             fr.set_client_id(a.entry.client_id);
             fr.set_request_id(a.entry.request_id);
             transport->SendMessageToReplica(this, leader, fr);
+            break;
+        }
+        case ReconAction::Kind::kSyncResend: {
+            proto::SyncResendRequest rr;
+            rr.set_partition_id(pid);
+            rr.set_replica_id(static_cast<uint32_t>(replicaIdx));
+            rr.set_from_log_id(a.log_id);
+            transport->SendMessageToReplica(this, leader, rr);
             break;
         }
         }
