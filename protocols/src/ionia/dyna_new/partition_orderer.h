@@ -74,12 +74,18 @@ public:
     using OnMaintenance = std::function<void(const std::vector<LogEntry> &resync,
                                              const std::vector<ReconAction> &fetches)>;
 
+    // Fired once after each release drain (all per-entry on_release callbacks for
+    // that drain have run, lock released). Lets the replica flush one batched Sync
+    // for everything released together — batching with zero added latency.
+    using OnPostDrain = std::function<void()>;
+
     PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                      StorageBackend *backend, Clock *clock,
                      Role role = Role::kLeader, OnRelease on_release = nullptr,
                      uint32_t commit_quorum = 1,
                      uint64_t recon_interval_us = 0,
-                     OnMaintenance on_maintenance = nullptr);
+                     OnMaintenance on_maintenance = nullptr,
+                     OnPostDrain on_post_drain = nullptr);
     ~PartitionOrderer();
 
     PartitionOrderer(const PartitionOrderer &) = delete;
@@ -181,6 +187,7 @@ private:
     const uint32_t commit_quorum_;
     const uint64_t recon_interval_us_;   // 0 = self-healing disabled
     OnMaintenance on_maintenance_;
+    OnPostDrain on_post_drain_;
     uint64_t last_maint_us_ = 0;
 
     mutable std::mutex mu_;

@@ -30,6 +30,7 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     clocks_.reserve(numPartitions_);
     orderers_.reserve(numPartitions_);
     dedup_.reserve(numPartitions_);
+    pendingSync_.resize(numPartitions_);
     for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
         clocks_.push_back(std::make_unique<RealClock>());
         dedup_.push_back(std::make_unique<PartitionDedup>());
@@ -46,7 +47,8 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
             [this, pid](const std::vector<LogEntry> &resync,
                         const std::vector<ReconAction> &fetches) {
                 OnMaintenance(pid, resync, fetches);
-            });
+            },
+            [this, pid]() { OnPostDrain(pid); });
         orderer->Start();
         orderers_.push_back(std::move(orderer));
     }
@@ -79,11 +81,11 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     const static auto requestName =
         proto::Request::default_instance().GetDescriptor()->full_name();
     const static auto syncName =
-        proto::Sync::default_instance().GetDescriptor()->full_name();
+        proto::SyncBatch::default_instance().GetDescriptor()->full_name();
     const static auto syncConfirmName =
-        proto::SyncConfirm::default_instance().GetDescriptor()->full_name();
+        proto::SyncConfirmBatch::default_instance().GetDescriptor()->full_name();
     const static auto commitName =
-        proto::Commit::default_instance().GetDescriptor()->full_name();
+        proto::CommitBatch::default_instance().GetDescriptor()->full_name();
     const static auto fetchReqName =
         proto::FetchRequest::default_instance().GetDescriptor()->full_name();
     const static auto fetchRespName =
@@ -147,45 +149,58 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     }
 
     if (type == syncName) {
-        proto::Sync s;
+        proto::SyncBatch s;
         if (!s.ParseFromArray(data.data(), data.size())) return;
-        syncIn_.fetch_add(1, std::memory_order_relaxed);
         const uint32_t pid = s.partition_id();
         if (pid >= orderers_.size()) return;
-        SyncIn in;
-        in.view_id = s.view_id();
-        in.log_id = s.log_id();
-        in.client_id = s.client_id();
-        in.request_id = s.request_id();
-        in.deadline = s.deadline();
-        ExecuteReconActions(pid, orderers_[pid]->HandleSync(in));
+        syncIn_.fetch_add(s.entries_size(), std::memory_order_relaxed);
+        // Feed entries in log order to the per-entry handler; batch the resulting
+        // confirms/replies into single messages via ExecuteReconActions.
+        std::vector<ReconAction> actions;
+        for (const proto::Sync &e : s.entries()) {
+            SyncIn in;
+            in.view_id = e.view_id();
+            in.log_id = e.log_id();
+            in.client_id = e.client_id();
+            in.request_id = e.request_id();
+            in.deadline = e.deadline();
+            auto a = orderers_[pid]->HandleSync(in);
+            actions.insert(actions.end(), a.begin(), a.end());
+        }
+        ExecuteReconActions(pid, actions);
         return;
     }
 
     if (type == syncConfirmName) {
-        // A follower reports log agreement. The leader tallies confirmations and,
-        // on f+1 (including its own append), persists off-path and broadcasts a
-        // Commit (§7).
-        proto::SyncConfirm c;
-        if (!c.ParseFromArray(data.data(), data.size())) return;
-        confirmIn_.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t pid = c.partition_id();
+        // A follower reports log agreement (batched). The leader tallies each and,
+        // on f+1 (including its own append), persists off-path (§7); committed
+        // entries are broadcast in one CommitBatch.
+        proto::SyncConfirmBatch cb;
+        if (!cb.ParseFromArray(data.data(), data.size())) return;
+        const uint32_t pid = cb.partition_id();
         if (pid >= orderers_.size()) return;
-        if (orderers_[pid]->HandleSyncConfirm(c.replica_id(), c.client_id(),
-                                              c.request_id(), c.deadline())) {
-            BroadcastCommit(pid, c.client_id(), c.request_id());
+        confirmIn_.fetch_add(cb.entries_size(), std::memory_order_relaxed);
+        std::vector<ClientAndReqId> committed;
+        for (const proto::SyncConfirm &c : cb.entries()) {
+            if (orderers_[pid]->HandleSyncConfirm(c.replica_id(), c.client_id(),
+                                                  c.request_id(), c.deadline())) {
+                committed.push_back(ClientAndReqId{c.client_id(), c.request_id()});
+            }
         }
+        BroadcastCommitBatch(pid, committed);
         return;
     }
 
     if (type == commitName) {
-        // Background commit from the partition leader: persist our own copy (§7).
-        proto::Commit cm;
-        if (!cm.ParseFromArray(data.data(), data.size())) return;
-        commitIn_.fetch_add(1, std::memory_order_relaxed);
-        const uint32_t pid = cm.partition_id();
+        // Background commit from the partition leader (batched): persist our copies.
+        proto::CommitBatch cb;
+        if (!cb.ParseFromArray(data.data(), data.size())) return;
+        const uint32_t pid = cb.partition_id();
         if (pid >= orderers_.size()) return;
-        orderers_[pid]->HandleCommit(cm.client_id(), cm.request_id());
+        commitIn_.fetch_add(cb.entries_size(), std::memory_order_relaxed);
+        for (const proto::Commit &cm : cb.entries()) {
+            orderers_[pid]->HandleCommit(cm.client_id(), cm.request_id());
+        }
         return;
     }
 
@@ -234,10 +249,22 @@ void
 DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
 {
     SendReply(pid, is_leader, e);
-    // Reads are not logged or synced (§6.3); only writes are reconciled.
+    // Reads are not logged or synced (§6.3); only writes are reconciled. Accumulate
+    // the sync; OnPostDrain flushes one SyncBatch for the whole drain (§9 batching,
+    // zero added latency). Runs on this partition's release thread only.
     if (is_leader && e.type != proto::READ_ONLY) {
-        BroadcastSync(pid, e);   // followers reconcile against this (§6.4)
+        pendingSync_[pid].push_back(e);
     }
+}
+
+void
+DynaNewReplica::OnPostDrain(uint32_t pid)
+{
+    if (pendingSync_[pid].empty()) {
+        return;
+    }
+    BroadcastSyncBatch(pid, pendingSync_[pid]);
+    pendingSync_[pid].clear();
 }
 
 void
@@ -245,11 +272,10 @@ DynaNewReplica::OnMaintenance(uint32_t pid,
                               const std::vector<LogEntry> &resync,
                               const std::vector<ReconAction> &fetches)
 {
-    // Leader: re-broadcast Sync for entries still awaiting confirmations (a fresh
-    // Sync is idempotent and re-elicits a lost SyncConfirm). Follower: resend the
-    // pending fetches (ExecuteReconActions handles kFetch).
-    for (const LogEntry &e : resync) {
-        BroadcastSync(pid, e);
+    // Leader: re-broadcast Sync (one batch) for entries still awaiting confirmations
+    // — idempotent + re-elicits a lost SyncConfirm. Follower: resend pending fetches.
+    if (!resync.empty()) {
+        BroadcastSyncBatch(pid, resync);
     }
     if (!fetches.empty()) {
         ExecuteReconActions(pid, fetches);
@@ -257,28 +283,37 @@ DynaNewReplica::OnMaintenance(uint32_t pid,
 }
 
 void
-DynaNewReplica::BroadcastSync(uint32_t pid, const LogEntry &e)
+DynaNewReplica::BroadcastSyncBatch(uint32_t pid, const std::vector<LogEntry> &entries)
 {
-    proto::Sync sync;
-    sync.set_view_id(0);
-    sync.set_partition_id(pid);
-    sync.set_log_id(e.log_pos);
-    sync.set_client_id(e.client_id);
-    sync.set_request_id(e.request_id);
-    sync.set_deadline(e.deadline);   // possibly reassigned by the slow path (§6.2)
-    transport->SendMessageToAll(this, sync);   // self ignores (leader-role HandleSync)
+    proto::SyncBatch batch;
+    batch.set_partition_id(pid);
+    for (const LogEntry &e : entries) {
+        proto::Sync *sync = batch.add_entries();
+        sync->set_view_id(0);
+        sync->set_partition_id(pid);
+        sync->set_log_id(e.log_pos);
+        sync->set_client_id(e.client_id);
+        sync->set_request_id(e.request_id);
+        sync->set_deadline(e.deadline);   // possibly reassigned by the slow path (§6.2)
+    }
+    transport->SendMessageToAll(this, batch);   // self ignores (leader-role HandleSync)
 }
 
 void
-DynaNewReplica::BroadcastCommit(uint32_t pid, uint64_t client_id,
-                                uint64_t request_id)
+DynaNewReplica::BroadcastCommitBatch(uint32_t pid,
+                                     const std::vector<ClientAndReqId> &committed)
 {
-    proto::Commit commit;
-    commit.set_view_id(0);
-    commit.set_partition_id(pid);
-    commit.set_client_id(client_id);
-    commit.set_request_id(request_id);
-    transport->SendMessageToAll(this, commit);   // self ignores (leader-role HandleCommit)
+    if (committed.empty()) return;
+    proto::CommitBatch batch;
+    batch.set_partition_id(pid);
+    for (const ClientAndReqId &k : committed) {
+        proto::Commit *commit = batch.add_entries();
+        commit->set_view_id(0);
+        commit->set_partition_id(pid);
+        commit->set_client_id(k.clientid);
+        commit->set_request_id(k.clientreqid);
+    }
+    transport->SendMessageToAll(this, batch);   // self ignores (leader-role HandleCommit)
 }
 
 void
@@ -286,6 +321,8 @@ DynaNewReplica::ExecuteReconActions(uint32_t pid,
                                     const std::vector<ReconAction> &actions)
 {
     const uint32_t leader = LeaderOf(pid, numPartitions_);
+    proto::SyncConfirmBatch confirms;   // batched to the leader (§9)
+    confirms.set_partition_id(pid);
     for (const ReconAction &a : actions) {
         switch (a.kind) {
         case ReconAction::Kind::kReply:
@@ -293,14 +330,13 @@ DynaNewReplica::ExecuteReconActions(uint32_t pid,
             SendReply(pid, /*is_leader=*/false, a.entry);
             break;
         case ReconAction::Kind::kConfirm: {
-            proto::SyncConfirm c;
-            c.set_view_id(0);
-            c.set_replica_id(static_cast<uint32_t>(replicaIdx));
-            c.set_partition_id(pid);
-            c.set_client_id(a.entry.client_id);
-            c.set_request_id(a.entry.request_id);
-            c.set_deadline(a.deadline);
-            transport->SendMessageToReplica(this, leader, c);
+            proto::SyncConfirm *c = confirms.add_entries();
+            c->set_view_id(0);
+            c->set_replica_id(static_cast<uint32_t>(replicaIdx));
+            c->set_partition_id(pid);
+            c->set_client_id(a.entry.client_id);
+            c->set_request_id(a.entry.request_id);
+            c->set_deadline(a.deadline);
             break;
         }
         case ReconAction::Kind::kFetch: {
@@ -312,6 +348,9 @@ DynaNewReplica::ExecuteReconActions(uint32_t pid,
             break;
         }
         }
+    }
+    if (confirms.entries_size() > 0) {
+        transport->SendMessageToReplica(this, leader, confirms);
     }
 }
 

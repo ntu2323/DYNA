@@ -13,13 +13,15 @@ PartitionOrderer::PartitionOrderer(uint32_t partition_id, uint64_t view_id,
                                    Role role, OnRelease on_release,
                                    uint32_t commit_quorum,
                                    uint64_t recon_interval_us,
-                                   OnMaintenance on_maintenance)
+                                   OnMaintenance on_maintenance,
+                                   OnPostDrain on_post_drain)
     : partition_id_(partition_id), view_id_(view_id),
       backend_(backend), clock_(clock), role_(role),
       on_release_(std::move(on_release)),
       commit_quorum_(commit_quorum == 0 ? 1 : commit_quorum),
       recon_interval_us_(recon_interval_us),
-      on_maintenance_(std::move(on_maintenance))
+      on_maintenance_(std::move(on_maintenance)),
+      on_post_drain_(std::move(on_post_drain))
 {
     state_.view_id = view_id;
 }
@@ -71,6 +73,7 @@ PartitionOrderer::ReleaseDue()
     for (const LogEntry &e : released) {
         if (on_release_) on_release_(e);
     }
+    if (!released.empty() && on_post_drain_) on_post_drain_();
     return released.size();
 }
 
@@ -387,6 +390,7 @@ PartitionOrderer::ReleaseLoop()
         for (const LogEntry &e : released) {
             if (on_release_) on_release_(e);
         }
+        if (!released.empty() && on_post_drain_) on_post_drain_();
 
         // Periodic self-healing: re-send Sync/Fetch so a lost control message
         // can't leave a permanent reconciliation gap. Off when interval is 0.

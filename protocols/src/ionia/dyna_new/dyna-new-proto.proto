@@ -61,6 +61,24 @@ message Commit {
     required uint64 request_id   = 4;
 }
 
+// Batched variants (§9 "sync may be batched"): one message carries many entries
+// released/confirmed/committed together, cutting per-op transport-thread load.
+// Elements reuse the singular messages; the batch's partition_id is authoritative.
+message SyncBatch {
+    required uint32 partition_id = 1;
+    repeated Sync   entries      = 2;
+}
+
+message SyncConfirmBatch {
+    required uint32      partition_id = 1;
+    repeated SyncConfirm entries      = 2;
+}
+
+message CommitBatch {
+    required uint32 partition_id = 1;
+    repeated Commit entries      = 2;
+}
+
 // follower → leader when sync arrives for a request the follower never saw  (§4)
 message FetchRequest {
     required uint32 partition_id = 1;

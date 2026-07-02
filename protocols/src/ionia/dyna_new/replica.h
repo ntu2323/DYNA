@@ -44,12 +44,17 @@ private:
     void OnMaintenance(uint32_t pid,
                        const std::vector<LogEntry> &resync,
                        const std::vector<ReconAction> &fetches);
+    // Flush the SyncBatch accumulated during a release drain (leader, §9 batching).
+    void OnPostDrain(uint32_t pid);
     void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
-    void BroadcastSync(uint32_t pid, const LogEntry &e);
+    // One SyncBatch / CommitBatch for many entries (cuts per-op transport load).
+    void BroadcastSyncBatch(uint32_t pid, const std::vector<LogEntry> &entries);
+    void BroadcastCommitBatch(uint32_t pid,
+                              const std::vector<ClientAndReqId> &committed);
     // DYNA_NEW_STATS: periodic per-partition stats dump (re-arms itself).
     void StatsDump();
-    void BroadcastCommit(uint32_t pid, uint64_t client_id, uint64_t request_id);
-    // Executes the messages a follower's reconciliation asked us to send.
+    // Executes the messages a follower's reconciliation asked us to send; batches
+    // the sync_confirms into a single SyncConfirmBatch.
     void ExecuteReconActions(uint32_t pid, const std::vector<ReconAction> &actions);
 
     specpaxos::Configuration config;
@@ -86,6 +91,11 @@ private:
         RequestDedup dedup;
     };
     std::vector<std::unique_ptr<PartitionDedup>> dedup_;
+
+    // Per-partition Sync accumulator: the leader appends released writes in
+    // OnRelease and flushes one SyncBatch in OnPostDrain. Touched only by that
+    // partition's single release thread, so it needs no lock.
+    std::vector<std::vector<LogEntry>> pendingSync_;
 };
 
 } // namespace dyna_new
