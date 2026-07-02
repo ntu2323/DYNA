@@ -76,6 +76,9 @@ private:
     // and reply-send (OnRelease→after SendMessage), to localize the ~85µs/hop.
     std::atomic<uint64_t> procDelaySumUs_{0}, procDelayCount_{0};
     std::atomic<uint64_t> replySendSumUs_{0}, replySendCount_{0}, replySendMaxUs_{0};
+    // Finer split: just the transport->SendMessage call inside SendReply (serialize
+    // + sendto). replySend − replyXmit ≈ our own pre-send work + deschedule.
+    std::atomic<uint64_t> replyXmitSumUs_{0}, replyXmitCount_{0};
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

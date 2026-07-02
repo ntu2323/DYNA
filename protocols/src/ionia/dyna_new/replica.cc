@@ -457,7 +457,11 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
         dedup_[pid]->dedup.OnReply(key, reply);
     }
 
+    const uint64_t xt0 = WallClockMicros();
     transport->SendMessage(this, *e.client_addr, reply);
+    const uint64_t xdt = WallClockMicros() - xt0;
+    replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);
+    replyXmitCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void
@@ -487,10 +491,12 @@ DynaNewReplica::StatsDump()
     const uint64_t procAvg = pc ? procDelaySumUs_.load() / pc : 0;
     const uint64_t rc = replySendCount_.load(std::memory_order_relaxed);
     const uint64_t replyAvg = rc ? replySendSumUs_.load() / rc : 0;
+    const uint64_t xc = replyXmitCount_.load(std::memory_order_relaxed);
+    const uint64_t xmitAvg = xc ? replyXmitSumUs_.load() / xc : 0;
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
-           "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] "
+           "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -503,6 +509,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)owdMax,
            (unsigned long)procAvg, (unsigned long)replyAvg,
            (unsigned long)replySendMaxUs_.load(std::memory_order_relaxed),
+           (unsigned long)xmitAvg,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {
