@@ -373,7 +373,13 @@ int main(int argc, char **argv)
         const size_t num_socket_cores = std::max<std::size_t>(1, CpuCountOnNumaNode(numa_node));
         auto ht_ct = std::max<std::size_t>(1, std::min(num_socket_cores, static_cast<std::size_t>(numRequests)));
 
-        const bool ionia_multithread = (proto == PROTO_VR);
+        // dyna_new busy-polls too (matches the replica) for low-latency pickup;
+        // DYNA_NEW_BUSY_POLL=0 disables for A/B comparison.
+        bool ionia_multithread = (proto == PROTO_VR);
+        if (proto == PROTO_DYNA_NEW) {
+            const char *bp = std::getenv("DYNA_NEW_BUSY_POLL");
+            ionia_multithread = (bp == nullptr) || (*bp != '0');
+        }
         FastTransport transport(config, ht_ct, 1, physical_port, numa_node, thread_id,
                               0, 0, ionia_multithread);
 

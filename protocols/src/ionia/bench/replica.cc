@@ -296,7 +296,12 @@ main(int argc, char **argv)
     }
 
     if (proto == PROTO_DYNA_NEW) {
-        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, false);
+        // Busy-poll transport (like VR/IONIA) for sub-µs packet pickup: epoll-blocking
+        // wakeups cost ~100s of µs/hop on these VMs, inflating latency AND the measured
+        // OWD (=> the deadline hold). Env-gated (DYNA_NEW_BUSY_POLL=0 to A/B).
+        const char *bp = std::getenv("DYNA_NEW_BUSY_POLL");
+        const bool busyPoll = (bp == nullptr) || (*bp != '0');
+        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, busyPoll);
         specpaxos::dyna_new::DynaNewReplica replica(internalConfig, index, &transport);
         transport.Run();
         return 0;
