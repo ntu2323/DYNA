@@ -93,8 +93,9 @@ private:
             if (v.size() < 16384) v.push_back(x);
         }
     };
-    LatSampler residenceSampler_;   // arrival_us → release
+    LatSampler residenceSampler_;   // arrival_us → release_time (client-visible)
     LatSampler lateSampler_;        // release − deadline (clamped ≥0)
+    LatSampler presendSampler_;     // time inside SendReply before the send stamp
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

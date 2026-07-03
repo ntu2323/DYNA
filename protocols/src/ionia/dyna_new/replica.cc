@@ -314,9 +314,6 @@ DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
     }
     releaseLateCount_.fetch_add(1, std::memory_order_relaxed);
     lateSampler_.add(late);
-    if (e.arrival_us != 0 && t0 > e.arrival_us) {
-        residenceSampler_.add(t0 - e.arrival_us);   // arrival→release (p50)
-    }
     SendReply(pid, is_leader, e);
     const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
     replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
@@ -443,6 +440,7 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
         return;
     }
 
+    const uint64_t sr_start = WallClockMicros();   // SendReply entry (presend probe)
     proto::Reply reply;
     reply.set_view_id(0);
     reply.set_replica_id(static_cast<uint32_t>(replicaIdx));
@@ -478,6 +476,14 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     // PTP-comparable release stamp so the client can split to_first into a true
     // forward leg (send→release) and reverse leg (release→client-recv).
     reply.set_release_time(xt0);
+    // residence = arrival→release_time (what the client's fwd leg actually sees,
+    // skew-immune replica-only). presend = time spent in SendReply BEFORE this
+    // stamp (reply build + owd_mu_ + dedup OnReply locks) — isolates whether the
+    // fwd cost is here vs the wire.
+    if (e.arrival_us != 0 && xt0 > e.arrival_us) {
+        residenceSampler_.add(xt0 - e.arrival_us);
+    }
+    presendSampler_.add(xt0 - sr_start);
     transport->SendMessage(this, *e.client_addr, reply);
     const uint64_t xdt = WallClockMicros() - xt0;
     replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);
@@ -526,15 +532,16 @@ DynaNewReplica::StatsDump()
         p50 = v[v.size() / 2];
         p90 = v[(v.size() * 9) / 10];
     };
-    uint64_t resP50, resP90, lateP50, lateP90;
+    uint64_t resP50, resP90, lateP50, lateP90, preP50, preP90;
     drain(residenceSampler_, resP50, resP90);
     drain(lateSampler_, lateP50, lateP90);
+    drain(presendSampler_, preP50, preP90);
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
            "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
            "releaseLate_us[avg=%lu max=%lu] "
-           "residence_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
+           "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -551,6 +558,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)lateAvg,
            (unsigned long)releaseLateMaxUs_.load(std::memory_order_relaxed),
            (unsigned long)resP50, (unsigned long)resP90,
+           (unsigned long)preP50, (unsigned long)preP90,
            (unsigned long)lateP50, (unsigned long)lateP90,
            confirmBacklog, syncGaps, earlyBuf);
 
