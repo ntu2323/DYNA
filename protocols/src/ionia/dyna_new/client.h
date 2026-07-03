@@ -84,6 +84,11 @@ private:
     // Per-replica forward leg (release_time − send), indexed by replica_id. Shows
     // whether DYNA is "fast everywhere" or one replica drags the deadline/commit.
     std::vector<std::vector<uint64_t>> stat_fwd_by_replica_;
+    // NTP 4-timestamp diagnostic (T1=send, T2=reply.recv_time, T3=reply.release_time,
+    // T4=recv): θ = client↔replica clock offset, δ = true network round-trip delay.
+    // Signed: a real clock offset can be either sign. Reported as p50 (median).
+    std::vector<int64_t> stat_clock_offset_us_;
+    std::vector<int64_t> stat_net_delay_us_;
     std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x

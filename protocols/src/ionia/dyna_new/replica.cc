@@ -195,6 +195,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.send_time = req.send_time();
         e.deadline = req.deadline();
         e.arrival_us = recv_arrival;   // for arrival→release residence (diagnostic)
+        e.recv_us = recv_arrival;      // T2 for the client's NTP clock-offset calc
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
         orderers_[pid]->Submit(std::move(e));
@@ -501,6 +502,7 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     // PTP-comparable release stamp so the client can split to_first into a true
     // forward leg (send→release) and reverse leg (release→client-recv).
     reply.set_release_time(xt0);
+    reply.set_recv_time(e.recv_us);   // T2 for the client's NTP clock-offset calc
     // residence = arrival→release_time (what the client's fwd leg actually sees,
     // skew-immune replica-only). presend = time spent in SendReply BEFORE this
     // stamp (reply build + owd_mu_ + dedup OnReply locks) — isolates whether the

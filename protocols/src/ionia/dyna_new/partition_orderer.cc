@@ -36,6 +36,11 @@ PartitionOrderer::~PartitionOrderer()
 void
 PartitionOrderer::Submit(LogEntry entry)
 {
+    // Stamp buffer-entry time on the REPLICA clock (guaranteed to survive to
+    // release, unlike the receive-path arrival_us). residence = release − this is
+    // offset-immune (single clock), so it shows the TRUE deadline-hold even when
+    // client↔replica clocks are skewed (which corrupts deadline-relative metrics).
+    entry.arrival_us = clock_->Now();
     {
         std::lock_guard<std::mutex> lk(mu_);
         if (role_ == Role::kFollower) {

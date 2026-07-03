@@ -199,6 +199,16 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         const uint64_t rel = reply.release_time();
         p.fwd_us = (rel > p.send_us) ? rel - p.send_us : 0;
         p.rev_us = (rel != 0 && p.first_reply_us > rel) ? p.first_reply_us - rel : 0;
+        // NTP 4-timestamp: T1=send, T2=replica recv, T3=replica release, T4=recv.
+        // θ = ((T2−T1)+(T3−T4))/2 (replica clock rel. to client), δ = (T4−T1)−(T3−T2).
+        if (client_stats_enabled_ && reply.recv_time() != 0 && rel != 0) {
+            const int64_t t1 = static_cast<int64_t>(p.send_us);
+            const int64_t t2 = static_cast<int64_t>(reply.recv_time());
+            const int64_t t3 = static_cast<int64_t>(rel);
+            const int64_t t4 = static_cast<int64_t>(p.first_reply_us);
+            stat_clock_offset_us_.push_back(((t2 - t1) + (t3 - t4)) / 2);
+            stat_net_delay_us_.push_back((t4 - t1) - (t3 - t2));
+        }
     }
     // Per-replica forward leg for EVERY reply (not just the first): is DYNA fast
     // everywhere, or is one replica the straggler that gates the deadline/commit?
@@ -264,6 +274,14 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     auto pct = [](const std::vector<uint64_t> &v, double p) {
         return v[static_cast<size_t>(p * (v.size() - 1))];
     };
+    // Signed median helper for the NTP θ/δ diagnostics (can be negative).
+    auto medi = [](std::vector<int64_t> v) -> long {
+        if (v.empty()) return 0;
+        std::sort(v.begin(), v.end());
+        return static_cast<long>(v[v.size() / 2]);
+    };
+    const long clkOffP50 = medi(stat_clock_offset_us_);
+    const long netDelP50 = medi(stat_net_delay_us_);
     uint64_t resend_sum = 0, max_resends = 0;
     for (uint32_t r : stat_resends_) {
         resend_sum += r;
@@ -291,6 +309,7 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     Notice("DYNA_NEW client stats [n=%zu]: total_us p50=%lu p90=%lu p99=%lu max=%lu; "
            "to_first_us p50=%lu p90=%lu; fwd_us p50=%lu p90=%lu; rev_us p50=%lu p90=%lu; "
            "quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
+           "clockOffset_us p50=%ld; netDelay_us p50=%ld; "
            "resends avg=%.2f max=%lu; bound_us=%lu %s pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
@@ -299,6 +318,7 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
            (unsigned long)pct(rev, 0.5), (unsigned long)pct(rev, 0.9),
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
            (unsigned long)send_issue_avg,
+           clkOffP50, netDelP50,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
            (unsigned long)bound_tracker_.bound_us(), perRep.c_str(), pending_.size());
 
@@ -307,6 +327,8 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     stat_fwd_us_.clear();
     stat_rev_us_.clear();
     for (auto &v : stat_fwd_by_replica_) v.clear();
+    stat_clock_offset_us_.clear();
+    stat_net_delay_us_.clear();
     stat_resends_.clear();
     stat_send_issue_sum_us_ = 0;
     stat_send_issue_count_ = 0;

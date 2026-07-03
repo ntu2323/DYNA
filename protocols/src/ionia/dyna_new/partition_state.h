@@ -46,6 +46,9 @@ struct LogEntry {
     // Diagnostic only: replica wall-clock µs when this request arrived (stamped at
     // the top of ReceiveMessage). Lets OnRelease measure arrival→release residence.
     uint64_t arrival_us = 0;
+    // Diagnostic only: replica wall-clock µs at request receipt (ReceiveMessage top),
+    // carried into the reply as T2 for the client's NTP clock-offset computation.
+    uint64_t recv_us = 0;
 
     // Where to send this request's reply (set by the replica from the inbound
     // message; null for entries that need no client reply, e.g. sync-fetched).
