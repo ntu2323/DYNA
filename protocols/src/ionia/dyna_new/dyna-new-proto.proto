@@ -36,6 +36,9 @@ message Reply {
     optional uint64 recv_time    = 12; // replica wall-clock µs at request arrival (T2);
                                        // with T1/T3/T4 the client computes the NTP clock
                                        // offset θ and true network delay δ
+    optional uint64 submit_time  = 13; // replica wall-clock µs when the entry entered the
+                                       // early buffer (Submit). Splits the replica hold
+                                       // (T3−T2) into pump-processing vs release-loop.
 }
 
 // partition leader → followers  (§4; also serves as heartbeat)

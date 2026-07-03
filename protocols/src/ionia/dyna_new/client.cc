@@ -212,6 +212,16 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         if (client_stats_enabled_ && reply.deadline() > p.send_us) {
             stat_eff_bound_us_.push_back(reply.deadline() - p.send_us);
         }
+        // Replica hold decomposed from reply timestamps (offset-immune; bypasses the
+        // flaky replica-side p50 samplers). Localizes the ~160µs recv→release.
+        if (client_stats_enabled_ && reply.recv_time() != 0 && rel > reply.recv_time()) {
+            stat_rhold_us_.push_back(rel - reply.recv_time());
+            const uint64_t sub = reply.submit_time();
+            if (sub >= reply.recv_time() && rel >= sub) {
+                stat_rproc_us_.push_back(sub - reply.recv_time());
+                stat_rloop_us_.push_back(rel - sub);
+            }
+        }
     }
     // Per-replica forward leg for EVERY reply (not just the first): is DYNA fast
     // everywhere, or is one replica the straggler that gates the deadline/commit?
@@ -288,6 +298,14 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     std::vector<uint64_t> eb = stat_eff_bound_us_;
     std::sort(eb.begin(), eb.end());
     const unsigned long effBoundP50 = eb.empty() ? 0 : eb[eb.size() / 2];
+    auto up50 = [](std::vector<uint64_t> v) -> unsigned long {
+        if (v.empty()) return 0;
+        std::sort(v.begin(), v.end());
+        return static_cast<unsigned long>(v[v.size() / 2]);
+    };
+    const unsigned long rHoldP50 = up50(stat_rhold_us_);
+    const unsigned long rProcP50 = up50(stat_rproc_us_);
+    const unsigned long rLoopP50 = up50(stat_rloop_us_);
     uint64_t resend_sum = 0, max_resends = 0;
     for (uint32_t r : stat_resends_) {
         resend_sum += r;
@@ -316,6 +334,7 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
            "to_first_us p50=%lu p90=%lu; fwd_us p50=%lu p90=%lu; rev_us p50=%lu p90=%lu; "
            "quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
            "clockOffset_us p50=%ld; netDelay_us p50=%ld; effBound_us p50=%lu; "
+           "rHold_us p50=%lu; rProc_us p50=%lu; rLoop_us p50=%lu; "
            "resends avg=%.2f max=%lu; bound_us=%lu %s pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
@@ -325,6 +344,7 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
            (unsigned long)send_issue_avg,
            clkOffP50, netDelP50, effBoundP50,
+           rHoldP50, rProcP50, rLoopP50,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
            (unsigned long)bound_tracker_.bound_us(), perRep.c_str(), pending_.size());
 
@@ -336,6 +356,9 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     stat_clock_offset_us_.clear();
     stat_net_delay_us_.clear();
     stat_eff_bound_us_.clear();
+    stat_rhold_us_.clear();
+    stat_rproc_us_.clear();
+    stat_rloop_us_.clear();
     stat_resends_.clear();
     stat_send_issue_sum_us_ = 0;
     stat_send_issue_count_ = 0;

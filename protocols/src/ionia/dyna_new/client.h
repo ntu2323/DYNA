@@ -93,6 +93,12 @@ private:
     // clock, offset-immune). If ≈ replica residence, the cost IS the deadline hold
     // (bound too big); if ≪ residence, the release fires late.
     std::vector<uint64_t> stat_eff_bound_us_;
+    // Replica hold decomposed from reply timestamps (all replica clock, differenced
+    // on the client ⇒ offset-immune, bypasses the flaky replica samplers):
+    //   hold  = release_time − recv_time   (full recv→release)
+    //   proc  = submit_time  − recv_time   (pump: receive→enter buffer)
+    //   loop  = release_time − submit_time (buffer wait + release-loop fire)
+    std::vector<uint64_t> stat_rhold_us_, stat_rproc_us_, stat_rloop_us_;
     std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x
