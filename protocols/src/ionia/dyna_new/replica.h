@@ -96,6 +96,7 @@ private:
     LatSampler residenceSampler_;   // arrival_us → release_time (client-visible)
     LatSampler lateSampler_;        // release − deadline (clamped ≥0)
     LatSampler presendSampler_;     // time inside SendReply before the send stamp
+    LatSampler rawOwdSampler_;      // raw per-request send→arrival (cf client fwd_us)
     // Cumulative pump-busy time (µs) inside ReceiveMessage — request vs §7 control.
     // Diff two 1s stat lines: if pumpCtrl/sec is a large fraction of 1e6, the single
     // transport thread is saturated by §7 and blocks request pickup.

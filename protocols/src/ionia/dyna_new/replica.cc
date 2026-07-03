@@ -180,8 +180,10 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         procDelaySumUs_.fetch_add(now - recv_arrival, std::memory_order_relaxed);
         procDelayCount_.fetch_add(1, std::memory_order_relaxed);
         if (recv_arrival > req.send_time()) {
+            const uint64_t raw = recv_arrival - req.send_time();
+            rawOwdSampler_.add(raw);   // raw per-request send→arrival p50 (cf client fwd)
             std::lock_guard<std::mutex> lk(owd_mu_);
-            owd_.sample(req.client_id(), recv_arrival - req.send_time());
+            owd_.sample(req.client_id(), raw);
         }
 
         LogEntry e;
@@ -555,10 +557,11 @@ DynaNewReplica::StatsDump()
         p50 = v[v.size() / 2];
         p90 = v[(v.size() * 9) / 10];
     };
-    uint64_t resP50, resP90, lateP50, lateP90, preP50, preP90;
+    uint64_t resP50, resP90, lateP50, lateP90, preP50, preP90, rawP50, rawP90;
     drain(residenceSampler_, resP50, resP90);
     drain(lateSampler_, lateP50, lateP90);
     drain(presendSampler_, preP50, preP90);
+    drain(rawOwdSampler_, rawP50, rawP90);
     const uint64_t pumpReq = pumpReqBusyUs_.load(std::memory_order_relaxed);
     const uint64_t pumpCtrl = pumpCtrlBusyUs_.load(std::memory_order_relaxed);
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
@@ -566,6 +569,7 @@ DynaNewReplica::StatsDump()
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
            "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
            "releaseLate_us[avg=%lu max=%lu] "
+           "rawOwd_us[p50=%lu p90=%lu] "
            "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
            "pumpBusy_us[req=%lu ctrl=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
@@ -583,6 +587,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)xmitAvg,
            (unsigned long)lateAvg,
            (unsigned long)releaseLateMaxUs_.load(std::memory_order_relaxed),
+           (unsigned long)rawP50, (unsigned long)rawP90,
            (unsigned long)resP50, (unsigned long)resP90,
            (unsigned long)preP50, (unsigned long)preP90,
            (unsigned long)lateP50, (unsigned long)lateP90,
