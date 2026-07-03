@@ -89,6 +89,10 @@ private:
     // Signed: a real clock offset can be either sign. Reported as p50 (median).
     std::vector<int64_t> stat_clock_offset_us_;
     std::vector<int64_t> stat_net_delay_us_;
+    // Effective deadline hold actually requested = reply.deadline − send (client
+    // clock, offset-immune). If ≈ replica residence, the cost IS the deadline hold
+    // (bound too big); if ≪ residence, the release fires late.
+    std::vector<uint64_t> stat_eff_bound_us_;
     std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x

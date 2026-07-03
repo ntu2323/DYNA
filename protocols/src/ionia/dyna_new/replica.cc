@@ -507,8 +507,12 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     // skew-immune replica-only). presend = time spent in SendReply BEFORE this
     // stamp (reply build + owd_mu_ + dedup OnReply locks) — isolates whether the
     // fwd cost is here vs the wire.
-    if (e.arrival_us != 0 && xt0 > e.arrival_us) {
-        residenceSampler_.add(xt0 - e.arrival_us);
+    // residence = recv→release (T3−T2): the TRUE replica hold, offset-immune (both
+    // stamps are the replica clock). Uses recv_us (stamped in ReceiveMessage), which
+    // provably survives to here since the NTP recv_time relies on it — unlike the
+    // Submit-stamped arrival_us, whose sampler read empty.
+    if (e.recv_us != 0 && xt0 > e.recv_us) {
+        residenceSampler_.add(xt0 - e.recv_us);
     }
     presendSampler_.add(xt0 - sr_start);
     transport->SendMessage(this, *e.client_addr, reply);
