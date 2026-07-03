@@ -8,7 +8,10 @@
 #include "lib/message.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <string>
 #include <utility>
+#include <vector>
 
 namespace specpaxos {
 namespace dyna_new {
@@ -25,6 +28,7 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
       bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
     if (resend_ms_ == 0) resend_ms_ = 1;
+    stat_fwd_by_replica_.resize(std::max(1, config.n));
     const char *sv = std::getenv("DYNA_NEW_CLIENT_STATS");
     client_stats_enabled_ = (sv != nullptr && *sv != '\0' && *sv != '0');
     client_stats_every_ =
@@ -196,6 +200,16 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         p.fwd_us = (rel > p.send_us) ? rel - p.send_us : 0;
         p.rev_us = (rel != 0 && p.first_reply_us > rel) ? p.first_reply_us - rel : 0;
     }
+    // Per-replica forward leg for EVERY reply (not just the first): is DYNA fast
+    // everywhere, or is one replica the straggler that gates the deadline/commit?
+    if (client_stats_enabled_) {
+        const uint64_t rel = reply.release_time();
+        const uint32_t rid = reply.replica_id();
+        if (rel > p.send_us && rid < stat_fwd_by_replica_.size() &&
+            stat_fwd_by_replica_[rid].size() < 65536) {
+            stat_fwd_by_replica_[rid].push_back(rel - p.send_us);
+        }
+    }
 
     // OWD feedback (ignored when 0 = insufficient samples).
     bound_tracker_.on_owd_sample(reply.replica_id(), reply.owd_estimate());
@@ -259,10 +273,25 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     // correction wait. bound_us is the deadline hold. p50 ≫ target => hold floor.
     const uint64_t send_issue_avg =
         stat_send_issue_count_ ? stat_send_issue_sum_us_ / stat_send_issue_count_ : 0;
+    // Per-replica forward-leg p50 + the client's current per-replica OWD estimate.
+    // "fast everywhere?" — a straggler replica shows a high fwd/owd here and, since
+    // bound = max OWD, inflates every request's deadline.
+    std::string perRep = "perReplica[";
+    const std::vector<uint64_t> &owd = bound_tracker_.per_replica_owd();
+    for (size_t r = 0; r < stat_fwd_by_replica_.size(); ++r) {
+        std::vector<uint64_t> fr = stat_fwd_by_replica_[r];
+        uint64_t p50 = 0;
+        if (!fr.empty()) { std::sort(fr.begin(), fr.end()); p50 = fr[fr.size() / 2]; }
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%sr%zu:fwd=%lu,owd=%lu", r ? " " : "", r,
+                 (unsigned long)p50, (unsigned long)(r < owd.size() ? owd[r] : 0));
+        perRep += buf;
+    }
+    perRep += "]";
     Notice("DYNA_NEW client stats [n=%zu]: total_us p50=%lu p90=%lu p99=%lu max=%lu; "
            "to_first_us p50=%lu p90=%lu; fwd_us p50=%lu p90=%lu; rev_us p50=%lu p90=%lu; "
            "quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
-           "resends avg=%.2f max=%lu; bound_us=%lu pending=%zu",
+           "resends avg=%.2f max=%lu; bound_us=%lu %s pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
            (unsigned long)pct(tf, 0.5), (unsigned long)pct(tf, 0.9),
@@ -271,12 +300,13 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
            (unsigned long)send_issue_avg,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
-           (unsigned long)bound_tracker_.bound_us(), pending_.size());
+           (unsigned long)bound_tracker_.bound_us(), perRep.c_str(), pending_.size());
 
     stat_latencies_us_.clear();
     stat_to_first_us_.clear();
     stat_fwd_us_.clear();
     stat_rev_us_.clear();
+    for (auto &v : stat_fwd_by_replica_) v.clear();
     stat_resends_.clear();
     stat_send_issue_sum_us_ = 0;
     stat_send_issue_count_ = 0;

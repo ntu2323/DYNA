@@ -81,6 +81,9 @@ private:
     std::vector<uint64_t> stat_latencies_us_;   // total commit latency this window
     std::vector<uint64_t> stat_to_first_us_;    // submit→first-reply this window
     std::vector<uint64_t> stat_fwd_us_;         // send→replica-release leg this window
+    // Per-replica forward leg (release_time − send), indexed by replica_id. Shows
+    // whether DYNA is "fast everywhere" or one replica drags the deadline/commit.
+    std::vector<std::vector<uint64_t>> stat_fwd_by_replica_;
     std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x

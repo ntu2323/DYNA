@@ -115,6 +115,11 @@ public:
 
     uint64_t bound_us() const { return bound_us_; }
 
+    // Diagnostic: latest per-replica OWD (index = replica_id). Exposes the "fast
+    // everywhere?" question — bound = max over these, so one slow replica inflates
+    // every request's deadline.
+    const std::vector<uint64_t> &per_replica_owd() const { return last_owd_; }
+
     // Ignores 0 (unknown). replica_id must be within range.
     void on_owd_sample(uint32_t replica_id, uint64_t owd_us) {
         if (owd_us == 0 || replica_id >= last_owd_.size()) return;
