@@ -51,15 +51,24 @@ public:
     uint64_t Now() override { return WallClockMicros(); }
 
     void SleepUntil(uint64_t until_us) override {
-        if (busy_poll_ && until_us != kNever) {
-            while (WallClockMicros() < until_us) {
+        if (busy_poll_) {
+            // Spin (cooperatively) until the deadline — and, crucially, keep
+            // spinning when idle (kNever) too, until Submit/Stop interrupts.
+            // At low load the early buffer is empty between requests, so parking
+            // on the CV in the idle case would make EVERY request pay ~100µs+
+            // cv/scheduler wakeup latency — exactly what busy-poll exists to
+            // avoid, and the dominant term in the commit-latency tail. Spinning
+            // keeps the idle→release wakeup at ~µs. (Costs a hot core per idle
+            // partition; acceptable on the 8-vCPU perf boxes, matching the
+            // transport's own busy-poll.)
+            while (until_us == kNever || WallClockMicros() < until_us) {
                 if (interrupted_.exchange(false)) return;  // Submit/Stop woke us
                 std::this_thread::yield();                 // cooperative spin
             }
             interrupted_.store(false);
             return;
         }
-        // Idle (kNever) or non-busy: park on the condition variable.
+        // Non-busy: park on the condition variable.
         std::unique_lock<std::mutex> lk(mu_);
         if (until_us == kNever) {
             cv_.wait(lk, [this] { return interrupted_.load(); });

@@ -79,6 +79,10 @@ private:
     // Finer split: just the transport->SendMessage call inside SendReply (serialize
     // + sendto). replySend − replyXmit ≈ our own pre-send work + deschedule.
     std::atomic<uint64_t> replyXmitSumUs_{0}, replyXmitCount_{0};
+    // How late releases fire vs their deadline (release_time − deadline). ~0 means
+    // the release loop is prompt; large means it woke late (cv-park at idle).
+    std::atomic<uint64_t> releaseLateSumUs_{0}, releaseLateCount_{0},
+        releaseLateMaxUs_{0};
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

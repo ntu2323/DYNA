@@ -300,6 +300,16 @@ void
 DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
 {
     const uint64_t t0 = WallClockMicros();
+    // How late the release fires vs the entry's deadline. If the release loop is
+    // prompt this is ~0; a large value means the loop woke late (e.g. cv-park at
+    // idle). Clamped at 0 (an early release / clock skew shows as 0).
+    if (t0 > e.deadline) {
+        const uint64_t late = t0 - e.deadline;
+        releaseLateSumUs_.fetch_add(late, std::memory_order_relaxed);
+        for (uint64_t cur = releaseLateMaxUs_.load(std::memory_order_relaxed);
+             late > cur && !releaseLateMaxUs_.compare_exchange_weak(cur, late); ) {}
+    }
+    releaseLateCount_.fetch_add(1, std::memory_order_relaxed);
     SendReply(pid, is_leader, e);
     const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
     replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
@@ -493,10 +503,13 @@ DynaNewReplica::StatsDump()
     const uint64_t replyAvg = rc ? replySendSumUs_.load() / rc : 0;
     const uint64_t xc = replyXmitCount_.load(std::memory_order_relaxed);
     const uint64_t xmitAvg = xc ? replyXmitSumUs_.load() / xc : 0;
+    const uint64_t lc = releaseLateCount_.load(std::memory_order_relaxed);
+    const uint64_t lateAvg = lc ? releaseLateSumUs_.load() / lc : 0;
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
            "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
+           "releaseLate_us[avg=%lu max=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -510,6 +523,8 @@ DynaNewReplica::StatsDump()
            (unsigned long)procAvg, (unsigned long)replyAvg,
            (unsigned long)replySendMaxUs_.load(std::memory_order_relaxed),
            (unsigned long)xmitAvg,
+           (unsigned long)lateAvg,
+           (unsigned long)releaseLateMaxUs_.load(std::memory_order_relaxed),
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {
