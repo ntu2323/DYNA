@@ -31,6 +31,8 @@ message Reply {
     optional bytes  result       = 8;  // populated only in leader reply for READ_ONLY / RMW
     required uint64 owd_estimate = 9;  // µs, piggybacked OWD feedback for deadline computation
     optional uint64 log_pos      = 10; // leader's log position (read commit rule)
+    optional uint64 release_time = 11; // replica wall-clock µs at release (PTP-comparable;
+                                       // lets the client split to_first into fwd/rev legs)
 }
 
 // partition leader → followers  (§4; also serves as heartbeat)

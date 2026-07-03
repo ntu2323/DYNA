@@ -468,6 +468,9 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     }
 
     const uint64_t xt0 = WallClockMicros();
+    // PTP-comparable release stamp so the client can split to_first into a true
+    // forward leg (send→release) and reverse leg (release→client-recv).
+    reply.set_release_time(xt0);
     transport->SendMessage(this, *e.client_addr, reply);
     const uint64_t xdt = WallClockMicros() - xt0;
     replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);

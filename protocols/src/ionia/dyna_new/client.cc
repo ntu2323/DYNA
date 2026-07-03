@@ -82,6 +82,8 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         /*send_us=*/0,
         /*first_submit_us=*/NowMicros(),
         /*first_reply_us=*/0,
+        /*fwd_us=*/0,
+        /*rev_us=*/0,
         /*resends=*/0,
         is_read,
         std::move(continuation),
@@ -188,6 +190,11 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
     }
     if (p.first_reply_us == 0) {
         p.first_reply_us = NowMicros();   // phase split: submit→first reply
+        // PTP-comparable split of to_first into forward (send→replica release) and
+        // reverse (release→client recv) legs, using the replica's release stamp.
+        const uint64_t rel = reply.release_time();
+        p.fwd_us = (rel > p.send_us) ? rel - p.send_us : 0;
+        p.rev_us = (rel != 0 && p.first_reply_us > rel) ? p.first_reply_us - rel : 0;
     }
 
     // OWD feedback (ignored when 0 = insufficient samples).
@@ -210,7 +217,8 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         const uint64_t now = NowMicros();
         const uint64_t to_first = (p.first_reply_us > p.first_submit_us)
                                       ? p.first_reply_us - p.first_submit_us : 0;
-        RecordCommitStat(now - p.first_submit_us, to_first, p.resends);
+        RecordCommitStat(now - p.first_submit_us, to_first, p.fwd_us, p.rev_us,
+                         p.resends);
     }
     continuation_t cont = std::move(p.continuation);
     std::string result = p.is_read ? p.quorum.result() : std::string();
@@ -220,10 +228,12 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
 
 void
 DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
-                                uint32_t resends)
+                                uint64_t fwd_us, uint64_t rev_us, uint32_t resends)
 {
     stat_latencies_us_.push_back(total_us);
     stat_to_first_us_.push_back(to_first_reply_us);
+    stat_fwd_us_.push_back(fwd_us);
+    stat_rev_us_.push_back(rev_us);
     stat_resends_.push_back(resends);
     if (stat_latencies_us_.size() < client_stats_every_) {
         return;
@@ -233,6 +243,10 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     std::sort(lat.begin(), lat.end());
     std::vector<uint64_t> tf = stat_to_first_us_;
     std::sort(tf.begin(), tf.end());
+    std::vector<uint64_t> fwd = stat_fwd_us_;
+    std::sort(fwd.begin(), fwd.end());
+    std::vector<uint64_t> rev = stat_rev_us_;
+    std::sort(rev.begin(), rev.end());
     auto pct = [](const std::vector<uint64_t> &v, double p) {
         return v[static_cast<size_t>(p * (v.size() - 1))];
     };
@@ -246,11 +260,14 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     const uint64_t send_issue_avg =
         stat_send_issue_count_ ? stat_send_issue_sum_us_ / stat_send_issue_count_ : 0;
     Notice("DYNA_NEW client stats [n=%zu]: total_us p50=%lu p90=%lu p99=%lu max=%lu; "
-           "to_first_us p50=%lu p90=%lu; quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
+           "to_first_us p50=%lu p90=%lu; fwd_us p50=%lu p90=%lu; rev_us p50=%lu p90=%lu; "
+           "quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
            "resends avg=%.2f max=%lu; bound_us=%lu pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
            (unsigned long)pct(tf, 0.5), (unsigned long)pct(tf, 0.9),
+           (unsigned long)pct(fwd, 0.5), (unsigned long)pct(fwd, 0.9),
+           (unsigned long)pct(rev, 0.5), (unsigned long)pct(rev, 0.9),
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
            (unsigned long)send_issue_avg,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
@@ -258,6 +275,8 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
 
     stat_latencies_us_.clear();
     stat_to_first_us_.clear();
+    stat_fwd_us_.clear();
+    stat_rev_us_.clear();
     stat_resends_.clear();
     stat_send_issue_sum_us_ = 0;
     stat_send_issue_count_ = 0;
