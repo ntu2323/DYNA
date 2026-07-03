@@ -97,6 +97,21 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
                                void *meta_data)
 {
     (void)meta_data;
+    // Pump-busy probe: total wall time this single transport thread spends inside
+    // ReceiveMessage, split request vs control (§7 sync/confirm/commit). If control
+    // dominates, request PICKUP is blocked behind §7 processing — the likely cause
+    // of the asymmetric forward leg (fwd 232µs ≫ rev 62µs) with residence≈0.
+    const uint64_t pump_t0 = WallClockMicros();
+    bool pump_is_request = false;
+    struct PumpTimer {
+        DynaNewReplica *self; const uint64_t &t0; const bool &is_req;
+        ~PumpTimer() {
+            const uint64_t d = WallClockMicros() - t0;
+            if (is_req) self->pumpReqBusyUs_.fetch_add(d, std::memory_order_relaxed);
+            else        self->pumpCtrlBusyUs_.fetch_add(d, std::memory_order_relaxed);
+        }
+    } pump_timer{this, pump_t0, pump_is_request};
+
     const static auto requestName =
         proto::Request::default_instance().GetDescriptor()->full_name();
     const static auto syncName =
@@ -118,6 +133,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
             return;
         }
         const uint64_t recv_arrival = WallClockMicros();   // stamp at arrival (§Step1)
+        pump_is_request = true;   // this ReceiveMessage is a client request
         reqIn_.fetch_add(1, std::memory_order_relaxed);
 
         const uint32_t pid = PartitionOf(req.key(), numPartitions_);
@@ -536,12 +552,15 @@ DynaNewReplica::StatsDump()
     drain(residenceSampler_, resP50, resP90);
     drain(lateSampler_, lateP50, lateP90);
     drain(presendSampler_, preP50, preP90);
+    const uint64_t pumpReq = pumpReqBusyUs_.load(std::memory_order_relaxed);
+    const uint64_t pumpCtrl = pumpCtrlBusyUs_.load(std::memory_order_relaxed);
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
            "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
            "releaseLate_us[avg=%lu max=%lu] "
            "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
+           "pumpBusy_us[req=%lu ctrl=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -560,6 +579,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)resP50, (unsigned long)resP90,
            (unsigned long)preP50, (unsigned long)preP90,
            (unsigned long)lateP50, (unsigned long)lateP90,
+           (unsigned long)pumpReq, (unsigned long)pumpCtrl,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {

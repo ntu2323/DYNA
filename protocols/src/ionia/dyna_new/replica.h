@@ -96,6 +96,10 @@ private:
     LatSampler residenceSampler_;   // arrival_us → release_time (client-visible)
     LatSampler lateSampler_;        // release − deadline (clamped ≥0)
     LatSampler presendSampler_;     // time inside SendReply before the send stamp
+    // Cumulative pump-busy time (µs) inside ReceiveMessage — request vs §7 control.
+    // Diff two 1s stat lines: if pumpCtrl/sec is a large fraction of 1e6, the single
+    // transport thread is saturated by §7 and blocks request pickup.
+    std::atomic<uint64_t> pumpReqBusyUs_{0}, pumpCtrlBusyUs_{0};
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.
