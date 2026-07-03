@@ -43,6 +43,10 @@ struct LogEntry {
     std::string result;         // populated for RMW / read on the leader
     bool has_result = false;
 
+    // Diagnostic only: replica wall-clock µs when this request arrived (stamped at
+    // the top of ReceiveMessage). Lets OnRelease measure arrival→release residence.
+    uint64_t arrival_us = 0;
+
     // Where to send this request's reply (set by the replica from the inbound
     // message; null for entries that need no client reply, e.g. sync-fetched).
     // shared_ptr keeps LogEntry cheaply movable through queues later.

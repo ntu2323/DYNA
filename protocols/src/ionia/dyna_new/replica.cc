@@ -7,8 +7,10 @@
 #include "dyna_new/partition_map.h"
 #include "lib/message.h"
 
+#include <algorithm>
 #include <memory>
 #include <utility>
+#include <vector>
 
 namespace specpaxos {
 namespace dyna_new {
@@ -167,6 +169,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.command = req.command();
         e.send_time = req.send_time();
         e.deadline = req.deadline();
+        e.arrival_us = recv_arrival;   // for arrival→release residence (diagnostic)
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
         orderers_[pid]->Submit(std::move(e));
@@ -303,13 +306,17 @@ DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
     // How late the release fires vs the entry's deadline. If the release loop is
     // prompt this is ~0; a large value means the loop woke late (e.g. cv-park at
     // idle). Clamped at 0 (an early release / clock skew shows as 0).
-    if (t0 > e.deadline) {
-        const uint64_t late = t0 - e.deadline;
+    const uint64_t late = (t0 > e.deadline) ? t0 - e.deadline : 0;
+    if (late > 0) {
         releaseLateSumUs_.fetch_add(late, std::memory_order_relaxed);
         for (uint64_t cur = releaseLateMaxUs_.load(std::memory_order_relaxed);
              late > cur && !releaseLateMaxUs_.compare_exchange_weak(cur, late); ) {}
     }
     releaseLateCount_.fetch_add(1, std::memory_order_relaxed);
+    lateSampler_.add(late);
+    if (e.arrival_us != 0 && t0 > e.arrival_us) {
+        residenceSampler_.add(t0 - e.arrival_us);   // arrival→release (p50)
+    }
     SendReply(pid, is_leader, e);
     const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
     replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
@@ -508,11 +515,26 @@ DynaNewReplica::StatsDump()
     const uint64_t xmitAvg = xc ? replyXmitSumUs_.load() / xc : 0;
     const uint64_t lc = releaseLateCount_.load(std::memory_order_relaxed);
     const uint64_t lateAvg = lc ? releaseLateSumUs_.load() / lc : 0;
+    // Drain the p50/p90 samplers (avgs above are tail-corrupted; these are the
+    // real medians for residence = arrival→release and late = release−deadline).
+    auto drain = [](LatSampler &s, uint64_t &p50, uint64_t &p90) {
+        std::vector<uint64_t> v;
+        { std::lock_guard<std::mutex> l(s.mu); v.swap(s.v); }
+        p50 = p90 = 0;
+        if (v.empty()) return;
+        std::sort(v.begin(), v.end());
+        p50 = v[v.size() / 2];
+        p90 = v[(v.size() * 9) / 10];
+    };
+    uint64_t resP50, resP90, lateP50, lateP90;
+    drain(residenceSampler_, resP50, resP90);
+    drain(lateSampler_, lateP50, lateP90);
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
            "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
            "releaseLate_us[avg=%lu max=%lu] "
+           "residence_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -528,6 +550,8 @@ DynaNewReplica::StatsDump()
            (unsigned long)xmitAvg,
            (unsigned long)lateAvg,
            (unsigned long)releaseLateMaxUs_.load(std::memory_order_relaxed),
+           (unsigned long)resP50, (unsigned long)resP90,
+           (unsigned long)lateP50, (unsigned long)lateP90,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {

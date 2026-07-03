@@ -83,6 +83,18 @@ private:
     // the release loop is prompt; large means it woke late (cv-park at idle).
     std::atomic<uint64_t> releaseLateSumUs_{0}, releaseLateCount_{0},
         releaseLateMaxUs_{0};
+    // p50/p90 samplers (averages are tail-corrupted here — a fat 30ms tail hides
+    // the median). residence = arrival→release; late = release−deadline.
+    struct LatSampler {
+        std::mutex mu;
+        std::vector<uint64_t> v;
+        void add(uint64_t x) {
+            std::lock_guard<std::mutex> l(mu);
+            if (v.size() < 16384) v.push_back(x);
+        }
+    };
+    LatSampler residenceSampler_;   // arrival_us → release
+    LatSampler lateSampler_;        // release − deadline (clamped ≥0)
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

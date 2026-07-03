@@ -13,20 +13,6 @@
 namespace specpaxos {
 namespace dyna_new {
 
-// CPU relax hint for a tight spin: yields the pipeline to a sibling hyperthread
-// without giving the core back to the scheduler (unlike sched_yield). Keeps the
-// spinning thread pinned so it fires within ~µs of its deadline.
-inline void CpuRelax()
-{
-#if defined(__x86_64__) || defined(__i386__)
-    __builtin_ia32_pause();
-#elif defined(__aarch64__)
-    asm volatile("yield" ::: "memory");
-#else
-    std::this_thread::yield();
-#endif
-}
-
 // Microsecond epoch from std::chrono::system_clock (NTP-comparable across hosts).
 inline uint64_t WallClockMicros()
 {
@@ -66,22 +52,17 @@ public:
 
     void SleepUntil(uint64_t until_us) override {
         if (busy_poll_) {
-            // Tight spin until the deadline — and, crucially, keep spinning when
-            // idle (kNever) too, until Submit/Stop interrupts. Two reasons this is
-            // a hard spin with a CPU `pause`, NOT std::this_thread::yield():
-            //   1. At low load the early buffer is empty between requests, so
-            //      parking on the CV in the idle case would make EVERY request pay
-            //      ~100µs+ cv/scheduler wakeup latency.
-            //   2. sched_yield() on a virtualized host hands the core to the
-            //      scheduler, which frequently doesn't reschedule this thread until
-            //      a full quantum later (~100µs) — so a yielding spin OVERSHOOTS the
-            //      deadline by ~one quantum. Measured: releases fired ~128µs late
-            //      (fwd leg 200µs vs a 72µs deadline hold). A pinned spin fires
-            //      within ~µs of the deadline. (Costs a hot core per partition;
-            //      fine on the 8-vCPU perf boxes, matching the transport's own spin.)
+            // Spin until the deadline — and keep spinning when idle (kNever) too,
+            // until Submit/Stop interrupts. At low load the early buffer is empty
+            // between requests, so parking on the CV in the idle case would make
+            // EVERY request pay ~100µs+ cv/scheduler wakeup latency. We yield()
+            // (not a hard pause-spin): a pinned pause-spin on all release threads
+            // starves the kernel's packet-RX softirq, inflating measured OWD
+            // (72µs→109µs observed) — and it does NOT reduce release lateness, so
+            // yielding is strictly better here.
             while (until_us == kNever || WallClockMicros() < until_us) {
                 if (interrupted_.exchange(false)) return;  // Submit/Stop woke us
-                CpuRelax();                                // stay on-core
+                std::this_thread::yield();                 // cooperative spin
             }
             interrupted_.store(false);
             return;
