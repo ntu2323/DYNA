@@ -33,6 +33,13 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // so cv/scheduler wakeup latency doesn't dominate commit latency.
     const char *bp = std::getenv("DYNA_NEW_BUSY_POLL");
     const bool busyPoll = (bp == nullptr) || (*bp != '0');
+    // Release-loop spin, independent of the transport busy-poll. Defaults to the
+    // transport setting, but DYNA_NEW_RELEASE_SPIN=0 parks the release loops on a
+    // cv (leaving only the transport pump spinning). Diagnostic: if the forward
+    // leg / pickup latency drops with release spinning OFF, the per-partition
+    // release spinners were starving the single transport pump for CPU.
+    const char *rs = std::getenv("DYNA_NEW_RELEASE_SPIN");
+    const bool releaseSpin = (rs == nullptr) ? busyPoll : (*rs != '0');
     // LRU cap for the per-partition dedup reply-cache (bounds a latency-drift
     // driver at scale). Must exceed the client retry window; 0 = unbounded.
     // Per-partition cap (each partition sees ~1/N of traffic). At a few hundred
@@ -49,7 +56,7 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     dedup_.reserve(numPartitions_);
     pendingSync_.resize(numPartitions_);
     for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
-        clocks_.push_back(std::make_unique<RealClock>(busyPoll));
+        clocks_.push_back(std::make_unique<RealClock>(releaseSpin));
         dedup_.push_back(std::make_unique<PartitionDedup>());
         dedup_.back()->dedup.set_cap(dedupCap);
         const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
