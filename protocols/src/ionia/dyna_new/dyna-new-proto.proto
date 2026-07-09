@@ -41,6 +41,8 @@ message Reply {
                                        // (T3−T2) into pump-processing vs release-loop.
     optional uint64 drain_time   = 14; // replica wall-clock µs when the release loop drained
                                        // it. Splits rLoop into submit→drain vs drain→reply.
+    optional uint64 onrelease_time = 15; // replica wall-clock µs at OnRelease entry. Splits
+                                         // drain→reply into dispatch vs OnRelease/SendReply.
 }
 
 // partition leader → followers  (§4; also serves as heartbeat)

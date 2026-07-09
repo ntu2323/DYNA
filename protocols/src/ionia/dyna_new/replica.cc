@@ -196,11 +196,15 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         const uint64_t now = WallClockMicros();
         procDelaySumUs_.fetch_add(now - recv_arrival, std::memory_order_relaxed);
         procDelayCount_.fetch_add(1, std::memory_order_relaxed);
-        if (recv_arrival > req.send_time()) {
-            const uint64_t raw = recv_arrival - req.send_time();
-            rawOwdSampler_.add(raw);   // raw per-request send→arrival p50 (cf client fwd)
+        uint64_t owd_est = 0;
+        {
             std::lock_guard<std::mutex> lk(owd_mu_);
-            owd_.sample(req.client_id(), raw);
+            if (recv_arrival > req.send_time()) {
+                owd_.sample(req.client_id(), recv_arrival - req.send_time());
+            }
+            // Snapshot the estimate here so SendReply needn't take owd_mu_ (a global
+            // lock) on the release critical path.
+            owd_est = owd_.estimate_us(req.client_id());
         }
 
         LogEntry e;
@@ -213,6 +217,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.deadline = req.deadline();
         e.arrival_us = recv_arrival;   // for arrival→release residence (diagnostic)
         e.recv_us = recv_arrival;      // T2 for the client's NTP clock-offset calc
+        e.owd_estimate_us = owd_est;   // snapshot so SendReply skips the global owd_mu_
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
         // Eager path submits without poking the release loop, so the release loop
@@ -401,7 +406,7 @@ DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
     }
     releaseLateCount_.fetch_add(1, std::memory_order_relaxed);
     lateSampler_.add(late);
-    SendReply(pid, is_leader, e);
+    SendReply(pid, is_leader, e, /*onrelease_us=*/t0);
     const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
     replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
     replySendCount_.fetch_add(1, std::memory_order_relaxed);
@@ -521,7 +526,8 @@ DynaNewReplica::ExecuteReconActions(uint32_t pid,
 }
 
 void
-DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
+DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
+                          uint64_t onrelease_us)
 {
     if (!e.client_addr) {
         return;
@@ -545,10 +551,8 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
         }
     }
 
-    {
-        std::lock_guard<std::mutex> lk(owd_mu_);
-        reply.set_owd_estimate(owd_.estimate_us(e.client_id));
-    }
+    // Use the estimate snapshotted at receive — no owd_mu_ (global lock) here.
+    reply.set_owd_estimate(e.owd_estimate_us);
 
     // Cache for at-most-once (spec §6.1): a later retry is answered from here.
     // A corrected reply (§6.4) overwrites the speculative one. Also clears the
@@ -566,6 +570,7 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     reply.set_recv_time(e.recv_us);      // T2 for the client's NTP clock-offset calc
     reply.set_submit_time(e.arrival_us); // Submit stamp — splits the replica hold
     reply.set_drain_time(e.drain_us);    // release-loop drain stamp — splits rLoop
+    reply.set_onrelease_time(onrelease_us ? onrelease_us : sr_start);
     // residence = arrival→release_time (what the client's fwd leg actually sees,
     // skew-immune replica-only). presend = time spent in SendReply BEFORE this
     // stamp (reply build + owd_mu_ + dedup OnReply locks) — isolates whether the

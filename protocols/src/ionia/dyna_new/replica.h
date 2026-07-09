@@ -46,7 +46,8 @@ private:
                        const std::vector<ReconAction> &fetches);
     // Flush the SyncBatch accumulated during a release drain (leader, §9 batching).
     void OnPostDrain(uint32_t pid);
-    void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
+    void SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
+                   uint64_t onrelease_us = 0);
     // One SyncBatch / CommitBatch for many entries (cuts per-op transport load).
     void BroadcastSyncBatch(uint32_t pid, const std::vector<LogEntry> &entries);
     void BroadcastCommitBatch(uint32_t pid,

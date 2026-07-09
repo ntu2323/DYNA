@@ -52,6 +52,9 @@ struct LogEntry {
     // Diagnostic only: replica wall-clock µs when the release loop drained this entry
     // (in DrainDueLocked). Splits rLoop into submit→drain vs drain→reply.
     uint64_t drain_us = 0;
+    // OWD estimate snapshotted at receive (under owd_mu_) so SendReply can put it in
+    // the reply WITHOUT taking the global owd_mu_ on the release critical path.
+    uint64_t owd_estimate_us = 0;
 
     // Where to send this request's reply (set by the replica from the inbound
     // message; null for entries that need no client reply, e.g. sync-fetched).

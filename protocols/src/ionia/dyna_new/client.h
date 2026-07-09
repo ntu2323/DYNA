@@ -102,6 +102,8 @@ private:
     // rLoop split: submit→drain (buffer wait + release-loop wake) vs drain→release
     // (OnRelease/SendReply). Localizes the cluster's fixed ~130µs release overhead.
     std::vector<uint64_t> stat_rwait_us_, stat_rsend_us_;
+    // rSend split: drain→OnRelease (dispatch) vs OnRelease→release (reply build).
+    std::vector<uint64_t> stat_rdisp_us_, stat_rreply_us_;
     std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x
