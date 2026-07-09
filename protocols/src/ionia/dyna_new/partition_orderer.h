@@ -106,6 +106,13 @@ public:
     size_t ReleaseDue();
 
     // Background release-loop lifecycle (idempotent).
+    // Eager release from the receive (pump) thread: drains already-due entries
+    // under mu_ (identical logic to the release loop's drain, deadline-ordered) so
+    // the caller can reply inline and skip the release-thread handoff. Returns the
+    // released entries with log_pos assigned. Both this and the release loop drain
+    // under mu_ and pop the buffer, so an entry is released by exactly one of them.
+    void DrainDueEager(std::vector<LogEntry> &out);
+
     void Start();
     void Stop();
 

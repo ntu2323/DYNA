@@ -65,6 +65,7 @@ private:
 
     uint32_t numPartitions_;
     uint64_t reconIntervalUs_;   // self-healing re-sync/re-fetch cadence
+    bool eagerEnabled_ = true;   // eager inline reply on the receive thread
 
     // DYNA_NEW_STATS diagnostics (off unless the env var is set).
     bool statsEnabled_ = false;

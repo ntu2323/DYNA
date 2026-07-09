@@ -79,6 +79,13 @@ PartitionOrderer::Submit(LogEntry entry)
     submitCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
+void
+PartitionOrderer::DrainDueEager(std::vector<LogEntry> &out)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    DrainDueLocked(out);
+}
+
 size_t
 PartitionOrderer::ReleaseDue()
 {

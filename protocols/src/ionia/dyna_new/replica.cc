@@ -40,6 +40,9 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // release spinners were starving the single transport pump for CPU.
     const char *rs = std::getenv("DYNA_NEW_RELEASE_SPIN");
     const bool releaseSpin = (rs == nullptr) ? busyPoll : (*rs != '0');
+    // Eager fast reply on the receive thread (default on). DYNA_NEW_EAGER=0 to A/B.
+    const char *eg = std::getenv("DYNA_NEW_EAGER");
+    eagerEnabled_ = (eg == nullptr) || (*eg != '0');
     // LRU cap for the per-partition dedup reply-cache (bounds a latency-drift
     // driver at scale). Must exceed the client retry window; 0 = unbounded.
     // Per-partition cap (each partition sees ~1/N of traffic). At a few hundred
@@ -84,8 +87,8 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // Make the release-clock spin mode visible: if this logs releaseSpin=0 the
     // release loop is cv-parking (≈100µs wakeup per release) — the prime suspect
     // for the Submit→release latency. Env can override the default (spin on).
-    Notice("DYNA_NEW r%d config: busyPoll=%d releaseSpin=%d reconIntervalUs=%lu",
-           replicaIdx, busyPoll ? 1 : 0, releaseSpin ? 1 : 0,
+    Notice("DYNA_NEW r%d config: busyPoll=%d releaseSpin=%d eager=%d reconIntervalUs=%lu",
+           replicaIdx, busyPoll ? 1 : 0, releaseSpin ? 1 : 0, eagerEnabled_ ? 1 : 0,
            (unsigned long)reconIntervalUs_);
 
     const char *sv = std::getenv("DYNA_NEW_STATS");
@@ -206,6 +209,35 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
         orderers_[pid]->Submit(std::move(e));
+
+        // Eager fast path (§ collapse the relay): if the request is already due,
+        // release + reply INLINE on this receive thread instead of paying the
+        // hand-off to the per-partition release thread. Most requests are due at
+        // Submit (deadline ≈ now once pump processing is done), so this is the
+        // common case. Not-yet-due entries stay in the buffer for the release loop.
+        // The pump already sends replies inline (dedup-resend path), so this is a
+        // proven-safe transport use; DrainDueEager pops under mu_ so the release
+        // loop never double-releases.
+        if (eagerEnabled_) {
+            std::vector<LogEntry> eager;
+            orderers_[pid]->DrainDueEager(eager);
+            if (!eager.empty()) {
+                const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
+                std::vector<LogEntry> writes;
+                for (const LogEntry &re : eager) {
+                    SendReply(pid, is_leader, re);
+                    if (is_leader && re.type != proto::READ_ONLY) {
+                        writes.push_back(re);
+                    }
+                }
+                if (is_leader && !writes.empty()) {
+                    // Sends may reorder vs the release loop's broadcasts, but
+                    // followers reconcile by log_id (DrainSyncsLocked), so §7 order
+                    // is preserved. Local batch — does not touch pendingSync_.
+                    BroadcastSyncBatch(pid, writes);
+                }
+            }
+        }
         return;
     }
 
