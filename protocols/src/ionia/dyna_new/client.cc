@@ -34,6 +34,12 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
     client_stats_every_ =
         DeadlineConfig::EnvU64("DYNA_NEW_CLIENT_STATS_LOG_EVERY", 10000);
     if (client_stats_every_ == 0) client_stats_every_ = 10000;
+    // Log the deadline config actually read from env, so bound-cap experiments are
+    // verifiable (the bound = min(max_owd, max(initial, measured_owd))).
+    DeadlineConfig dc = DeadlineConfig::FromEnv();
+    Notice("DYNA_NEW client config: initial_bound_us=%lu max_owd_us=%lu owd_pct=%u",
+           (unsigned long)dc.initial_bound_us, (unsigned long)dc.max_owd_us,
+           dc.owd_percentile_percent);
 }
 
 DynaNewClient::~DynaNewClient() {}
