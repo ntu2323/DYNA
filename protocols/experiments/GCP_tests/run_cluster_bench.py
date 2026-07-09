@@ -247,9 +247,14 @@ def _build_client_cmd(
         # dyna_new ignores DYNA_CLIENT_STATS (not implemented). It reads the shared
         # deadline vars (deadline.h) plus its own retransmission timeout (spec §5).
         # BENCH_INFLIGHT_LOG surfaces inflight/submitted on throughput lines.
+        # Bound knobs pass through from the LOCAL environment (they're evaluated in
+        # the remote shell otherwise, which never sees the local export). Lets you
+        # A/B the deadline hold: e.g. DYNA_MAX_OWD_US=40 python3 run_cluster_bench.py …
+        _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "50")
+        _max_owd = os.environ.get("DYNA_MAX_OWD_US", "2000")
         dyna_env = (
-            "export DYNA_INITIAL_BOUND_US=${DYNA_INITIAL_BOUND_US:-50}; "
-            "export DYNA_MAX_OWD_US=${DYNA_MAX_OWD_US:-2000}; "
+            f"export DYNA_INITIAL_BOUND_US={_init_bound}; "
+            f"export DYNA_MAX_OWD_US={_max_owd}; "
             "export DYNA_NEW_RESEND_TIMEOUT_MS=${DYNA_NEW_RESEND_TIMEOUT_MS:-30}; "
             "export DYNA_NEW_CLIENT_STATS=${DYNA_NEW_CLIENT_STATS:-1}; "
             "export DYNA_NEW_CLIENT_STATS_LOG_EVERY=${DYNA_NEW_CLIENT_STATS_LOG_EVERY:-2000}; "

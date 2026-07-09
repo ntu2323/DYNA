@@ -46,7 +46,7 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // Max time the eager path will spin to a near-due deadline before drain+reply.
     // Deadlines are ~a few µs out at Submit, so a small budget covers the common
     // case; far-future entries fall through to the release loop.
-    eagerSpinUs_ = DeadlineConfig::EnvU64("DYNA_NEW_EAGER_SPIN_US", 40);
+    eagerSpinUs_ = DeadlineConfig::EnvU64("DYNA_NEW_EAGER_SPIN_US", 0);
     // LRU cap for the per-partition dedup reply-cache (bounds a latency-drift
     // driver at scale). Must exceed the client retry window; 0 = unbounded.
     // Per-partition cap (each partition sees ~1/N of traffic). At a few hundred
