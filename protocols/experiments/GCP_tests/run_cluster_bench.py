@@ -250,8 +250,11 @@ def _build_client_cmd(
         # Bound knobs pass through from the LOCAL environment (they're evaluated in
         # the remote shell otherwise, which never sees the local export). Lets you
         # A/B the deadline hold: e.g. DYNA_MAX_OWD_US=40 python3 run_cluster_bench.py …
-        _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "50")
-        _max_owd = os.environ.get("DYNA_MAX_OWD_US", "2000")
+        # EXPERIMENT: cap the deadline-hold bound low (was 50/2000). The bound is the
+        # dominant latency term; capping it shrinks the deadline hold. Override via
+        # the local env if set. Revert defaults to 50/2000 for production.
+        _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "30")
+        _max_owd = os.environ.get("DYNA_MAX_OWD_US", "40")
         dyna_env = (
             f"export DYNA_INITIAL_BOUND_US={_init_bound}; "
             f"export DYNA_MAX_OWD_US={_max_owd}; "
