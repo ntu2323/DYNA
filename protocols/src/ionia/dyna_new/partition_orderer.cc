@@ -433,10 +433,17 @@ PartitionOrderer::ReleaseLoop()
                 lockWaitCount_.fetch_add(1, std::memory_order_relaxed);
             }
         }
+        const uint64_t sw0 = WallClockMicros();
         for (const LogEntry &e : released) {
             if (on_release_) on_release_(e);
         }
         if (!released.empty() && on_post_drain_) on_post_drain_();
+        if (!released.empty()) {
+            // Inline reply-send + sync broadcast time on the release thread. If
+            // large, the loop is busy here and later entries wait behind it.
+            sendWorkSumUs_.fetch_add(WallClockMicros() - sw0, std::memory_order_relaxed);
+            sendWorkCount_.fetch_add(1, std::memory_order_relaxed);
+        }
 
         // Periodic self-healing: re-send Sync/Fetch so a lost control message
         // can't leave a permanent reconciliation gap. Off when interval is 0.

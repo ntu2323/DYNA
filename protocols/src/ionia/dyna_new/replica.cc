@@ -534,7 +534,7 @@ DynaNewReplica::StatsDump()
 {
     uint64_t fast = 0, slow = 0, resync = 0, refetch = 0, commits = 0;
     size_t confirmBacklog = 0, syncGaps = 0, earlyBuf = 0;
-    uint64_t lockWaitSum = 0, lockWaitCnt = 0;
+    uint64_t lockWaitSum = 0, lockWaitCnt = 0, sendWorkSum = 0, sendWorkCnt = 0;
     for (auto &o : orderers_) {
         fast += o->fast_submits();
         slow += o->slow_submits();
@@ -546,8 +546,20 @@ DynaNewReplica::StatsDump()
         earlyBuf += o->early_buffer_size();
         lockWaitSum += o->lock_wait_sum_us();
         lockWaitCnt += o->lock_wait_count();
+        sendWorkSum += o->send_work_sum_us();
+        sendWorkCnt += o->send_work_count();
     }
+    const uint64_t sendWorkAvg = sendWorkCnt ? sendWorkSum / sendWorkCnt : 0;
     const uint64_t lockWaitAvg = lockWaitCnt ? lockWaitSum / lockWaitCnt : 0;
+    // Interrupt→wake latency of the busy-poll release spin. If large, the spin is
+    // slow to notice a Submit's Interrupt (e.g. sched_yield not rescheduling) —
+    // the systematic Submit→release cost with lockWait≈0.
+    uint64_t wakeLatSum = 0, wakeLatCnt = 0;
+    for (auto &c : clocks_) {
+        wakeLatSum += c->wake_lat_sum_us();
+        wakeLatCnt += c->wake_lat_count();
+    }
+    const uint64_t wakeLatAvg = wakeLatCnt ? wakeLatSum / wakeLatCnt : 0;
     // Cumulative counters (diff consecutive lines for rates) + instantaneous
     // gauges. slow/(fast+slow) = slow-path ratio; resync/refetch = healing (loss);
     // confirmBacklog/syncGaps = commit/reconciliation backlog behind the tail.
@@ -589,7 +601,8 @@ DynaNewReplica::StatsDump()
            "releaseLate_us[avg=%lu max=%lu] "
            "rawOwd_us[p50=%lu p90=%lu] "
            "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
-           "pumpBusy_us[req=%lu ctrl=%lu] lockWait_us[avg=%lu] "
+           "pumpBusy_us[req=%lu ctrl=%lu] lockWait_us[avg=%lu] wakeLat_us[avg=%lu] "
+           "sendWork_us[avg=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -610,7 +623,8 @@ DynaNewReplica::StatsDump()
            (unsigned long)preP50, (unsigned long)preP90,
            (unsigned long)lateP50, (unsigned long)lateP90,
            (unsigned long)pumpReq, (unsigned long)pumpCtrl,
-           (unsigned long)lockWaitAvg,
+           (unsigned long)lockWaitAvg, (unsigned long)wakeLatAvg,
+           (unsigned long)sendWorkAvg,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {
