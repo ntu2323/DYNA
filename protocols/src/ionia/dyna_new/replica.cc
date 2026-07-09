@@ -553,35 +553,25 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
     // Use the estimate snapshotted at receive — no owd_mu_ (global lock) here.
     reply.set_owd_estimate(e.owd_estimate_us);
 
-    // Cache for at-most-once (spec §6.1): a later retry is answered from here.
-    // A corrected reply (§6.4) overwrites the speculative one. Also clears the
-    // in-flight mark set at receive time.
+    const uint64_t xt0 = WallClockMicros();
+    reply.set_release_time(xt0);         // PTP-comparable release stamp
+    reply.set_recv_time(e.recv_us);      // T2 for the client's NTP clock-offset calc
+    reply.set_submit_time(e.arrival_us); // Submit stamp — splits the replica hold
+    reply.set_drain_time(e.drain_us);    // release-loop drain stamp — splits rLoop
+    reply.set_onrelease_time(onrelease_us ? onrelease_us : sr_start);
+    transport->SendMessage(this, *e.client_addr, reply);
+    const uint64_t xdt = WallClockMicros() - xt0;
+    replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);
+    replyXmitCount_.fetch_add(1, std::memory_order_relaxed);
+
+    // Cache for at-most-once AFTER the send — off the release critical path. A retry
+    // is answered from here; the retry window is ms, so a µs gap before caching is
+    // fine. (spec §6.1; a corrected reply §6.4 overwrites the speculative one.)
     if (pid < dedup_.size()) {
         const ClientAndReqId key{e.client_id, e.request_id};
         std::lock_guard<std::mutex> dlk(dedup_[pid]->mu);
         dedup_[pid]->dedup.OnReply(key, reply);
     }
-
-    const uint64_t xt0 = WallClockMicros();
-    // PTP-comparable release stamp so the client can split to_first into a true
-    // forward leg (send→release) and reverse leg (release→client-recv).
-    reply.set_release_time(xt0);
-    reply.set_recv_time(e.recv_us);      // T2 for the client's NTP clock-offset calc
-    reply.set_submit_time(e.arrival_us); // Submit stamp — splits the replica hold
-    reply.set_drain_time(e.drain_us);    // release-loop drain stamp — splits rLoop
-    reply.set_onrelease_time(onrelease_us ? onrelease_us : sr_start);
-    // residence = arrival→release_time (what the client's fwd leg actually sees,
-    // skew-immune replica-only). presend = time spent in SendReply BEFORE this
-    // stamp (reply build + owd_mu_ + dedup OnReply locks) — isolates whether the
-    // fwd cost is here vs the wire.
-    // residence = recv→release (T3−T2): the TRUE replica hold, offset-immune (both
-    // stamps are the replica clock). Uses recv_us (stamped in ReceiveMessage), which
-    // provably survives to here since the NTP recv_time relies on it — unlike the
-    // Submit-stamped arrival_us, whose sampler read empty.
-    transport->SendMessage(this, *e.client_addr, reply);
-    const uint64_t xdt = WallClockMicros() - xt0;
-    replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);
-    replyXmitCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void
