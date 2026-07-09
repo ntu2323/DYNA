@@ -126,6 +126,7 @@ PartitionOrderer::DrainDueLocked(std::vector<LogEntry> &out)
             continue;
         }
 
+        e.drain_us = WallClockMicros();   // when the loop drained it (diagnostic)
         ReleaseEntryLocked(e);
         out.push_back(std::move(e));
     }

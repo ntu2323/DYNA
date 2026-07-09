@@ -49,6 +49,9 @@ struct LogEntry {
     // Diagnostic only: replica wall-clock µs at request receipt (ReceiveMessage top),
     // carried into the reply as T2 for the client's NTP clock-offset computation.
     uint64_t recv_us = 0;
+    // Diagnostic only: replica wall-clock µs when the release loop drained this entry
+    // (in DrainDueLocked). Splits rLoop into submit→drain vs drain→reply.
+    uint64_t drain_us = 0;
 
     // Where to send this request's reply (set by the replica from the inbound
     // message; null for entries that need no client reply, e.g. sync-fetched).

@@ -565,6 +565,7 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     reply.set_release_time(xt0);
     reply.set_recv_time(e.recv_us);      // T2 for the client's NTP clock-offset calc
     reply.set_submit_time(e.arrival_us); // Submit stamp — splits the replica hold
+    reply.set_drain_time(e.drain_us);    // release-loop drain stamp — splits rLoop
     // residence = arrival→release_time (what the client's fwd leg actually sees,
     // skew-immune replica-only). presend = time spent in SendReply BEFORE this
     // stamp (reply build + owd_mu_ + dedup OnReply locks) — isolates whether the

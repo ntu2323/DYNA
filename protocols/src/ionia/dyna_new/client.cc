@@ -226,6 +226,11 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
             if (sub >= reply.recv_time() && rel >= sub) {
                 stat_rproc_us_.push_back(sub - reply.recv_time());
                 stat_rloop_us_.push_back(rel - sub);
+                const uint64_t dr = reply.drain_time();
+                if (dr >= sub && rel >= dr) {
+                    stat_rwait_us_.push_back(dr - sub);   // submit→drain
+                    stat_rsend_us_.push_back(rel - dr);   // drain→release
+                }
             }
         }
     }
@@ -312,6 +317,8 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     const unsigned long rHoldP50 = up50(stat_rhold_us_);
     const unsigned long rProcP50 = up50(stat_rproc_us_);
     const unsigned long rLoopP50 = up50(stat_rloop_us_);
+    const unsigned long rWaitP50 = up50(stat_rwait_us_);
+    const unsigned long rSendP50 = up50(stat_rsend_us_);
     uint64_t resend_sum = 0, max_resends = 0;
     for (uint32_t r : stat_resends_) {
         resend_sum += r;
@@ -341,6 +348,7 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
            "quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
            "clockOffset_us p50=%ld; netDelay_us p50=%ld; effBound_us p50=%lu; "
            "rHold_us p50=%lu; rProc_us p50=%lu; rLoop_us p50=%lu; "
+           "rWait_us p50=%lu; rSend_us p50=%lu; "
            "resends avg=%.2f max=%lu; bound_us=%lu %s pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
@@ -350,7 +358,7 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
            (unsigned long)send_issue_avg,
            clkOffP50, netDelP50, effBoundP50,
-           rHoldP50, rProcP50, rLoopP50,
+           rHoldP50, rProcP50, rLoopP50, rWaitP50, rSendP50,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
            (unsigned long)bound_tracker_.bound_us(), perRep.c_str(), pending_.size());
 
@@ -365,6 +373,8 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     stat_rhold_us_.clear();
     stat_rproc_us_.clear();
     stat_rloop_us_.clear();
+    stat_rwait_us_.clear();
+    stat_rsend_us_.clear();
     stat_resends_.clear();
     stat_send_issue_sum_us_ = 0;
     stat_send_issue_count_ = 0;

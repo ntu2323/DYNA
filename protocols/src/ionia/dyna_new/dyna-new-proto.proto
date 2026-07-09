@@ -39,6 +39,8 @@ message Reply {
     optional uint64 submit_time  = 13; // replica wall-clock µs when the entry entered the
                                        // early buffer (Submit). Splits the replica hold
                                        // (T3−T2) into pump-processing vs release-loop.
+    optional uint64 drain_time   = 14; // replica wall-clock µs when the release loop drained
+                                       // it. Splits rLoop into submit→drain vs drain→reply.
 }
 
 // partition leader → followers  (§4; also serves as heartbeat)

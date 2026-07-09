@@ -99,6 +99,9 @@ private:
     //   proc  = submit_time  − recv_time   (pump: receive→enter buffer)
     //   loop  = release_time − submit_time (buffer wait + release-loop fire)
     std::vector<uint64_t> stat_rhold_us_, stat_rproc_us_, stat_rloop_us_;
+    // rLoop split: submit→drain (buffer wait + release-loop wake) vs drain→release
+    // (OnRelease/SendReply). Localizes the cluster's fixed ~130µs release overhead.
+    std::vector<uint64_t> stat_rwait_us_, stat_rsend_us_;
     std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x
