@@ -55,8 +55,12 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // Per-partition cap (each partition sees ~1/N of traffic). At a few hundred
     // ops/s/partition, 8192 ≈ tens of seconds of history — far longer than the
     // client retry window, so a retried request is never evicted early.
+    // Small cap: the retry window is the resend timeout (~30ms), so at a few
+    // hundred ops/s/partition a few hundred entries is ample. A big cache just
+    // bounces more shared cache lines between the pump (OnReceive) and the release
+    // thread (OnReply) — a measured latency driver on the receive/reply paths.
     const size_t dedupCap =
-        static_cast<size_t>(DeadlineConfig::EnvU64("DYNA_NEW_DEDUP_CAP", 8192));
+        static_cast<size_t>(DeadlineConfig::EnvU64("DYNA_NEW_DEDUP_CAP", 512));
     // Trailing-window log GC: keep this many entries below commit_point in memory,
     // drop older (durably-committed) ones. Must exceed any healthy follower's lag.
     const uint64_t logKeep = DeadlineConfig::EnvU64("DYNA_NEW_LOG_KEEP", 4096);
