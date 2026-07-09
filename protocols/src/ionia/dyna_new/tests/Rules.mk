@@ -10,7 +10,8 @@ GTEST_SRCS += $(addprefix $(d), \
 		quorum_test.cc \
 		recon_test.cc \
 		commit_test.cc \
-		dedup_flow_test.cc)
+		dedup_flow_test.cc \
+		release_repro_test.cc)
 
 $(d)dyna-new-types-test: $(o)types_test.o \
 	.obj/dyna_new/dyna-new-proto.o \
@@ -59,3 +60,11 @@ $(d)dyna-new-dedup-flow-test: $(o)dedup_flow_test.o \
 	$(GTEST_MAIN)
 
 TEST_BINS += $(d)dyna-new-dedup-flow-test
+
+$(d)dyna-new-release-repro-test: $(o)release_repro_test.o \
+	.obj/dyna_new/partition_orderer.o \
+	.obj/dyna_new/in_memory_backend.o \
+	.obj/dyna_new/dyna-new-proto.o \
+	$(GTEST_MAIN)
+
+TEST_BINS += $(d)dyna-new-release-repro-test

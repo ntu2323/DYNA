@@ -40,9 +40,12 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // release spinners were starving the single transport pump for CPU.
     const char *rs = std::getenv("DYNA_NEW_RELEASE_SPIN");
     const bool releaseSpin = (rs == nullptr) ? busyPoll : (*rs != '0');
-    // Eager fast reply on the receive thread (default on). DYNA_NEW_EAGER=0 to A/B.
+    // Eager fast reply on the receive thread. Default OFF: the local repro showed
+    // the release loop already releases at deadline+~10µs, so eager isn't needed,
+    // and doing release work on the pump busies it → inflates measured OWD → inflates
+    // the deadline-hold bound (the dominant latency term). DYNA_NEW_EAGER=1 to A/B.
     const char *eg = std::getenv("DYNA_NEW_EAGER");
-    eagerEnabled_ = (eg == nullptr) || (*eg != '0');
+    eagerEnabled_ = (eg != nullptr) && (*eg != '0');
     // Max time the eager path will spin to a near-due deadline before drain+reply.
     // Deadlines are ~a few µs out at Submit, so a small budget covers the common
     // case; far-future entries fall through to the release loop.
