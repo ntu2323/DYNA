@@ -43,6 +43,10 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // Eager fast reply on the receive thread (default on). DYNA_NEW_EAGER=0 to A/B.
     const char *eg = std::getenv("DYNA_NEW_EAGER");
     eagerEnabled_ = (eg == nullptr) || (*eg != '0');
+    // Max time the eager path will spin to a near-due deadline before drain+reply.
+    // Deadlines are ~a few µs out at Submit, so a small budget covers the common
+    // case; far-future entries fall through to the release loop.
+    eagerSpinUs_ = DeadlineConfig::EnvU64("DYNA_NEW_EAGER_SPIN_US", 40);
     // LRU cap for the per-partition dedup reply-cache (bounds a latency-drift
     // driver at scale). Must exceed the client retry window; 0 = unbounded.
     // Per-partition cap (each partition sees ~1/N of traffic). At a few hundred
@@ -87,9 +91,9 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // Make the release-clock spin mode visible: if this logs releaseSpin=0 the
     // release loop is cv-parking (≈100µs wakeup per release) — the prime suspect
     // for the Submit→release latency. Env can override the default (spin on).
-    Notice("DYNA_NEW r%d config: busyPoll=%d releaseSpin=%d eager=%d reconIntervalUs=%lu",
+    Notice("DYNA_NEW r%d config: busyPoll=%d releaseSpin=%d eager=%d eagerSpinUs=%lu reconIntervalUs=%lu",
            replicaIdx, busyPoll ? 1 : 0, releaseSpin ? 1 : 0, eagerEnabled_ ? 1 : 0,
-           (unsigned long)reconIntervalUs_);
+           (unsigned long)eagerSpinUs_, (unsigned long)reconIntervalUs_);
 
     const char *sv = std::getenv("DYNA_NEW_STATS");
     statsEnabled_ = (sv != nullptr && *sv != '\0' && *sv != '0');
@@ -219,6 +223,15 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         // proven-safe transport use; DrainDueEager pops under mu_ so the release
         // loop never double-releases.
         if (eagerEnabled_) {
+            // The entry is typically a few µs short of due at Submit (submit≈send+67,
+            // deadline≈send+70). Spin the small remaining time to its deadline, then
+            // drain+reply inline. Bounded by eagerSpinUs_ so far-future deadlines are
+            // left to the release loop and the pump is never blocked long.
+            const uint64_t dl = req.deadline();
+            const uint64_t now0 = WallClockMicros();
+            if (dl <= now0 + eagerSpinUs_) {
+                while (WallClockMicros() < dl) { /* brief spin to the deadline */ }
+            }
             std::vector<LogEntry> eager;
             orderers_[pid]->DrainDueEager(eager);
             if (!eager.empty()) {
