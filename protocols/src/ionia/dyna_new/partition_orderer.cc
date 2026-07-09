@@ -34,7 +34,7 @@ PartitionOrderer::~PartitionOrderer()
 }
 
 void
-PartitionOrderer::Submit(LogEntry entry)
+PartitionOrderer::Submit(LogEntry entry, bool poke)
 {
     // Stamp buffer-entry time on the REPLICA clock (guaranteed to survive to
     // release, unlike the receive-path arrival_us). residence = release − this is
@@ -71,8 +71,9 @@ PartitionOrderer::Submit(LogEntry entry)
             state_.early_buffer.push(std::move(entry));
         }
     }
-    // Wake the release loop so it re-evaluates the next deadline.
-    clock_->Interrupt();
+    // Wake the release loop so it re-evaluates the next deadline (unless the caller
+    // will drain the entry itself, e.g. the eager receive-thread path).
+    if (poke) clock_->Interrupt();
     // Whole Submit body (arrival stamp → after Interrupt), on the pump thread.
     submitInternalSumUs_.fetch_add(WallClockMicros() - t_before_lock,
                                    std::memory_order_relaxed);
@@ -84,6 +85,12 @@ PartitionOrderer::DrainDueEager(std::vector<LogEntry> &out)
 {
     std::lock_guard<std::mutex> lk(mu_);
     DrainDueLocked(out);
+}
+
+void
+PartitionOrderer::PokeReleaseLoop()
+{
+    clock_->Interrupt();
 }
 
 size_t

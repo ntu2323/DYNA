@@ -98,7 +98,13 @@ public:
     // (deadline > deadline_counter) -> early_buffer; otherwise the slow path
     // (§6.2): stage in late_buffer, reassign deadline = max(now, counter+1),
     // move to early_buffer. Thread-safe.
-    void Submit(LogEntry entry);
+    // poke=false skips waking the release loop — used by the eager receive-thread
+    // path so it can drain the just-submitted entry itself without the release loop
+    // racing it; the caller pokes afterwards for any entries it left behind.
+    void Submit(LogEntry entry, bool poke = true);
+    // Wake the release loop to re-evaluate its next deadline (public so the eager
+    // path can poke after it has drained the due entries).
+    void PokeReleaseLoop();
 
     // Release every entry whose deadline <= clock->Now(), in deadline order
     // (advance deadline_counter, append to synced_log, mem_apply writes).

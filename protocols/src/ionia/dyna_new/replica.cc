@@ -212,7 +212,10 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.recv_us = recv_arrival;      // T2 for the client's NTP clock-offset calc
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
-        orderers_[pid]->Submit(std::move(e));
+        // Eager path submits without poking the release loop, so the release loop
+        // can't race the pump for the just-submitted entry during the eager spin;
+        // the pump pokes it afterwards for anything it left behind.
+        orderers_[pid]->Submit(std::move(e), /*poke=*/!eagerEnabled_);
 
         // Eager fast path (§ collapse the relay): if the request is already due,
         // release + reply INLINE on this receive thread instead of paying the
@@ -234,6 +237,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
             }
             std::vector<LogEntry> eager;
             orderers_[pid]->DrainDueEager(eager);
+            eagerReleases_.fetch_add(eager.size(), std::memory_order_relaxed);
             if (!eager.empty()) {
                 const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
                 std::vector<LogEntry> writes;
@@ -250,6 +254,8 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
                     BroadcastSyncBatch(pid, writes);
                 }
             }
+            // Now let the release loop handle any not-yet-due entries left behind.
+            orderers_[pid]->PokeReleaseLoop();
         }
         return;
     }
@@ -654,6 +660,7 @@ DynaNewReplica::StatsDump()
            "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
            "pumpBusy_us[req=%lu ctrl=%lu] lockWait_us[avg=%lu] wakeLat_us[avg=%lu] "
            "sendWork_us[avg=%lu] submitLockWait_us[avg=%lu] submitInternal_us[avg=%lu] "
+           "eagerRel=%lu "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -677,6 +684,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)lockWaitAvg, (unsigned long)wakeLatAvg,
            (unsigned long)sendWorkAvg,
            (unsigned long)submitLockWaitAvg, (unsigned long)submitInternalAvg,
+           (unsigned long)eagerReleases_.load(std::memory_order_relaxed),
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {
