@@ -166,6 +166,10 @@ public:
     // Inline reply-send + sync-broadcast time per release drain (release thread).
     uint64_t send_work_sum_us() const { return sendWorkSumUs_.load(std::memory_order_relaxed); }
     uint64_t send_work_count() const { return sendWorkCount_.load(std::memory_order_relaxed); }
+    // Pump-side Submit timing: mu_ acquire wait, and whole Submit body.
+    uint64_t submit_lock_wait_sum_us() const { return submitLockWaitSumUs_.load(std::memory_order_relaxed); }
+    uint64_t submit_internal_sum_us() const { return submitInternalSumUs_.load(std::memory_order_relaxed); }
+    uint64_t submit_count() const { return submitCount_.load(std::memory_order_relaxed); }
     size_t confirm_state_size() const;   // leader: uncommitted backlog
     size_t pending_syncs_size() const;   // follower: reconciliation gap depth
 
@@ -253,6 +257,9 @@ private:
     std::atomic<uint64_t> lockWaitCount_{0};
     std::atomic<uint64_t> sendWorkSumUs_{0};  // inline send+broadcast per drain (diag)
     std::atomic<uint64_t> sendWorkCount_{0};
+    std::atomic<uint64_t> submitLockWaitSumUs_{0};  // pump mu_ acquire wait in Submit
+    std::atomic<uint64_t> submitInternalSumUs_{0};  // whole Submit body time
+    std::atomic<uint64_t> submitCount_{0};
 };
 
 } // namespace dyna_new

@@ -535,6 +535,7 @@ DynaNewReplica::StatsDump()
     uint64_t fast = 0, slow = 0, resync = 0, refetch = 0, commits = 0;
     size_t confirmBacklog = 0, syncGaps = 0, earlyBuf = 0;
     uint64_t lockWaitSum = 0, lockWaitCnt = 0, sendWorkSum = 0, sendWorkCnt = 0;
+    uint64_t submitLockWaitSum = 0, submitInternalSum = 0, submitCnt = 0;
     for (auto &o : orderers_) {
         fast += o->fast_submits();
         slow += o->slow_submits();
@@ -548,8 +549,13 @@ DynaNewReplica::StatsDump()
         lockWaitCnt += o->lock_wait_count();
         sendWorkSum += o->send_work_sum_us();
         sendWorkCnt += o->send_work_count();
+        submitLockWaitSum += o->submit_lock_wait_sum_us();
+        submitInternalSum += o->submit_internal_sum_us();
+        submitCnt += o->submit_count();
     }
     const uint64_t sendWorkAvg = sendWorkCnt ? sendWorkSum / sendWorkCnt : 0;
+    const uint64_t submitLockWaitAvg = submitCnt ? submitLockWaitSum / submitCnt : 0;
+    const uint64_t submitInternalAvg = submitCnt ? submitInternalSum / submitCnt : 0;
     const uint64_t lockWaitAvg = lockWaitCnt ? lockWaitSum / lockWaitCnt : 0;
     // Interrupt→wake latency of the busy-poll release spin. If large, the spin is
     // slow to notice a Submit's Interrupt (e.g. sched_yield not rescheduling) —
@@ -602,7 +608,7 @@ DynaNewReplica::StatsDump()
            "rawOwd_us[p50=%lu p90=%lu] "
            "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
            "pumpBusy_us[req=%lu ctrl=%lu] lockWait_us[avg=%lu] wakeLat_us[avg=%lu] "
-           "sendWork_us[avg=%lu] "
+           "sendWork_us[avg=%lu] submitLockWait_us[avg=%lu] submitInternal_us[avg=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -625,6 +631,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)pumpReq, (unsigned long)pumpCtrl,
            (unsigned long)lockWaitAvg, (unsigned long)wakeLatAvg,
            (unsigned long)sendWorkAvg,
+           (unsigned long)submitLockWaitAvg, (unsigned long)submitInternalAvg,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {
