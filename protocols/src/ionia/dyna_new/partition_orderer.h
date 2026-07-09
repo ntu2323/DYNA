@@ -159,6 +159,10 @@ public:
     uint64_t resync_count() const { return resync_count_.load(std::memory_order_relaxed); }
     uint64_t refetch_count() const { return refetch_count_.load(std::memory_order_relaxed); }
     uint64_t commit_count() const { return commit_count_.load(std::memory_order_relaxed); }
+    // Release-loop wait to acquire mu_ before DrainDueLocked. If large, §7 pump
+    // processing (HandleSync/SyncConfirm/Commit) is starving the release path.
+    uint64_t lock_wait_sum_us() const { return lockWaitSumUs_.load(std::memory_order_relaxed); }
+    uint64_t lock_wait_count() const { return lockWaitCount_.load(std::memory_order_relaxed); }
     size_t confirm_state_size() const;   // leader: uncommitted backlog
     size_t pending_syncs_size() const;   // follower: reconciliation gap depth
 
@@ -242,6 +246,8 @@ private:
     std::atomic<uint64_t> resync_count_{0};   // leader re-broadcast Syncs (healing)
     std::atomic<uint64_t> refetch_count_{0};  // follower re-fetches (healing)
     std::atomic<uint64_t> commit_count_{0};
+    std::atomic<uint64_t> lockWaitSumUs_{0};  // release-loop mu_ acquire wait (diag)
+    std::atomic<uint64_t> lockWaitCount_{0};
 };
 
 } // namespace dyna_new

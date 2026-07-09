@@ -419,11 +419,19 @@ PartitionOrderer::ReleaseLoop()
         std::vector<LogEntry> released;
         uint64_t next;
         {
+            const uint64_t lw0 = WallClockMicros();
             std::lock_guard<std::mutex> lk(mu_);
+            const uint64_t lockWait = WallClockMicros() - lw0;
             DrainDueLocked(released);
             next = state_.early_buffer.empty()
                        ? Clock::kNever
                        : state_.early_buffer.top().deadline;
+            // Only count iterations that actually release: measures the wait to
+            // acquire mu_ on the release critical path (vs §7 pump holders).
+            if (!released.empty()) {
+                lockWaitSumUs_.fetch_add(lockWait, std::memory_order_relaxed);
+                lockWaitCount_.fetch_add(1, std::memory_order_relaxed);
+            }
         }
         for (const LogEntry &e : released) {
             if (on_release_) on_release_(e);

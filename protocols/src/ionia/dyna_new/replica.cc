@@ -81,6 +81,13 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
 
     transport->Register(this, config, 0, replicaIdx);
 
+    // Make the release-clock spin mode visible: if this logs releaseSpin=0 the
+    // release loop is cv-parking (≈100µs wakeup per release) — the prime suspect
+    // for the Submit→release latency. Env can override the default (spin on).
+    Notice("DYNA_NEW r%d config: busyPoll=%d releaseSpin=%d reconIntervalUs=%lu",
+           replicaIdx, busyPoll ? 1 : 0, releaseSpin ? 1 : 0,
+           (unsigned long)reconIntervalUs_);
+
     const char *sv = std::getenv("DYNA_NEW_STATS");
     statsEnabled_ = (sv != nullptr && *sv != '\0' && *sv != '0');
     statsIntervalMs_ = DeadlineConfig::EnvU64("DYNA_NEW_STATS_INTERVAL_MS", 1000);
@@ -527,6 +534,7 @@ DynaNewReplica::StatsDump()
 {
     uint64_t fast = 0, slow = 0, resync = 0, refetch = 0, commits = 0;
     size_t confirmBacklog = 0, syncGaps = 0, earlyBuf = 0;
+    uint64_t lockWaitSum = 0, lockWaitCnt = 0;
     for (auto &o : orderers_) {
         fast += o->fast_submits();
         slow += o->slow_submits();
@@ -536,7 +544,10 @@ DynaNewReplica::StatsDump()
         confirmBacklog += o->confirm_state_size();
         syncGaps += o->pending_syncs_size();
         earlyBuf += o->early_buffer_size();
+        lockWaitSum += o->lock_wait_sum_us();
+        lockWaitCnt += o->lock_wait_count();
     }
+    const uint64_t lockWaitAvg = lockWaitCnt ? lockWaitSum / lockWaitCnt : 0;
     // Cumulative counters (diff consecutive lines for rates) + instantaneous
     // gauges. slow/(fast+slow) = slow-path ratio; resync/refetch = healing (loss);
     // confirmBacklog/syncGaps = commit/reconciliation backlog behind the tail.
@@ -578,7 +589,7 @@ DynaNewReplica::StatsDump()
            "releaseLate_us[avg=%lu max=%lu] "
            "rawOwd_us[p50=%lu p90=%lu] "
            "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
-           "pumpBusy_us[req=%lu ctrl=%lu] "
+           "pumpBusy_us[req=%lu ctrl=%lu] lockWait_us[avg=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -599,6 +610,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)preP50, (unsigned long)preP90,
            (unsigned long)lateP50, (unsigned long)lateP90,
            (unsigned long)pumpReq, (unsigned long)pumpCtrl,
+           (unsigned long)lockWaitAvg,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {
