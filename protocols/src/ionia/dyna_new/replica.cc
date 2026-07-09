@@ -405,7 +405,6 @@ DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
              late > cur && !releaseLateMaxUs_.compare_exchange_weak(cur, late); ) {}
     }
     releaseLateCount_.fetch_add(1, std::memory_order_relaxed);
-    lateSampler_.add(late);
     SendReply(pid, is_leader, e, /*onrelease_us=*/t0);
     const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
     replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
@@ -579,10 +578,6 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
     // stamps are the replica clock). Uses recv_us (stamped in ReceiveMessage), which
     // provably survives to here since the NTP recv_time relies on it — unlike the
     // Submit-stamped arrival_us, whose sampler read empty.
-    if (e.recv_us != 0 && xt0 > e.recv_us) {
-        residenceSampler_.add(xt0 - e.recv_us);
-    }
-    presendSampler_.add(xt0 - sr_start);
     transport->SendMessage(this, *e.client_addr, reply);
     const uint64_t xdt = WallClockMicros() - xt0;
     replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);
