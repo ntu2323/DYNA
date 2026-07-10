@@ -21,7 +21,6 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
                                int replicaIdx,
                                Transport *transport)
     : config(config), replicaIdx(replicaIdx), transport(transport),
-      backend_(std::make_unique<InMemoryBackend>(InMemoryBackend::LatencyFromEnv())),
       numPartitions_(static_cast<uint32_t>(config.n)),
       reconIntervalUs_(DeadlineConfig::EnvU64("DYNA_NEW_RECON_INTERVAL_MS", 5) * 1000),
       owd_(DeadlineConfig::FromEnv())
@@ -40,13 +39,12 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     // release spinners were starving the single transport pump for CPU.
     const char *rs = std::getenv("DYNA_NEW_RELEASE_SPIN");
     const bool releaseSpin = (rs == nullptr) ? busyPoll : (*rs != '0');
-    // Eager fast reply on the receive thread. Re-enabled by default now that the pump
-    // is lean (dedup no longer dominates rProc) and entries are due at submit
-    // (bound≈OWD): eager releases inline and skips the ~30µs release-thread relay.
-    // (It was OFF while the busy pump inflated OWD; that condition is gone.)
-    // DYNA_NEW_EAGER=0 to A/B back to the release-thread path.
+    // Eager fast reply on the receive thread. Default OFF: an A/B showed it's neutral
+    // (it moves the SAME ~30µs release work onto the pump, not removing it) and it
+    // risks making the single pump the bottleneck at high throughput. The release
+    // thread already releases promptly. DYNA_NEW_EAGER=1 to A/B.
     const char *eg = std::getenv("DYNA_NEW_EAGER");
-    eagerEnabled_ = (eg == nullptr) || (*eg != '0');
+    eagerEnabled_ = (eg != nullptr) && (*eg != '0');
     // Max time the eager path will spin to a near-due deadline before drain+reply.
     // Deadlines are ~a few µs out at Submit, so a small budget covers the common
     // case; far-future entries fall through to the release loop.
@@ -69,16 +67,19 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
     clocks_.reserve(numPartitions_);
     orderers_.reserve(numPartitions_);
     dedup_.reserve(numPartitions_);
+    backends_.reserve(numPartitions_);
     pendingSync_.resize(numPartitions_);
     for (uint32_t pid = 0; pid < numPartitions_; ++pid) {
         clocks_.push_back(std::make_unique<RealClock>(releaseSpin));
         dedup_.push_back(std::make_unique<PartitionDedup>());
         dedup_.back()->dedup.set_cap(dedupCap);
+        backends_.push_back(
+            std::make_unique<InMemoryBackend>(InMemoryBackend::LatencyFromEnv()));
         const bool is_leader = (pid == static_cast<uint32_t>(replicaIdx));
         auto role = is_leader ? PartitionOrderer::Role::kLeader
                               : PartitionOrderer::Role::kFollower;
         auto orderer = std::make_unique<PartitionOrderer>(
-            pid, /*view=*/0, backend_.get(), clocks_[pid].get(), role,
+            pid, /*view=*/0, backends_[pid].get(), clocks_[pid].get(), role,
             [this, pid, is_leader](const LogEntry &e) {
                 OnRelease(pid, is_leader, e);
             },

@@ -62,11 +62,13 @@ private:
     int replicaIdx;
     Transport *transport;
 
-    std::unique_ptr<StorageBackend> backend_;
+    // One backend per partition: keys are partitioned, so per-partition backends
+    // avoid a global mem_mu_ contended by all release threads (a per-write cost).
+    std::vector<std::unique_ptr<StorageBackend>> backends_;
 
     uint32_t numPartitions_;
     uint64_t reconIntervalUs_;   // self-healing re-sync/re-fetch cadence
-    bool eagerEnabled_ = true;   // eager inline reply on the receive thread
+    bool eagerEnabled_ = false;  // eager inline reply on receive thread (off: neutral)
     uint64_t eagerSpinUs_ = 0;   // spin budget in the eager path (0 = due-only, no spin)
     std::atomic<uint64_t> eagerReleases_{0};  // entries released by the eager path
 
