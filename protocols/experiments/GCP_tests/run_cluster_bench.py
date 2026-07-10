@@ -259,9 +259,17 @@ def _build_client_cmd(
         # raise them (bound ≈ p50 one-way delay). Override via the local env.
         _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "30")
         _max_owd = os.environ.get("DYNA_MAX_OWD_US", "40")
+        # Client transport mode, baked from the LOCAL env (a remote ${VAR:-1} would not
+        # see the local export). Default 1 = busy-poll (lowest single-thread latency).
+        # Set DYNA_NEW_BUSY_POLL=0 to make the CLIENT epoll-block: many client threads
+        # (-j N) then PARK when idle instead of each spinning a core, so multi-thread
+        # load scales without CPU / NIC-RX-softirq starvation (which collapses busy-poll
+        # at high -j). This affects clients only; replicas keep their own default.
+        _client_busy = os.environ.get("DYNA_NEW_BUSY_POLL", "1")
         dyna_env = (
             f"export DYNA_INITIAL_BOUND_US={_init_bound}; "
             f"export DYNA_MAX_OWD_US={_max_owd}; "
+            f"export DYNA_NEW_BUSY_POLL={_client_busy}; "
             "export DYNA_NEW_RESEND_TIMEOUT_MS=${DYNA_NEW_RESEND_TIMEOUT_MS:-30}; "
             "export DYNA_NEW_CLIENT_STATS=${DYNA_NEW_CLIENT_STATS:-1}; "
             "export DYNA_NEW_CLIENT_STATS_LOG_EVERY=${DYNA_NEW_CLIENT_STATS_LOG_EVERY:-2000}; "
