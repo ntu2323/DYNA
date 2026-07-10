@@ -114,7 +114,10 @@ PartitionOrderer::DrainDueLocked(std::vector<LogEntry> &out)
     const uint64_t now = clock_->Now();
     while (!state_.early_buffer.empty() &&
            state_.early_buffer.top().deadline <= now) {
-        LogEntry e = state_.early_buffer.top();
+        // Move (not copy) the entry out of the pq — it is popped immediately after,
+        // so the moved-from top is destroyed. Saves a full LogEntry (strings +
+        // shared_ptr) copy per release, on the critical path.
+        LogEntry e = std::move(const_cast<LogEntry &>(state_.early_buffer.top()));
         state_.early_buffer.pop();
         state_.deadline_counter = e.deadline;   // monotonically non-decreasing
 
