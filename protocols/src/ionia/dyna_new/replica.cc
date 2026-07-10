@@ -95,11 +95,6 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
         orderers_.push_back(std::move(orderer));
     }
 
-    // Start the replication worker before registering with transport so it is
-    // ready to drain §7 control the moment messages start arriving.
-    ctrl_running_ = true;
-    ctrl_thread_ = std::thread(&DynaNewReplica::ControlWorkerLoop, this);
-
     transport->Register(this, config, 0, replicaIdx);
 
     // Make the release-clock spin mode visible: if this logs releaseSpin=0 the
@@ -120,15 +115,6 @@ DynaNewReplica::DynaNewReplica(const specpaxos::Configuration &config,
 
 DynaNewReplica::~DynaNewReplica()
 {
-    // Stop the control worker first (it calls into the orderers), then the orderers.
-    {
-        std::lock_guard<std::mutex> lk(ctrl_mu_);
-        ctrl_running_ = false;
-    }
-    ctrl_cv_.notify_all();
-    if (ctrl_thread_.joinable()) {
-        ctrl_thread_.join();
-    }
     for (auto &o : orderers_) {
         o->Stop();
     }
@@ -143,6 +129,18 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
     (void)meta_data;
     const static auto requestName =
         proto::Request::default_instance().GetDescriptor()->full_name();
+    const static auto syncName =
+        proto::SyncBatch::default_instance().GetDescriptor()->full_name();
+    const static auto syncConfirmName =
+        proto::SyncConfirmBatch::default_instance().GetDescriptor()->full_name();
+    const static auto commitName =
+        proto::CommitBatch::default_instance().GetDescriptor()->full_name();
+    const static auto syncResendName =
+        proto::SyncResendRequest::default_instance().GetDescriptor()->full_name();
+    const static auto fetchReqName =
+        proto::FetchRequest::default_instance().GetDescriptor()->full_name();
+    const static auto fetchRespName =
+        proto::FetchResponse::default_instance().GetDescriptor()->full_name();
 
     if (type == requestName) {
         proto::Request req;
@@ -252,66 +250,6 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         }
         return;
     }
-
-    // Everything else is §7/reconciliation control — hand it to the replication
-    // worker so the pump returns immediately to pick up the next client request.
-    EnqueueControl(type, data, remote);
-}
-
-void
-DynaNewReplica::EnqueueControl(const std::string_view type,
-                               const std::string_view data,
-                               const TransportAddress &remote)
-{
-    ControlMsg m;
-    m.type.assign(type.data(), type.size());
-    m.data.assign(data.data(), data.size());
-    m.remote = std::shared_ptr<TransportAddress>(remote.clone());
-    {
-        std::lock_guard<std::mutex> lk(ctrl_mu_);
-        ctrl_q_.push_back(std::move(m));
-    }
-    ctrl_cv_.notify_one();
-}
-
-void
-DynaNewReplica::ControlWorkerLoop()
-{
-    std::deque<ControlMsg> batch;
-    for (;;) {
-        {
-            std::unique_lock<std::mutex> lk(ctrl_mu_);
-            ctrl_cv_.wait(lk, [this] { return !ctrl_q_.empty() || !ctrl_running_; });
-            if (ctrl_q_.empty() && !ctrl_running_) return;
-            // Drain the whole backlog in one lock acquisition — under load this
-            // amortizes the pump↔worker hand-off over many §7 messages instead of
-            // one lock per message. FIFO order is preserved.
-            batch.swap(ctrl_q_);
-        }
-        for (ControlMsg &m : batch) {
-            HandleControlMessage(m.type, m.data, *m.remote);
-        }
-        batch.clear();
-    }
-}
-
-void
-DynaNewReplica::HandleControlMessage(const std::string_view type,
-                                     const std::string_view data,
-                                     const TransportAddress &remote)
-{
-    const static auto syncName =
-        proto::SyncBatch::default_instance().GetDescriptor()->full_name();
-    const static auto syncConfirmName =
-        proto::SyncConfirmBatch::default_instance().GetDescriptor()->full_name();
-    const static auto commitName =
-        proto::CommitBatch::default_instance().GetDescriptor()->full_name();
-    const static auto syncResendName =
-        proto::SyncResendRequest::default_instance().GetDescriptor()->full_name();
-    const static auto fetchReqName =
-        proto::FetchRequest::default_instance().GetDescriptor()->full_name();
-    const static auto fetchRespName =
-        proto::FetchResponse::default_instance().GetDescriptor()->full_name();
 
     if (type == syncName) {
         proto::SyncBatch s;
