@@ -66,7 +66,7 @@ private:
 
     uint32_t numPartitions_;
     uint64_t reconIntervalUs_;   // self-healing re-sync/re-fetch cadence
-    bool eagerEnabled_ = false;  // eager inline reply on receive thread (off: busies pump)
+    bool eagerEnabled_ = true;   // eager inline reply on the receive thread
     uint64_t eagerSpinUs_ = 0;   // spin budget in the eager path (0 = due-only, no spin)
     std::atomic<uint64_t> eagerReleases_{0};  // entries released by the eager path
 
