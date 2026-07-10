@@ -127,21 +127,6 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
                                void *meta_data)
 {
     (void)meta_data;
-    // Pump-busy probe: total wall time this single transport thread spends inside
-    // ReceiveMessage, split request vs control (§7 sync/confirm/commit). If control
-    // dominates, request PICKUP is blocked behind §7 processing — the likely cause
-    // of the asymmetric forward leg (fwd 232µs ≫ rev 62µs) with residence≈0.
-    const uint64_t pump_t0 = WallClockMicros();
-    bool pump_is_request = false;
-    struct PumpTimer {
-        DynaNewReplica *self; const uint64_t &t0; const bool &is_req;
-        ~PumpTimer() {
-            const uint64_t d = WallClockMicros() - t0;
-            if (is_req) self->pumpReqBusyUs_.fetch_add(d, std::memory_order_relaxed);
-            else        self->pumpCtrlBusyUs_.fetch_add(d, std::memory_order_relaxed);
-        }
-    } pump_timer{this, pump_t0, pump_is_request};
-
     const static auto requestName =
         proto::Request::default_instance().GetDescriptor()->full_name();
     const static auto syncName =
@@ -162,8 +147,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         if (!req.ParseFromArray(data.data(), data.size())) {
             return;
         }
-        const uint64_t recv_arrival = WallClockMicros();   // stamp at arrival (§Step1)
-        pump_is_request = true;   // this ReceiveMessage is a client request
+        const uint64_t recv_arrival = WallClockMicros();   // stamp at arrival for OWD
         reqIn_.fetch_add(1, std::memory_order_relaxed);
 
         const uint32_t pid = PartitionOf(req.key(), numPartitions_);
@@ -197,11 +181,6 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         // OWD sample (§2): one-way delay = arrival_time - send_time (stamped at the
         // top, before parse/dedup, so it reflects the wire+pickup, not our own
         // processing). Only sampled for genuinely-new requests so retries don't skew.
-        // proc_delay = how long our own receive-path processing (parse/PartitionOf/
-        // dedup-lock) took before this point — a hop-latency breakdown (Step 1).
-        const uint64_t now = WallClockMicros();
-        procDelaySumUs_.fetch_add(now - recv_arrival, std::memory_order_relaxed);
-        procDelayCount_.fetch_add(1, std::memory_order_relaxed);
         uint64_t owd_est = 0;
         {
             std::lock_guard<std::mutex> lk(owd_mu_);
@@ -221,8 +200,6 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.command = req.command();
         e.send_time = req.send_time();
         e.deadline = req.deadline();
-        e.arrival_us = recv_arrival;   // for arrival→release residence (diagnostic)
-        e.recv_us = recv_arrival;      // T2 for the client's NTP clock-offset calc
         e.owd_estimate_us = owd_est;   // snapshot so SendReply skips the global owd_mu_
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
@@ -400,23 +377,7 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
 void
 DynaNewReplica::OnRelease(uint32_t pid, bool is_leader, const LogEntry &e)
 {
-    const uint64_t t0 = WallClockMicros();
-    // How late the release fires vs the entry's deadline. If the release loop is
-    // prompt this is ~0; a large value means the loop woke late (e.g. cv-park at
-    // idle). Clamped at 0 (an early release / clock skew shows as 0).
-    const uint64_t late = (t0 > e.deadline) ? t0 - e.deadline : 0;
-    if (late > 0) {
-        releaseLateSumUs_.fetch_add(late, std::memory_order_relaxed);
-        for (uint64_t cur = releaseLateMaxUs_.load(std::memory_order_relaxed);
-             late > cur && !releaseLateMaxUs_.compare_exchange_weak(cur, late); ) {}
-    }
-    releaseLateCount_.fetch_add(1, std::memory_order_relaxed);
-    SendReply(pid, is_leader, e, /*onrelease_us=*/t0);
-    const uint64_t dt = WallClockMicros() - t0;   // reply-send cost (Step 1)
-    replySendSumUs_.fetch_add(dt, std::memory_order_relaxed);
-    replySendCount_.fetch_add(1, std::memory_order_relaxed);
-    for (uint64_t cur = replySendMaxUs_.load(std::memory_order_relaxed);
-         dt > cur && !replySendMaxUs_.compare_exchange_weak(cur, dt); ) {}
+    SendReply(pid, is_leader, e);
     // Reads are not logged or synced (§6.3); only writes are reconciled. Accumulate
     // the sync; OnPostDrain flushes one SyncBatch for the whole drain (§9 batching,
     // zero added latency). Runs on this partition's release thread only.
@@ -531,14 +492,12 @@ DynaNewReplica::ExecuteReconActions(uint32_t pid,
 }
 
 void
-DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
-                          uint64_t onrelease_us)
+DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
 {
     if (!e.client_addr) {
         return;
     }
 
-    const uint64_t sr_start = WallClockMicros();   // SendReply entry (presend probe)
     proto::Reply reply;
     reply.set_view_id(0);
     reply.set_replica_id(static_cast<uint32_t>(replicaIdx));
@@ -559,16 +518,7 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
     // Use the estimate snapshotted at receive — no owd_mu_ (global lock) here.
     reply.set_owd_estimate(e.owd_estimate_us);
 
-    const uint64_t xt0 = WallClockMicros();
-    reply.set_release_time(xt0);         // PTP-comparable release stamp
-    reply.set_recv_time(e.recv_us);      // T2 for the client's NTP clock-offset calc
-    reply.set_submit_time(e.arrival_us); // Submit stamp — splits the replica hold
-    reply.set_drain_time(e.drain_us);    // release-loop drain stamp — splits rLoop
-    reply.set_onrelease_time(onrelease_us ? onrelease_us : sr_start);
     transport->SendMessage(this, *e.client_addr, reply);
-    const uint64_t xdt = WallClockMicros() - xt0;
-    replyXmitSumUs_.fetch_add(xdt, std::memory_order_relaxed);
-    replyXmitCount_.fetch_add(1, std::memory_order_relaxed);
 
     // Cache for at-most-once AFTER the send — off the release critical path. A retry
     // is answered from here; the retry window is ms, so a µs gap before caching is
@@ -585,8 +535,6 @@ DynaNewReplica::StatsDump()
 {
     uint64_t fast = 0, slow = 0, resync = 0, refetch = 0, commits = 0;
     size_t confirmBacklog = 0, syncGaps = 0, earlyBuf = 0;
-    uint64_t lockWaitSum = 0, lockWaitCnt = 0, sendWorkSum = 0, sendWorkCnt = 0;
-    uint64_t submitLockWaitSum = 0, submitInternalSum = 0, submitCnt = 0;
     for (auto &o : orderers_) {
         fast += o->fast_submits();
         slow += o->slow_submits();
@@ -596,27 +544,7 @@ DynaNewReplica::StatsDump()
         confirmBacklog += o->confirm_state_size();
         syncGaps += o->pending_syncs_size();
         earlyBuf += o->early_buffer_size();
-        lockWaitSum += o->lock_wait_sum_us();
-        lockWaitCnt += o->lock_wait_count();
-        sendWorkSum += o->send_work_sum_us();
-        sendWorkCnt += o->send_work_count();
-        submitLockWaitSum += o->submit_lock_wait_sum_us();
-        submitInternalSum += o->submit_internal_sum_us();
-        submitCnt += o->submit_count();
     }
-    const uint64_t sendWorkAvg = sendWorkCnt ? sendWorkSum / sendWorkCnt : 0;
-    const uint64_t submitLockWaitAvg = submitCnt ? submitLockWaitSum / submitCnt : 0;
-    const uint64_t submitInternalAvg = submitCnt ? submitInternalSum / submitCnt : 0;
-    const uint64_t lockWaitAvg = lockWaitCnt ? lockWaitSum / lockWaitCnt : 0;
-    // Interrupt→wake latency of the busy-poll release spin. If large, the spin is
-    // slow to notice a Submit's Interrupt (e.g. sched_yield not rescheduling) —
-    // the systematic Submit→release cost with lockWait≈0.
-    uint64_t wakeLatSum = 0, wakeLatCnt = 0;
-    for (auto &c : clocks_) {
-        wakeLatSum += c->wake_lat_sum_us();
-        wakeLatCnt += c->wake_lat_count();
-    }
-    const uint64_t wakeLatAvg = wakeLatCnt ? wakeLatSum / wakeLatCnt : 0;
     // Cumulative counters (diff consecutive lines for rates) + instantaneous
     // gauges. slow/(fast+slow) = slow-path ratio; resync/refetch = healing (loss);
     // confirmBacklog/syncGaps = commit/reconciliation backlog behind the tail.
@@ -625,42 +553,9 @@ DynaNewReplica::StatsDump()
         std::lock_guard<std::mutex> lk(owd_mu_);
         owdMax = owd_.max_estimate_us();
     }
-    const uint64_t pc = procDelayCount_.load(std::memory_order_relaxed);
-    const uint64_t procAvg = pc ? procDelaySumUs_.load() / pc : 0;
-    const uint64_t rc = replySendCount_.load(std::memory_order_relaxed);
-    const uint64_t replyAvg = rc ? replySendSumUs_.load() / rc : 0;
-    const uint64_t xc = replyXmitCount_.load(std::memory_order_relaxed);
-    const uint64_t xmitAvg = xc ? replyXmitSumUs_.load() / xc : 0;
-    const uint64_t lc = releaseLateCount_.load(std::memory_order_relaxed);
-    const uint64_t lateAvg = lc ? releaseLateSumUs_.load() / lc : 0;
-    // Drain the p50/p90 samplers (avgs above are tail-corrupted; these are the
-    // real medians for residence = arrival→release and late = release−deadline).
-    auto drain = [](LatSampler &s, uint64_t &p50, uint64_t &p90) {
-        std::vector<uint64_t> v;
-        { std::lock_guard<std::mutex> l(s.mu); v.swap(s.v); }
-        p50 = p90 = 0;
-        if (v.empty()) return;
-        std::sort(v.begin(), v.end());
-        p50 = v[v.size() / 2];
-        p90 = v[(v.size() * 9) / 10];
-    };
-    uint64_t resP50, resP90, lateP50, lateP90, preP50, preP90, rawP50, rawP90;
-    drain(residenceSampler_, resP50, resP90);
-    drain(lateSampler_, lateP50, lateP90);
-    drain(presendSampler_, preP50, preP90);
-    drain(rawOwdSampler_, rawP50, rawP90);
-    const uint64_t pumpReq = pumpReqBusyUs_.load(std::memory_order_relaxed);
-    const uint64_t pumpCtrl = pumpCtrlBusyUs_.load(std::memory_order_relaxed);
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
-           "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu "
-           "procDelay_us[avg=%lu] replySend_us[avg=%lu max=%lu] replyXmit_us[avg=%lu] "
-           "releaseLate_us[avg=%lu max=%lu] "
-           "rawOwd_us[p50=%lu p90=%lu] "
-           "residence_us[p50=%lu p90=%lu] presend_us[p50=%lu p90=%lu] late_us[p50=%lu p90=%lu] "
-           "pumpBusy_us[req=%lu ctrl=%lu] lockWait_us[avg=%lu] wakeLat_us[avg=%lu] "
-           "sendWork_us[avg=%lu] submitLockWait_us[avg=%lu] submitInternal_us[avg=%lu] "
-           "eagerRel=%lu "
+           "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu eagerRel=%lu "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -671,19 +566,6 @@ DynaNewReplica::StatsDump()
            (unsigned long)fast, (unsigned long)slow,
            (unsigned long)resync, (unsigned long)refetch, (unsigned long)commits,
            (unsigned long)owdMax,
-           (unsigned long)procAvg, (unsigned long)replyAvg,
-           (unsigned long)replySendMaxUs_.load(std::memory_order_relaxed),
-           (unsigned long)xmitAvg,
-           (unsigned long)lateAvg,
-           (unsigned long)releaseLateMaxUs_.load(std::memory_order_relaxed),
-           (unsigned long)rawP50, (unsigned long)rawP90,
-           (unsigned long)resP50, (unsigned long)resP90,
-           (unsigned long)preP50, (unsigned long)preP90,
-           (unsigned long)lateP50, (unsigned long)lateP90,
-           (unsigned long)pumpReq, (unsigned long)pumpCtrl,
-           (unsigned long)lockWaitAvg, (unsigned long)wakeLatAvg,
-           (unsigned long)sendWorkAvg,
-           (unsigned long)submitLockWaitAvg, (unsigned long)submitInternalAvg,
            (unsigned long)eagerReleases_.load(std::memory_order_relaxed),
            confirmBacklog, syncGaps, earlyBuf);
 

@@ -62,7 +62,6 @@ public:
             // yielding is strictly better here.
             while (until_us == kNever || WallClockMicros() < until_us) {
                 if (interrupted_.exchange(false)) {         // Submit/Stop woke us
-                    RecordWake();
                     return;
                 }
                 std::this_thread::yield();                 // cooperative spin
@@ -83,38 +82,15 @@ public:
     }
 
     void Interrupt() override {
-        // Stamp the interrupt time so the woken loop can measure interrupt→wake
-        // latency (diagnostic). Only stamp the FIRST pending interrupt so the
-        // latency reflects the earliest waker, not the most recent.
-        uint64_t expect = 0;
-        interrupt_stamp_us_.compare_exchange_strong(expect, WallClockMicros(),
-                                                    std::memory_order_relaxed);
         interrupted_.store(true);
         { std::lock_guard<std::mutex> lk(mu_); }   // barrier vs a cv waiter
         cv_.notify_all();
     }
 
-    // Diagnostic: how long the busy-poll spin took to notice an interrupt.
-    uint64_t wake_lat_sum_us() const { return wake_lat_sum_us_.load(std::memory_order_relaxed); }
-    uint64_t wake_lat_count() const { return wake_lat_count_.load(std::memory_order_relaxed); }
-
 private:
-    void RecordWake() {
-        const uint64_t stamp =
-            interrupt_stamp_us_.exchange(0, std::memory_order_relaxed);
-        if (stamp != 0) {
-            const uint64_t now = WallClockMicros();
-            wake_lat_sum_us_.fetch_add(now > stamp ? now - stamp : 0,
-                                       std::memory_order_relaxed);
-            wake_lat_count_.fetch_add(1, std::memory_order_relaxed);
-        }
-    }
-
     std::mutex mu_;
     std::condition_variable cv_;
     std::atomic<bool> interrupted_{false};
-    std::atomic<uint64_t> interrupt_stamp_us_{0};  // time of first pending interrupt
-    std::atomic<uint64_t> wake_lat_sum_us_{0}, wake_lat_count_{0};
     bool busy_poll_ = false;
 };
 

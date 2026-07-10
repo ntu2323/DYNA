@@ -36,19 +36,8 @@ PartitionOrderer::~PartitionOrderer()
 void
 PartitionOrderer::Submit(LogEntry entry, bool poke)
 {
-    // Stamp buffer-entry time on the REPLICA clock (guaranteed to survive to
-    // release, unlike the receive-path arrival_us). residence = release − this is
-    // offset-immune (single clock), so it shows the TRUE deadline-hold even when
-    // client↔replica clocks are skewed (which corrupts deadline-relative metrics).
-    entry.arrival_us = clock_->Now();
-    const uint64_t t_before_lock = WallClockMicros();
     {
         std::lock_guard<std::mutex> lk(mu_);
-        // Pump-side wait to acquire mu_ (vs the release thread / §7 handlers). If
-        // large, this is the missing Submit→release cost that release-side lockWait
-        // (=0) cannot see.
-        submitLockWaitSumUs_.fetch_add(WallClockMicros() - t_before_lock,
-                                       std::memory_order_relaxed);
         if (role_ == Role::kFollower) {
             // Remember the body so reconciliation against the leader's sync can
             // place it into synced_log without searching the priority queue.
@@ -74,10 +63,6 @@ PartitionOrderer::Submit(LogEntry entry, bool poke)
     // Wake the release loop so it re-evaluates the next deadline (unless the caller
     // will drain the entry itself, e.g. the eager receive-thread path).
     if (poke) clock_->Interrupt();
-    // Whole Submit body (arrival stamp → after Interrupt), on the pump thread.
-    submitInternalSumUs_.fetch_add(WallClockMicros() - t_before_lock,
-                                   std::memory_order_relaxed);
-    submitCount_.fetch_add(1, std::memory_order_relaxed);
 }
 
 void
@@ -129,7 +114,6 @@ PartitionOrderer::DrainDueLocked(std::vector<LogEntry> &out)
             continue;
         }
 
-        e.drain_us = WallClockMicros();   // when the loop drained it (diagnostic)
         ReleaseEntryLocked(e);
         out.push_back(std::move(e));
     }
@@ -447,31 +431,16 @@ PartitionOrderer::ReleaseLoop()
         std::vector<LogEntry> released;
         uint64_t next;
         {
-            const uint64_t lw0 = WallClockMicros();
             std::lock_guard<std::mutex> lk(mu_);
-            const uint64_t lockWait = WallClockMicros() - lw0;
             DrainDueLocked(released);
             next = state_.early_buffer.empty()
                        ? Clock::kNever
                        : state_.early_buffer.top().deadline;
-            // Only count iterations that actually release: measures the wait to
-            // acquire mu_ on the release critical path (vs §7 pump holders).
-            if (!released.empty()) {
-                lockWaitSumUs_.fetch_add(lockWait, std::memory_order_relaxed);
-                lockWaitCount_.fetch_add(1, std::memory_order_relaxed);
-            }
         }
-        const uint64_t sw0 = WallClockMicros();
         for (const LogEntry &e : released) {
             if (on_release_) on_release_(e);
         }
         if (!released.empty() && on_post_drain_) on_post_drain_();
-        if (!released.empty()) {
-            // Inline reply-send + sync broadcast time on the release thread. If
-            // large, the loop is busy here and later entries wait behind it.
-            sendWorkSumUs_.fetch_add(WallClockMicros() - sw0, std::memory_order_relaxed);
-            sendWorkCount_.fetch_add(1, std::memory_order_relaxed);
-        }
 
         // Periodic self-healing: re-send Sync/Fetch so a lost control message
         // can't leave a permanent reconciliation gap. Off when interval is 0.

@@ -44,8 +44,6 @@ private:
         uint64_t send_us = 0;
         uint64_t first_submit_us = 0;   // for end-to-end commit latency (stats)
         uint64_t first_reply_us = 0;    // when the first reply arrived (phase split)
-        uint64_t fwd_us = 0;            // send→replica-release (PTP-comparable leg)
-        uint64_t rev_us = 0;            // replica-release→first-reply-recv leg
         uint32_t resends = 0;           // retransmit count for this request (stats)
         bool is_read = false;
         continuation_t continuation;
@@ -66,7 +64,7 @@ private:
     // DYNA_NEW_CLIENT_STATS: record a commit and periodically log percentiles.
     // total = submit→commit; to_first_reply = submit→first reply (hold + 1 one-way).
     void RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
-                          uint64_t fwd_us, uint64_t rev_us, uint32_t resends);
+                          uint32_t resends);
 
     uint64_t last_req_id_ = 0;
     uint32_t num_partitions_;
@@ -80,34 +78,12 @@ private:
     uint64_t client_stats_every_ = 10000;
     std::vector<uint64_t> stat_latencies_us_;   // total commit latency this window
     std::vector<uint64_t> stat_to_first_us_;    // submit→first-reply this window
-    std::vector<uint64_t> stat_fwd_us_;         // send→replica-release leg this window
-    // Per-replica forward leg (release_time − send), indexed by replica_id. Shows
-    // whether DYNA is "fast everywhere" or one replica drags the deadline/commit.
-    std::vector<std::vector<uint64_t>> stat_fwd_by_replica_;
-    // NTP 4-timestamp diagnostic (T1=send, T2=reply.recv_time, T3=reply.release_time,
-    // T4=recv): θ = client↔replica clock offset, δ = true network round-trip delay.
-    // Signed: a real clock offset can be either sign. Reported as p50 (median).
-    std::vector<int64_t> stat_clock_offset_us_;
-    std::vector<int64_t> stat_net_delay_us_;
     // Effective deadline hold actually requested = reply.deadline − send (client
-    // clock, offset-immune). If ≈ replica residence, the cost IS the deadline hold
-    // (bound too big); if ≪ residence, the release fires late.
+    // clock, offset-immune): the leader's deadline hold applied to each request.
     std::vector<uint64_t> stat_eff_bound_us_;
-    // Replica hold decomposed from reply timestamps (all replica clock, differenced
-    // on the client ⇒ offset-immune, bypasses the flaky replica samplers):
-    //   hold  = release_time − recv_time   (full recv→release)
-    //   proc  = submit_time  − recv_time   (pump: receive→enter buffer)
-    //   loop  = release_time − submit_time (buffer wait + release-loop fire)
-    std::vector<uint64_t> stat_rhold_us_, stat_rproc_us_, stat_rloop_us_;
-    // rLoop split: submit→drain (buffer wait + release-loop wake) vs drain→release
-    // (OnRelease/SendReply). Localizes the cluster's fixed ~130µs release overhead.
-    std::vector<uint64_t> stat_rwait_us_, stat_rsend_us_;
-    // rSend split: drain→OnRelease (dispatch) vs OnRelease→release (reply build).
-    std::vector<uint64_t> stat_rdisp_us_, stat_rreply_us_;
-    std::vector<uint64_t> stat_rev_us_;         // replica-release→recv leg this window
     std::vector<uint32_t> stat_resends_;        // resends per commit this window
     // Client send-issue cost: send_time stamp → after SendMessageToAll (3x
-    // serialize+sendto). Cumulative; a hop-latency breakdown (Step 1).
+    // serialize+sendto). Cumulative.
     uint64_t stat_send_issue_sum_us_ = 0;
     uint64_t stat_send_issue_count_ = 0;
 };

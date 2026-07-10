@@ -46,8 +46,7 @@ private:
                        const std::vector<ReconAction> &fetches);
     // Flush the SyncBatch accumulated during a release drain (leader, §9 batching).
     void OnPostDrain(uint32_t pid);
-    void SendReply(uint32_t pid, bool is_leader, const LogEntry &e,
-                   uint64_t onrelease_us = 0);
+    void SendReply(uint32_t pid, bool is_leader, const LogEntry &e);
     // One SyncBatch / CommitBatch for many entries (cuts per-op transport load).
     void BroadcastSyncBatch(uint32_t pid, const std::vector<LogEntry> &entries);
     void BroadcastCommitBatch(uint32_t pid,
@@ -78,35 +77,6 @@ private:
     std::atomic<uint64_t> reqIn_{0}, syncIn_{0}, confirmIn_{0}, commitIn_{0},
         fetchReqIn_{0}, fetchRespIn_{0};
     std::atomic<uint64_t> dedupSubmit_{0}, dedupDrop_{0}, dedupResend_{0};
-    // Hop-latency breakdown (Step 1): replica receive-processing (arrival→post-dedup)
-    // and reply-send (OnRelease→after SendMessage), to localize the ~85µs/hop.
-    std::atomic<uint64_t> procDelaySumUs_{0}, procDelayCount_{0};
-    std::atomic<uint64_t> replySendSumUs_{0}, replySendCount_{0}, replySendMaxUs_{0};
-    // Finer split: just the transport->SendMessage call inside SendReply (serialize
-    // + sendto). replySend − replyXmit ≈ our own pre-send work + deschedule.
-    std::atomic<uint64_t> replyXmitSumUs_{0}, replyXmitCount_{0};
-    // How late releases fire vs their deadline (release_time − deadline). ~0 means
-    // the release loop is prompt; large means it woke late (cv-park at idle).
-    std::atomic<uint64_t> releaseLateSumUs_{0}, releaseLateCount_{0},
-        releaseLateMaxUs_{0};
-    // p50/p90 samplers (averages are tail-corrupted here — a fat 30ms tail hides
-    // the median). residence = arrival→release; late = release−deadline.
-    struct LatSampler {
-        std::mutex mu;
-        std::vector<uint64_t> v;
-        void add(uint64_t x) {
-            std::lock_guard<std::mutex> l(mu);
-            if (v.size() < 16384) v.push_back(x);
-        }
-    };
-    LatSampler residenceSampler_;   // arrival_us → release_time (client-visible)
-    LatSampler lateSampler_;        // release − deadline (clamped ≥0)
-    LatSampler presendSampler_;     // time inside SendReply before the send stamp
-    LatSampler rawOwdSampler_;      // raw per-request send→arrival (cf client fwd_us)
-    // Cumulative pump-busy time (µs) inside ReceiveMessage — request vs §7 control.
-    // Diff two 1s stat lines: if pumpCtrl/sec is a large fraction of 1e6, the single
-    // transport thread is saturated by §7 and blocks request pickup.
-    std::atomic<uint64_t> pumpReqBusyUs_{0}, pumpCtrlBusyUs_{0};
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.

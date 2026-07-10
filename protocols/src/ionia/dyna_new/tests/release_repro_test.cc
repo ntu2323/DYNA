@@ -45,6 +45,7 @@ TEST(ReleaseRepro, SubmitToReleaseTimeline) {
 
     std::vector<uint64_t> rloop(N, 0);   // release - submit, per request_id
     std::vector<uint64_t> late(N, 0);    // release - deadline (clamped)
+    std::vector<uint64_t> submit_at(N, 0);   // per-id submit stamp (test-local)
     std::atomic<uint64_t> released_count{0};
 
     // on_release runs on the release loop thread — record the hop stamps.
@@ -52,7 +53,7 @@ TEST(ReleaseRepro, SubmitToReleaseTimeline) {
         const uint64_t now = WallClockMicros();
         const uint64_t id = e.request_id;
         if (id < N) {
-            rloop[id] = (now > e.arrival_us) ? now - e.arrival_us : 0;
+            rloop[id] = (now > submit_at[id]) ? now - submit_at[id] : 0;
             late[id] = (now > e.deadline) ? now - e.deadline : 0;
         }
         released_count.fetch_add(1, std::memory_order_relaxed);
@@ -80,7 +81,7 @@ TEST(ReleaseRepro, SubmitToReleaseTimeline) {
         e.type = proto::BLIND_WRITE;
         e.key = "k";
         e.command = "v";
-        e.arrival_us = t;          // submit stamp
+        submit_at[i] = t;          // submit stamp (test-local)
         e.deadline = t + BOUND;    // client deadline
         orderer.Submit(std::move(e));
         // Busy-wait the inter-submit gap (mimics arrivals; avoids sleep jitter).

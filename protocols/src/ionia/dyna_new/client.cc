@@ -28,7 +28,6 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
       bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
     if (resend_ms_ == 0) resend_ms_ = 1;
-    stat_fwd_by_replica_.resize(std::max(1, config.n));
     const char *sv = std::getenv("DYNA_NEW_CLIENT_STATS");
     client_stats_enabled_ = (sv != nullptr && *sv != '\0' && *sv != '0');
     client_stats_every_ =
@@ -92,8 +91,6 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         /*send_us=*/0,
         /*first_submit_us=*/NowMicros(),
         /*first_reply_us=*/0,
-        /*fwd_us=*/0,
-        /*rev_us=*/0,
         /*resends=*/0,
         is_read,
         std::move(continuation),
@@ -200,53 +197,9 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
     }
     if (p.first_reply_us == 0) {
         p.first_reply_us = NowMicros();   // phase split: submit→first reply
-        // PTP-comparable split of to_first into forward (send→replica release) and
-        // reverse (release→client recv) legs, using the replica's release stamp.
-        const uint64_t rel = reply.release_time();
-        p.fwd_us = (rel > p.send_us) ? rel - p.send_us : 0;
-        p.rev_us = (rel != 0 && p.first_reply_us > rel) ? p.first_reply_us - rel : 0;
-        // NTP 4-timestamp: T1=send, T2=replica recv, T3=replica release, T4=recv.
-        // θ = ((T2−T1)+(T3−T4))/2 (replica clock rel. to client), δ = (T4−T1)−(T3−T2).
-        if (client_stats_enabled_ && reply.recv_time() != 0 && rel != 0) {
-            const int64_t t1 = static_cast<int64_t>(p.send_us);
-            const int64_t t2 = static_cast<int64_t>(reply.recv_time());
-            const int64_t t3 = static_cast<int64_t>(rel);
-            const int64_t t4 = static_cast<int64_t>(p.first_reply_us);
-            stat_clock_offset_us_.push_back(((t2 - t1) + (t3 - t4)) / 2);
-            stat_net_delay_us_.push_back((t4 - t1) - (t3 - t2));
-        }
+        // Effective deadline hold the leader applied (leader deadline − client send).
         if (client_stats_enabled_ && reply.deadline() > p.send_us) {
             stat_eff_bound_us_.push_back(reply.deadline() - p.send_us);
-        }
-        // Replica hold decomposed from reply timestamps (offset-immune; bypasses the
-        // flaky replica-side p50 samplers). Localizes the ~160µs recv→release.
-        if (client_stats_enabled_ && reply.recv_time() != 0 && rel > reply.recv_time()) {
-            stat_rhold_us_.push_back(rel - reply.recv_time());
-            const uint64_t sub = reply.submit_time();
-            if (sub >= reply.recv_time() && rel >= sub) {
-                stat_rproc_us_.push_back(sub - reply.recv_time());
-                stat_rloop_us_.push_back(rel - sub);
-                const uint64_t dr = reply.drain_time();
-                if (dr >= sub && rel >= dr) {
-                    stat_rwait_us_.push_back(dr - sub);   // submit→drain
-                    stat_rsend_us_.push_back(rel - dr);   // drain→release
-                    const uint64_t orl = reply.onrelease_time();
-                    if (orl >= dr && rel >= orl) {
-                        stat_rdisp_us_.push_back(orl - dr);   // drain→OnRelease
-                        stat_rreply_us_.push_back(rel - orl); // OnRelease→release
-                    }
-                }
-            }
-        }
-    }
-    // Per-replica forward leg for EVERY reply (not just the first): is DYNA fast
-    // everywhere, or is one replica the straggler that gates the deadline/commit?
-    if (client_stats_enabled_) {
-        const uint64_t rel = reply.release_time();
-        const uint32_t rid = reply.replica_id();
-        if (rel > p.send_us && rid < stat_fwd_by_replica_.size() &&
-            stat_fwd_by_replica_[rid].size() < 65536) {
-            stat_fwd_by_replica_[rid].push_back(rel - p.send_us);
         }
     }
 
@@ -270,8 +223,7 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         const uint64_t now = NowMicros();
         const uint64_t to_first = (p.first_reply_us > p.first_submit_us)
                                       ? p.first_reply_us - p.first_submit_us : 0;
-        RecordCommitStat(now - p.first_submit_us, to_first, p.fwd_us, p.rev_us,
-                         p.resends);
+        RecordCommitStat(now - p.first_submit_us, to_first, p.resends);
     }
     continuation_t cont = std::move(p.continuation);
     std::string result = p.is_read ? p.quorum.result() : std::string();
@@ -281,12 +233,10 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
 
 void
 DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
-                                uint64_t fwd_us, uint64_t rev_us, uint32_t resends)
+                                uint32_t resends)
 {
     stat_latencies_us_.push_back(total_us);
     stat_to_first_us_.push_back(to_first_reply_us);
-    stat_fwd_us_.push_back(fwd_us);
-    stat_rev_us_.push_back(rev_us);
     stat_resends_.push_back(resends);
     if (stat_latencies_us_.size() < client_stats_every_) {
         return;
@@ -296,36 +246,12 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     std::sort(lat.begin(), lat.end());
     std::vector<uint64_t> tf = stat_to_first_us_;
     std::sort(tf.begin(), tf.end());
-    std::vector<uint64_t> fwd = stat_fwd_us_;
-    std::sort(fwd.begin(), fwd.end());
-    std::vector<uint64_t> rev = stat_rev_us_;
-    std::sort(rev.begin(), rev.end());
     auto pct = [](const std::vector<uint64_t> &v, double p) {
         return v[static_cast<size_t>(p * (v.size() - 1))];
     };
-    // Signed median helper for the NTP θ/δ diagnostics (can be negative).
-    auto medi = [](std::vector<int64_t> v) -> long {
-        if (v.empty()) return 0;
-        std::sort(v.begin(), v.end());
-        return static_cast<long>(v[v.size() / 2]);
-    };
-    const long clkOffP50 = medi(stat_clock_offset_us_);
-    const long netDelP50 = medi(stat_net_delay_us_);
     std::vector<uint64_t> eb = stat_eff_bound_us_;
     std::sort(eb.begin(), eb.end());
     const unsigned long effBoundP50 = eb.empty() ? 0 : eb[eb.size() / 2];
-    auto up50 = [](std::vector<uint64_t> v) -> unsigned long {
-        if (v.empty()) return 0;
-        std::sort(v.begin(), v.end());
-        return static_cast<unsigned long>(v[v.size() / 2]);
-    };
-    const unsigned long rHoldP50 = up50(stat_rhold_us_);
-    const unsigned long rProcP50 = up50(stat_rproc_us_);
-    const unsigned long rLoopP50 = up50(stat_rloop_us_);
-    const unsigned long rWaitP50 = up50(stat_rwait_us_);
-    const unsigned long rSendP50 = up50(stat_rsend_us_);
-    const unsigned long rDispP50 = up50(stat_rdisp_us_);
-    const unsigned long rReplyP50 = up50(stat_rreply_us_);
     uint64_t resend_sum = 0, max_resends = 0;
     for (uint32_t r : stat_resends_) {
         resend_sum += r;
@@ -335,55 +261,20 @@ DynaNewClient::RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
     // correction wait. bound_us is the deadline hold. p50 ≫ target => hold floor.
     const uint64_t send_issue_avg =
         stat_send_issue_count_ ? stat_send_issue_sum_us_ / stat_send_issue_count_ : 0;
-    // Per-replica forward-leg p50 + the client's current per-replica OWD estimate.
-    // "fast everywhere?" — a straggler replica shows a high fwd/owd here and, since
-    // bound = max OWD, inflates every request's deadline.
-    std::string perRep = "perReplica[";
-    const std::vector<uint64_t> &owd = bound_tracker_.per_replica_owd();
-    for (size_t r = 0; r < stat_fwd_by_replica_.size(); ++r) {
-        std::vector<uint64_t> fr = stat_fwd_by_replica_[r];
-        uint64_t p50 = 0;
-        if (!fr.empty()) { std::sort(fr.begin(), fr.end()); p50 = fr[fr.size() / 2]; }
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%sr%zu:fwd=%lu,owd=%lu", r ? " " : "", r,
-                 (unsigned long)p50, (unsigned long)(r < owd.size() ? owd[r] : 0));
-        perRep += buf;
-    }
-    perRep += "]";
     Notice("DYNA_NEW client stats [n=%zu]: total_us p50=%lu p90=%lu p99=%lu max=%lu; "
-           "to_first_us p50=%lu p90=%lu; fwd_us p50=%lu p90=%lu; rev_us p50=%lu p90=%lu; "
-           "quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
-           "clockOffset_us p50=%ld; netDelay_us p50=%ld; effBound_us p50=%lu; "
-           "rHold_us p50=%lu; rProc_us p50=%lu; rLoop_us p50=%lu; "
-           "rWait_us p50=%lu; rSend_us p50=%lu; rDisp_us p50=%lu; rReply_us p50=%lu; "
-           "resends avg=%.2f max=%lu; bound_us=%lu %s pending=%zu",
+           "to_first_us p50=%lu p90=%lu; quorum_wait_us p50=%lu; send_issue_us avg=%lu; "
+           "effBound_us p50=%lu; resends avg=%.2f max=%lu; bound_us=%lu pending=%zu",
            lat.size(), (unsigned long)pct(lat, 0.5), (unsigned long)pct(lat, 0.9),
            (unsigned long)pct(lat, 0.99), (unsigned long)lat.back(),
            (unsigned long)pct(tf, 0.5), (unsigned long)pct(tf, 0.9),
-           (unsigned long)pct(fwd, 0.5), (unsigned long)pct(fwd, 0.9),
-           (unsigned long)pct(rev, 0.5), (unsigned long)pct(rev, 0.9),
            (unsigned long)(pct(lat, 0.5) > pct(tf, 0.5) ? pct(lat, 0.5) - pct(tf, 0.5) : 0),
-           (unsigned long)send_issue_avg,
-           clkOffP50, netDelP50, effBoundP50,
-           rHoldP50, rProcP50, rLoopP50, rWaitP50, rSendP50, rDispP50, rReplyP50,
+           (unsigned long)send_issue_avg, effBoundP50,
            static_cast<double>(resend_sum) / lat.size(), (unsigned long)max_resends,
-           (unsigned long)bound_tracker_.bound_us(), perRep.c_str(), pending_.size());
+           (unsigned long)bound_tracker_.bound_us(), pending_.size());
 
     stat_latencies_us_.clear();
     stat_to_first_us_.clear();
-    stat_fwd_us_.clear();
-    stat_rev_us_.clear();
-    for (auto &v : stat_fwd_by_replica_) v.clear();
-    stat_clock_offset_us_.clear();
-    stat_net_delay_us_.clear();
     stat_eff_bound_us_.clear();
-    stat_rhold_us_.clear();
-    stat_rproc_us_.clear();
-    stat_rloop_us_.clear();
-    stat_rwait_us_.clear();
-    stat_rsend_us_.clear();
-    stat_rdisp_us_.clear();
-    stat_rreply_us_.clear();
     stat_resends_.clear();
     stat_send_issue_sum_us_ = 0;
     stat_send_issue_count_ = 0;
