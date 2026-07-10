@@ -48,8 +48,6 @@ private:
         bool is_read = false;
         continuation_t continuation;
         CommitQuorum quorum;
-        // Retransmission timer (spec §5): fires if the request has not committed.
-        std::unique_ptr<Timeout> resend_timer;
     };
 
     uint64_t NowMicros() const;
@@ -59,8 +57,12 @@ private:
     // (Re)build and multicast the request proto for a pending request, with a
     // fresh send_time and recomputed deadline; keeps the same request_id.
     void SendRequestProto(uint64_t request_id);
-    // Resend timer callback: resend + reschedule while the request is pending.
-    void OnResendTimeout(uint64_t request_id);
+    // Retransmission (spec §5) via ONE periodic sweep instead of a per-request
+    // Timeout: arming/disarming a libevent timer on every Invoke/commit serializes
+    // the client event loop (and never fires on a healthy network — resends≈0), so
+    // it inflated single-thread latency. The sweep re-sends any pending request
+    // older than resend_ms_ and re-arms itself.
+    void ResendSweep();
     // DYNA_NEW_CLIENT_STATS: record a commit and periodically log percentiles.
     // total = submit→commit; to_first_reply = submit→first reply (hold + 1 one-way).
     void RecordCommitStat(uint64_t total_us, uint64_t to_first_reply_us,
@@ -72,6 +74,8 @@ private:
     uint64_t resend_ms_;
     ClientBoundTracker bound_tracker_;
     std::unordered_map<uint64_t, PendingRequest> pending_;
+    // Single periodic retransmission sweep (replaces per-request Timeout).
+    std::unique_ptr<Timeout> resend_sweep_timer_;
 
     // Client-side diagnostics (off unless DYNA_NEW_CLIENT_STATS is set).
     bool client_stats_enabled_ = false;

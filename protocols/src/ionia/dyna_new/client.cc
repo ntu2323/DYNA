@@ -39,6 +39,15 @@ DynaNewClient::DynaNewClient(const specpaxos::Configuration &config,
     Notice("DYNA_NEW client config: initial_bound_us=%lu max_owd_us=%lu owd_pct=%u",
            (unsigned long)dc.initial_bound_us, (unsigned long)dc.max_owd_us,
            dc.owd_percentile_percent);
+
+    // One periodic retransmission sweep for ALL pending requests (spec §5), instead
+    // of arming/disarming a libevent timer per request. Sweeps at half the resend
+    // interval so an aged request is resent within ~resend_ms_.
+    uint64_t sweep_ms = resend_ms_ / 2;
+    if (sweep_ms == 0) sweep_ms = 1;
+    resend_sweep_timer_ = std::make_unique<Timeout>(
+        transport, sweep_ms, [this]() { ResendSweep(); });
+    resend_sweep_timer_->Start();
 }
 
 DynaNewClient::~DynaNewClient() {}
@@ -95,18 +104,11 @@ DynaNewClient::Invoke(const string &request, continuation_t continuation)
         is_read,
         std::move(continuation),
         CommitQuorum(leader_id, write_quorum_),
-        /*resend_timer=*/nullptr,
     };
-    auto res = pending_.emplace(request_id, std::move(pending));
+    pending_.emplace(request_id, std::move(pending));
 
-    // Arm the retransmission timer (spec §5): if the request has not committed by
-    // resend_ms_, resend it (fresh send_time + deadline, same request_id) so a
-    // dropped request/reply on best-effort UDP recovers.
-    res.first->second.resend_timer = std::make_unique<Timeout>(
-        transport, resend_ms_,
-        [this, request_id]() { OnResendTimeout(request_id); });
-    res.first->second.resend_timer->Start();
-
+    // Retransmission is handled by the periodic ResendSweep (armed in the ctor),
+    // so there is no per-request timer to arm here.
     SendRequestProto(request_id);
 }
 
@@ -142,16 +144,28 @@ DynaNewClient::SendRequestProto(uint64_t request_id)
 }
 
 void
-DynaNewClient::OnResendTimeout(uint64_t request_id)
+DynaNewClient::ResendSweep()
 {
-    auto it = pending_.find(request_id);
-    if (it == pending_.end()) {
-        return;   // already committed and erased
+    // Re-send any pending request whose last send is older than resend_ms_ (spec §5).
+    // On a healthy network nothing is aged (resends≈0), so this is a cheap scan of a
+    // near-empty map. send_us is µs; resend_ms_ is ms.
+    const uint64_t now = NowMicros();
+    const uint64_t age_us = resend_ms_ * 1000;
+    std::vector<uint64_t> aged;
+    for (auto &kv : pending_) {
+        if (now > kv.second.send_us && now - kv.second.send_us >= age_us) {
+            aged.push_back(kv.first);
+        }
     }
-    ++it->second.resends;
-    SendRequestProto(request_id);
-    if (it->second.resend_timer) {
-        it->second.resend_timer->Reset();
+    for (uint64_t id : aged) {
+        auto it = pending_.find(id);
+        if (it != pending_.end()) {
+            ++it->second.resends;
+            SendRequestProto(id);
+        }
+    }
+    if (resend_sweep_timer_) {
+        resend_sweep_timer_->Reset();   // re-arm
     }
 }
 
@@ -216,9 +230,8 @@ DynaNewClient::ReceiveMessage(const TransportAddress &remote,
         return;
     }
 
-    if (p.resend_timer) {
-        p.resend_timer->Stop();   // committed: stop retransmitting
-    }
+    // Committed: erasing from pending_ (below) drops it from the resend sweep — no
+    // per-request timer to stop.
     if (client_stats_enabled_) {
         const uint64_t now = NowMicros();
         const uint64_t to_first = (p.first_reply_us > p.first_submit_us)
