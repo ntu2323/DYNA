@@ -47,6 +47,11 @@ struct LogEntry {
     // the reply WITHOUT taking the global owd_mu_ on the release critical path.
     uint64_t owd_estimate_us = 0;
 
+    // Diagnostic (DYNA_NEW_STATS): replica wall-clock µs stamped at the top of
+    // ReceiveMessage. Lets SendReply compute the full replica-internal latency
+    // (arrival → reply-sent) on ONE replica clock — skew-immune.
+    uint64_t arrival_us = 0;
+
     // Where to send this request's reply (set by the replica from the inbound
     // message; null for entries that need no client reply, e.g. sync-fetched).
     // shared_ptr keeps LogEntry cheaply movable through queues later.

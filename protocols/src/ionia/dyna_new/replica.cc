@@ -201,12 +201,16 @@ DynaNewReplica::ReceiveMessage(const TransportAddress &remote,
         e.send_time = req.send_time();
         e.deadline = req.deadline();
         e.owd_estimate_us = owd_est;   // snapshot so SendReply skips the global owd_mu_
+        e.arrival_us = recv_arrival;   // diagnostic: replica-internal latency baseline
         e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
 
         // Eager path submits without poking the release loop, so the release loop
         // can't race the pump for the just-submitted entry during the eager spin;
         // the pump pokes it afterwards for anything it left behind.
         orderers_[pid]->Submit(std::move(e), /*poke=*/!eagerEnabled_);
+        if (statsEnabled_) {
+            pumpProcSampler_.add(WallClockMicros() - recv_arrival);
+        }
 
         // Eager fast path (§ collapse the relay): if the request is already due,
         // release + reply INLINE on this receive thread instead of paying the
@@ -519,6 +523,10 @@ DynaNewReplica::SendReply(uint32_t pid, bool is_leader, const LogEntry &e)
     reply.set_owd_estimate(e.owd_estimate_us);
 
     transport->SendMessage(this, *e.client_addr, reply);
+    if (statsEnabled_ && e.arrival_us != 0) {
+        // Full replica-internal latency: arrival → reply-sent (one replica clock).
+        replicaInternalSampler_.add(WallClockMicros() - e.arrival_us);
+    }
 
     // Cache for at-most-once AFTER the send — off the release critical path. A retry
     // is answered from here; the retry window is ms, so a µs gap before caching is
@@ -553,9 +561,12 @@ DynaNewReplica::StatsDump()
         std::lock_guard<std::mutex> lk(owd_mu_);
         owdMax = owd_.max_estimate_us();
     }
+    const uint64_t pumpProcP50 = pumpProcSampler_.drain_p50();
+    const uint64_t replicaInternalP50 = replicaInternalSampler_.drain_p50();
     Notice("DYNA_NEW stats r%d: in[req=%lu sync=%lu conf=%lu commit=%lu fReq=%lu fResp=%lu] "
            "dedup[sub=%lu drop=%lu resend=%lu] release[fast=%lu slow=%lu] "
            "heal[resync=%lu refetch=%lu] commits=%lu owd_max=%lu eagerRel=%lu "
+           "pumpProc_us[p50=%lu] replicaInternal_us[p50=%lu] "
            "gauge[confirmBacklog=%zu syncGaps=%zu earlyBuf=%zu]",
            replicaIdx,
            (unsigned long)reqIn_.load(), (unsigned long)syncIn_.load(),
@@ -567,6 +578,7 @@ DynaNewReplica::StatsDump()
            (unsigned long)resync, (unsigned long)refetch, (unsigned long)commits,
            (unsigned long)owdMax,
            (unsigned long)eagerReleases_.load(std::memory_order_relaxed),
+           (unsigned long)pumpProcP50, (unsigned long)replicaInternalP50,
            confirmBacklog, syncGaps, earlyBuf);
 
     if (statsEnabled_) {

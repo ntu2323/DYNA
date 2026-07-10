@@ -13,6 +13,7 @@
 #include "dyna_new/storage_backend.h"
 #include "dyna_new/wall_clock.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -77,6 +78,29 @@ private:
     std::atomic<uint64_t> reqIn_{0}, syncIn_{0}, confirmIn_{0}, commitIn_{0},
         fetchReqIn_{0}, fetchRespIn_{0};
     std::atomic<uint64_t> dedupSubmit_{0}, dedupDrop_{0}, dedupResend_{0};
+    // Skew-immune replica-internal latency split (all deltas on ONE replica clock).
+    // pumpProc = receive→submit (pump per-request cost); replicaInternal =
+    // receive→reply-sent (pump + hold + release + reply-build). Compared to the
+    // client's to_first (157µs) and IONIA (54µs) these localize DYNA's ~53µs excess
+    // to pump / release / outside-the-replica. p50 (not avg) — a fat tail corrupts avg.
+    struct LatSampler {
+        std::mutex mu;
+        std::vector<uint64_t> v;
+        void add(uint64_t x) {
+            std::lock_guard<std::mutex> l(mu);
+            if (v.size() < 16384) v.push_back(x);
+        }
+        uint64_t drain_p50() {
+            std::lock_guard<std::mutex> l(mu);
+            if (v.empty()) return 0;
+            std::sort(v.begin(), v.end());
+            uint64_t p = v[v.size() / 2];
+            v.clear();
+            return p;
+        }
+    };
+    LatSampler pumpProcSampler_;        // receive → submit (pump per-request)
+    LatSampler replicaInternalSampler_; // receive → reply-sent (whole replica path)
     // One clock + orderer per partition (leader of partition==replicaIdx,
     // follower of the rest). Separate clocks so a Submit only wakes its own
     // partition's release loop.
