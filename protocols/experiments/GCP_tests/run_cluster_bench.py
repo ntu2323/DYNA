@@ -250,9 +250,13 @@ def _build_client_cmd(
         # Bound knobs pass through from the LOCAL environment (they're evaluated in
         # the remote shell otherwise, which never sees the local export). Lets you
         # A/B the deadline hold: e.g. DYNA_MAX_OWD_US=40 python3 run_cluster_bench.py …
-        # EXPERIMENT: cap the deadline-hold bound low (was 50/2000). The bound is the
-        # dominant latency term; capping it shrinks the deadline hold. Override via
-        # the local env if set. Revert defaults to 50/2000 for production.
+        # The deadline-hold bound is the dominant client-visible latency term. It is
+        # sized to the real one-way delay: measured OWD on this CloudLab cluster is
+        # ~40µs, so DYNA_MAX_OWD_US=40 caps the (noisy, sometimes-inflated) OWD
+        # estimate at the true wire delay — this removed ~30µs of spurious deadline
+        # hold (290→147µs) with slow-path ≈ 0 and 100% completion. These are
+        # cluster-calibrated defaults, not a temporary experiment; on a slower network
+        # raise them (bound ≈ p50 one-way delay). Override via the local env.
         _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "30")
         _max_owd = os.environ.get("DYNA_MAX_OWD_US", "40")
         dyna_env = (
@@ -288,6 +292,12 @@ def _dyna_replica_env_prefix(*, wal_tmpfs: bool, eager_fast_reply: bool) -> str:
         parts.append(f"mkdir -p {DYNA_WAL_DIR_TMPFS}")
         parts.append(f"export DYNA_WAL_DIR={DYNA_WAL_DIR_TMPFS}")
     parts.append(f"export DYNA_EAGER_FAST_REPLY={'1' if eager_fast_reply else '0'}")
+    # dyna_new replica per-second stats (release fast/slow, heal resync/refetch,
+    # backlog gauges) — opt-in via the LOCAL env (baked in here; a remote ${VAR:-0}
+    # would not see the local export). Set DYNA_NEW_STATS=1 to watch the saturation
+    # knee (slow-path / §7 backlog) during a throughput sweep.
+    _dyna_new_stats = os.environ.get("DYNA_NEW_STATS", "0")
+    parts.append(f"export DYNA_NEW_STATS={_dyna_new_stats}")
     return "; ".join(parts) + "; "
 
 

@@ -20,6 +20,38 @@ from datetime import datetime, timezone
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
+def _row_from_summary(summary: dict, offered: float, threads: int, run_dir: str) -> dict:
+    """One sweep.csv row: achieved throughput + latency (median/p99) + completion %."""
+    tp = summary.get("throughput", {})
+    mean_tput = tp.get("mean_ops_per_sec") or 0.0
+    if "fallback" in tp:
+        mean_tput = tp["fallback"].get("mean_ops_per_sec", mean_tput)
+
+    psl = summary.get("per_sender_latency_ns", {})
+    medians = [v["median"] for v in psl.values()
+               if isinstance(v, dict) and "median" in v]
+    p99s = [v["99th"] for v in psl.values()
+            if isinstance(v, dict) and "99th" in v]
+
+    # Completion = delivered ops / submitted ops, summed across senders (per_sender_finish).
+    pf = summary.get("per_sender_finish", {})
+    ops = sum(v.get("ops", 0) for v in pf.values() if isinstance(v, dict))
+    sub = sum(v.get("submitted", 0) for v in pf.values() if isinstance(v, dict))
+    completion = (100.0 * ops / sub) if sub else ""
+
+    return {
+        "offered_rate": offered,
+        "threads": threads,
+        "mean_ops_per_sec": mean_tput,
+        "peak_ops_per_sec": tp.get("peak_ops_per_sec", 0.0),
+        "total_ops": tp.get("total_ops", 0),
+        "median_latency_ns": sum(medians) / len(medians) if medians else "",
+        "p99_latency_ns": sum(p99s) / len(p99s) if p99s else "",
+        "completion_pct": completion,
+        "run_dir": run_dir,
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sweep client threads and aggregate throughput/latency.")
     ap.add_argument("--protocol", choices=["vr", "dyna", "dyna_new", "ionia"], required=True)
@@ -53,6 +85,15 @@ def main() -> None:
         help="Pass through to run_cluster_bench.py (disable eager fast-reply).",
     )
     ap.add_argument("--offered-ops-per-sec", type=float, default=0.0)
+    ap.add_argument(
+        "--offered-sweep",
+        type=float,
+        nargs="+",
+        default=None,
+        help="Open-loop offered-rate sweep: iterate these ops/s (each run -j 1, "
+        "--max-inflight 0) INSTEAD of --threads. Matches the low-load latency baseline "
+        "and exposes each protocol's saturation knee (completion drops, p99 spikes).",
+    )
     ap.add_argument("--max-inflight", type=int, default=0)
     ap.add_argument("--wan-open-loop", action="store_true")
     ap.add_argument("--auto-max-inflight", action="store_true")
@@ -70,11 +111,24 @@ def main() -> None:
     if not ssh_user:
         sys.exit("Set SSH_USER")
 
+    # Sweep dimension: open-loop offered-rate (--offered-sweep) OR closed-loop threads.
+    # Each point is (run_id, offered_rate, threads); offered_rate=0 => threads mode.
+    if args.offered_sweep:
+        points = [(f"g{r:g}", float(r), 1) for r in args.offered_sweep]
+        sweep_label = "offered"
+    else:
+        points = [(f"t{t}", 0.0, t) for t in args.threads]
+        sweep_label = "threads"
+
     rows = []
-    for t in args.threads:
-        run_id = f"t{t}"
+    for run_id, offered, t in points:
         run_dir = os.path.join(sweep_dir, run_id)
-        print(f"\n=== sweep threads={t} -> {run_dir} ===\n")
+        # offered-sweep mode drives load open-loop (per-point rate, no inflight cap);
+        # threads mode passes any global --offered-ops-per-sec / --max-inflight through.
+        point_offered = offered if offered > 0.0 else args.offered_ops_per_sec
+        point_inflight = 0 if offered > 0.0 else args.max_inflight
+        print(f"\n=== sweep {sweep_label}: {run_id} "
+              f"(offered={point_offered or 0:g} threads={t}) -> {run_dir} ===\n")
 
         run_cmd = [
             sys.executable,
@@ -114,10 +168,10 @@ def main() -> None:
             run_cmd.append("--wal-tmpfs")
         if args.no_eager_fast_reply:
             run_cmd.append("--no-eager-fast-reply")
-        if args.offered_ops_per_sec > 0.0:
-            run_cmd.extend(["--offered-ops-per-sec", str(args.offered_ops_per_sec)])
-        if args.max_inflight > 0:
-            run_cmd.extend(["--max-inflight", str(args.max_inflight)])
+        if point_offered > 0.0:
+            run_cmd.extend(["--offered-ops-per-sec", str(point_offered)])
+        if point_inflight > 0:
+            run_cmd.extend(["--max-inflight", str(point_inflight)])
         if args.wan_open_loop:
             run_cmd.append("--wan-open-loop")
         if args.auto_max_inflight:
@@ -143,25 +197,7 @@ def main() -> None:
         with open(os.path.join(run_dir, "summary.json"), encoding="utf-8") as f:
             summary = json.load(f)
 
-        tp = summary["throughput"]
-        mean_tput = tp.get("mean_ops_per_sec") or 0.0
-        if "fallback" in tp:
-            mean_tput = tp["fallback"].get("mean_ops_per_sec", mean_tput)
-
-        medians = []
-        for _role, lats in summary.get("per_sender_latency_ns", {}).items():
-            if isinstance(lats, dict) and "median" in lats:
-                medians.append(lats["median"])
-
-        row = {
-            "threads": t,
-            "mean_ops_per_sec": mean_tput,
-            "peak_ops_per_sec": tp.get("peak_ops_per_sec", 0.0),
-            "total_ops": tp.get("total_ops", 0),
-            "median_latency_ns": sum(medians) / len(medians) if medians else "",
-            "run_dir": run_dir,
-        }
-        rows.append(row)
+        rows.append(_row_from_summary(summary, offered, t, run_dir))
 
     csv_path = os.path.join(sweep_dir, "sweep.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -170,11 +206,18 @@ def main() -> None:
         writer.writerows(rows)
 
     print(f"\nSweep complete: {csv_path}")
-    print(f"{'threads':>8}  {'ops/s':>12}  {'median_ns':>14}")
+    hdr = "offered" if args.offered_sweep else "threads"
+    key = "offered_rate" if args.offered_sweep else "threads"
+    print(f"{hdr:>9}  {'ach_ops/s':>11}  {'median_us':>10}  {'p99_us':>10}  {'compl%':>7}")
     for r in rows:
         med = r["median_latency_ns"]
-        med_s = f"{med:.0f}" if med != "" else "n/a"
-        print(f"{r['threads']:>8}  {r['mean_ops_per_sec']:>12.1f}  {med_s:>14}")
+        p99 = r["p99_latency_ns"]
+        comp = r["completion_pct"]
+        med_s = f"{med/1000:.1f}" if med != "" else "n/a"
+        p99_s = f"{p99/1000:.1f}" if p99 != "" else "n/a"
+        comp_s = f"{comp:.1f}" if comp != "" else "n/a"
+        print(f"{r[key]:>9g}  {r['mean_ops_per_sec']:>11.1f}  {med_s:>10}  "
+              f"{p99_s:>10}  {comp_s:>7}")
 
 
 if __name__ == "__main__":
