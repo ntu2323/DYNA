@@ -14,9 +14,13 @@
 #include "dyna_new/wall_clock.h"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <string>
+#include <thread>
 #include <vector>
 
 namespace specpaxos {
@@ -36,6 +40,18 @@ public:
                         void *meta_data) override;
 
 private:
+    // §7/reconciliation control handling, run on a dedicated replication worker
+    // thread (NOT the transport pump). The pump only picks up client requests +
+    // sends replies; sync/confirm/commit/fetch are enqueued here so request pickup
+    // is never blocked behind §7 processing (which is ~2× request volume). All
+    // orderer methods these call already take the orderer's own mutex, so moving
+    // them off the pump changes only which thread runs them, not the protocol.
+    void HandleControlMessage(const std::string_view type,
+                              const std::string_view data,
+                              const TransportAddress &remote);
+    void EnqueueControl(const std::string_view type, const std::string_view data,
+                        const TransportAddress &remote);
+    void ControlWorkerLoop();
     // Fired by partition `pid`'s orderer when an entry releases: sends the client
     // reply and, for the leader, broadcasts the sync to followers.
     void OnRelease(uint32_t pid, bool is_leader, const LogEntry &e);
@@ -101,6 +117,22 @@ private:
     // OnRelease and flushes one SyncBatch in OnPostDrain. Touched only by that
     // partition's single release thread, so it needs no lock.
     std::vector<std::vector<LogEntry>> pendingSync_;
+
+    // Replication worker: a single-producer (pump) / single-consumer (worker) FIFO
+    // of §7 control messages, drained off the transport pump. FIFO order is
+    // preserved (one producer, one consumer) so per-partition sync/confirm/commit
+    // ordering is unchanged. The worker cv-parks when idle (§7 is background, off
+    // the client's f+1 commit path) and drains continuously under load.
+    struct ControlMsg {
+        std::string type;
+        std::string data;
+        std::shared_ptr<TransportAddress> remote;
+    };
+    std::mutex ctrl_mu_;
+    std::condition_variable ctrl_cv_;
+    std::deque<ControlMsg> ctrl_q_;
+    bool ctrl_running_ = false;
+    std::thread ctrl_thread_;
 };
 
 } // namespace dyna_new
