@@ -1,0 +1,40 @@
+20260524-142447-8625 00011 ! AppReplica      (replica.h:216):    Splinterdb exists: 0
+20260524-142447-8673 00011 * BindToPort      (udptransport.cc:200): Binding to 127.0.0.1:13000
+20260524-142447-8713 00011 * Register        (udptransport.cc:453): Listening on UDP port 13000
+20260524-142448-1913 00011 * Initialize      (log.cc:53):        Entry size 152
+20260524-142448-1920 00011 * BindToPort      (udptransport.cc:200): Binding to 127.0.0.1:14000
+20260524-142448-1951 00011 * operator()      (replica.cc:160):   TIME [0.000042] [0] [0] [0] [0] [0] [0] [0] [0] [0] [0] [0]
+20260524-142448-1955 00011 * Register        (udptransport.cc:453): Listening on UDP port 14000
+20260524-142448-1962 00011 * BindToPort      (udptransport.cc:200): Binding to 0.0.0.0:0
+20260524-142448-1965 00011 * Register        (udptransport.cc:453): Listening on UDP port 52047
+20260524-142448-1970 00011 * HandleMakeDurabilityServerKnown (replica.cc:1868):  Received Makeknown message from the durability server
+20260524-142448-1973 00011 * SendStatusUpdateWaitAck (replica.cc:533):   Sending status update message to the durability server
+20260524-142448-1975 00011 * HandleStatusUpdate (durabilityreplica.cc:200): Received a statusupdate message with view 0, status 0
+20260524-142449-1961 00011 * operator()      (replica.cc:160):   TIME [1000.981251] [0] [0] [0] [0] [0] [0] [0] [0] [0] [0] [0]
+20260524-142450-1971 00011 * operator()      (replica.cc:160):   TIME [2001.986210] [0] [0] [0] [0] [0] [0] [0] [0] [0] [0] [0]
+20260524-142450-8202 00011 PANIC HandlePrepare   (replica.cc:1014):  [0] Unexpected PREPARE: I'm the leader of this view
+20260524-142450-8206 00011 ! Backtrace       (message.cc:169):   Backtrace:
+20260524-142450-8212 00011 ! Backtrace       (message.cc:217):    0: _Z6_Panicv+0xc [0xaaaac8278094]
+
+20260524-142450-8218 00011 ! Backtrace       (message.cc:217):    1: _ZN9specpaxos2vr9VRReplica13HandlePrepareERK16TransportAddressRKNS0_5proto14PrepareMessageE+0x654 [0xaaaac8248a2c]
+
+20260524-142450-8222 00011 ! Backtrace       (message.cc:217):    2: _ZN9specpaxos2vr9VRReplica14ReceiveMessageERK16TransportAddressSt17basic_string_viewIcSt11char_traitsIcEES8_Pv+0x4c4 [0xaaaac824ec0c]
+
+20260524-142450-8227 00011 ! Backtrace       (message.cc:217):    3: _ZN12UDPTransport13ProcessPacketEi11sockaddr_injPcl+0xb00 [0xaaaac82887d0]
+
+20260524-142450-8232 00011 ! Backtrace       (message.cc:217):    4: _ZN12UDPTransport10OnReadableEi+0xf8 [0xaaaac82895a8]
+
+20260524-142450-8239 00011 ! Backtrace       (message.cc:217):    5: event_reinit+0x4b4 [0xffff8260f214]
+
+20260524-142450-8243 00011 ! Backtrace       (message.cc:217):    6: event_base_loop+0x50c [0xffff8260fa4c]
+
+20260524-142450-8282 00011 ! Backtrace       (message.cc:217):    7: _ZN13FastTransport3RunEv+0xb4 [0xaaaac8299994]
+
+20260524-142450-8285 00011 ! Backtrace       (message.cc:217):    8: _ZNSt6thread11_State_implINS_8_InvokerISt5tupleIJZ4mainEUlvE_EEEEE6_M_runEv+0xa8 [0xaaaac8233d98]
+
+20260524-142450-8289 00011 ! Backtrace       (message.cc:217):    9: _ZNKSt10error_code23default_error_conditionEv+0x3c [0xffff81ce7fbc]
+
+20260524-142450-8293 00011 ! Backtrace       (message.cc:217):    10: start_thread+0x184 [0xffff8270c624]
+
+20260524-142450-8296 00011 ! Backtrace       (message.cc:217):    11: clone+0x5c [0xffff81b796bc]
+

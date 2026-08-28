@@ -1,0 +1,130 @@
+syntax = "proto2";
+
+package specpaxos.dyna_multi.proto;
+
+// DYNA-multi wire messages (spec §2). Every message carries the transaction's
+// identity (client_id, request_id) and view_id unless noted. OrderKey and TxnId
+// are computed locally on each server and are NOT sent (spec §1.1).
+
+enum TxnType {
+    WRITE = 0;   // pure blind write (wSet only)
+    READ  = 1;   // pure read (rSet only); RMW deferred (§0.4)
+}
+
+// A single written key/value pair (proto2 has no first-class map on the wire).
+message KV {
+    required bytes key   = 1;
+    required bytes value = 2;
+}
+
+// §1.2 the transaction body a client multicasts. `t` is the client-assigned
+// deadline (physical component of OrderKey); it may be advanced, never lowered.
+message Txn {
+    required uint64  client_id  = 1;   // TxnId.client
+    required uint64  request_id = 2;   // TxnId.request (unique per client)
+    required TxnType type       = 3;
+    repeated bytes   r_set      = 4;   // keys read       (empty for pure WRITE)
+    repeated KV      w_set      = 5;   // keys+values written (empty for pure READ)
+    required uint64  t          = 6;   // client-assigned deadline (µs)
+    required uint64  view_id    = 7;
+    optional uint64  send_time  = 8;   // µs, client send stamp (replica learns OWD, §2)
+}
+
+// 1. ClientRequest — client → all servers (multicast / retry).
+message ClientRequest {
+    required Txn txn = 1;
+}
+
+// 2. SpecReply — server → client, after the server releases the txn.
+message SpecReply {
+    required uint64 client_id    = 1;   // txnId
+    required uint64 request_id   = 2;
+    required uint64 view_id      = 3;
+    required uint32 server_id    = 4;
+    required uint64 t            = 5;   // the LIVE timestamp this server released at
+    required bool   is_leader    = 6;   // true iff this server leads a key in the txn
+    repeated KV     results      = 7;   // READ + leader only: disk-read values
+    required uint64 owd_estimate = 8;   // µs, piggybacked OWD feedback
+}
+
+// 3. RejectReply — READ arrived late at a follower; tells client to retry larger t.
+message RejectReply {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint32 server_id  = 4;
+}
+
+// 4. FastCommit — client → all servers after fast-path quorum.
+message FastCommit {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint64 agreed_t   = 4;   // commonly-agreed timestamp (all leaders matched)
+}
+
+// 5. SlowCommit — client → all servers when leaders' timestamps disagreed.
+message SlowCommit {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint64 agreed_t   = 4;   // max over involved leaders' proposed timestamps
+}
+
+// 6. CommitReply — server → client in response to a SlowCommit (quorum re-check).
+message CommitReply {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint32 server_id  = 4;
+    required uint64 t          = 5;   // == agreed_t after the server adopted it
+    required bool   is_leader  = 6;
+}
+
+// 7. FetchRequest — server → server, pull a missing txn body from a peer.
+message FetchRequest {
+    required uint64 client_id    = 1;   // txnId of the wanted body
+    required uint64 request_id   = 2;
+    required uint64 view_id      = 3;
+    required uint32 requester_id = 4;
+}
+
+// 8. FetchReply — server → server, the requested txn body.
+message FetchReply {
+    required Txn txn = 1;               // txnId+viewId are inside the body
+}
+
+// 9. TsAgree — leader → other involved leaders (background ts-agreement, §3.5).
+message TsAgree {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint32 sender_id  = 4;
+    required uint64 proposed_t = 5;    // this leader's current live t for the txn
+}
+
+// 10. ReplicatePrepare — leader → all other servers (durability of agreed order).
+message ReplicatePrepare {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint32 leader_id  = 4;
+    required uint64 agreed_t   = 5;
+    optional Txn    txn        = 6;    // optional body so a lacking follower can materialize
+}
+
+// 11. ReplicatePrepareReply — server → leader, ack of ReplicatePrepare.
+message ReplicatePrepareReply {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint32 server_id  = 4;
+}
+
+// 12. ReplicateCommit — leader → all other servers, txn durably committed.
+message ReplicateCommit {
+    required uint64 client_id  = 1;
+    required uint64 request_id = 2;
+    required uint64 view_id    = 3;
+    required uint32 leader_id  = 4;
+}

@@ -6,8 +6,8 @@ SRCS += $(addprefix $(d), \
 OBJS-benchmark := $(o)benchmark.o \
                   $(LIB-message) $(LIB-latency)
 
-$(d)client: $(o)client.o $(OBJS-spec-client) $(OBJS-vr-client) $(OBJS-dyna-client) $(OBJS-dyna-new-client) $(OBJS-fastpaxos-client) $(OBJS-unreplicated-client) $(OBJS-nopaxos-client) $(OBJS-benchmark) $(LIB-udptransport) $(LIB-fasttransport) $(LIB-cpu_affinity) $(LIB-data_structure)
+$(d)client: $(o)client.o $(OBJS-spec-client) $(OBJS-vr-client) $(OBJS-dyna-client) $(OBJS-dyna-new-client) $(OBJS-dyna-multi-client) $(OBJS-fastpaxos-client) $(OBJS-unreplicated-client) $(OBJS-nopaxos-client) $(OBJS-benchmark) $(LIB-udptransport) $(LIB-fasttransport) $(LIB-cpu_affinity) $(LIB-data_structure)
 
-$(d)replica: $(o)replica.o $(OBJS-spec-replica) $(OBJS-vr-replica) $(OBJS-vr-durabilityreplica) $(OBJS-dyna-replica) $(OBJS-dyna-new-replica) $(OBJS-fastpaxos-replica) $(OBJS-unreplicated-replica) $(OBJS-nopaxos-replica) $(LIB-udptransport) $(LIB-fasttransport) $(LIB-cpu_affinity) $(LIB-batchgen) $(LIB-data_structure) $(LIB-db)
+$(d)replica: $(o)replica.o $(OBJS-spec-replica) $(OBJS-vr-replica) $(OBJS-vr-durabilityreplica) $(OBJS-dyna-replica) $(OBJS-dyna-new-replica) $(OBJS-dyna-multi-replica) $(OBJS-fastpaxos-replica) $(OBJS-unreplicated-replica) $(OBJS-nopaxos-replica) $(LIB-udptransport) $(LIB-fasttransport) $(LIB-cpu_affinity) $(LIB-batchgen) $(LIB-data_structure) $(LIB-db)
 
 BINS += $(d)client $(d)replica

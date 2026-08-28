@@ -40,6 +40,7 @@
 #include "lib/cpu_affinity.h"
 #include "dyna/replica.h"
 #include "dyna_new/replica.h"
+#include "dyna_multi/replica.h"
 #include "vr/replica.h"
 #include "vr/durabilityreplica.h"
 
@@ -62,7 +63,7 @@
 static void
 Usage(const char *progName)
 {
-        fprintf(stderr, "usage: %s -c conf-file [-R] -i replica-index -m {vr|dyna|dyna_new} [-b batch-size] [-d packet-drop-rate] [-r packet-reorder-rate] [-q dscp]\n",
+        fprintf(stderr, "usage: %s -c conf-file [-R] -i replica-index -m {vr|dyna|dyna_new|dyna_multi} [-b batch-size] [-d packet-drop-rate] [-r packet-reorder-rate] [-q dscp]\n",
                 progName);
         exit(1);
 }
@@ -102,7 +103,8 @@ main(int argc, char **argv)
         PROTO_UNKNOWN,
         PROTO_VR,
         PROTO_DYNA,
-        PROTO_DYNA_NEW
+        PROTO_DYNA_NEW,
+        PROTO_DYNA_MULTI
     } proto = PROTO_UNKNOWN;
 
     // Parse arguments
@@ -160,6 +162,8 @@ main(int argc, char **argv)
                 proto = PROTO_DYNA;
             } else if (strcasecmp(optarg, "dyna_new") == 0) {
                 proto = PROTO_DYNA_NEW;
+            } else if (strcasecmp(optarg, "dyna_multi") == 0) {
+                proto = PROTO_DYNA_MULTI;
             } else {
                 fprintf(stderr, "unknown mode '%s'\n", optarg);
                 Usage(argv[0]);
@@ -303,6 +307,15 @@ main(int argc, char **argv)
         const bool busyPoll = (bp == nullptr) || (*bp != '0');
         FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, busyPoll);
         specpaxos::dyna_new::DynaNewReplica replica(internalConfig, index, &transport);
+        transport.Run();
+        return 0;
+    }
+
+    if (proto == PROTO_DYNA_MULTI) {
+        const char *bp = std::getenv("DYNA_MULTI_BUSY_POLL");
+        const bool busyPoll = (bp == nullptr) || (*bp != '0');
+        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, busyPoll);
+        specpaxos::dyna_multi::DynaMultiReplica replica(internalConfig, index, &transport);
         transport.Run();
         return 0;
     }

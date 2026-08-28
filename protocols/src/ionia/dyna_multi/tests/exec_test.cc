@@ -1,0 +1,132 @@
+// -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
+//
+// dyna_multi/tests/exec_test.cc
+//   Stage 6 acceptance tests for dependency-gated batched disk execution (spec §3.7):
+//   a COMMITTED write executes and is applied + GC'd; a w-w conflict executes in
+//   OrderKey order (larger blocked until the smaller commits); a non-conflicting txn
+//   executes even while an unrelated smaller txn is un-committed; and disk persistence
+//   is asynchronous (mem visible immediately) — invariant 2.
+
+#include "dyna_multi/in_memory_backend.h"
+#include "dyna_multi/server_orderer.h"
+#include "dyna_multi/topology.h"
+#include "dyna_multi/txn_types.h"
+#include "dyna_multi/wall_clock.h"
+
+#include <gtest/gtest.h>
+
+#include <string>
+#include <vector>
+
+using namespace specpaxos::dyna_multi;
+namespace proto = specpaxos::dyna_multi::proto;
+
+namespace {
+
+TxnEntry MakeWrite(uint64_t client, uint64_t req, uint64_t t,
+                   const std::string &key, const std::string &value)
+{
+    TxnEntry e;
+    e.txn.set_client_id(client);
+    e.txn.set_request_id(req);
+    e.txn.set_type(proto::WRITE);
+    proto::KV *kv = e.txn.add_w_set();
+    kv->set_key(key);
+    kv->set_value(value);
+    e.txn.set_t(t);
+    e.txn.set_view_id(0);
+    e.t = t;
+    return e;
+}
+
+ServerOrderer::OnSpecReply Noop() { return [](const TxnEntry &) {}; }
+
+// Release an on-time write and force it to COMMITTED (skips the commit/replication
+// handshake — this test targets ExecuteReady only).
+void ReleaseAndCommit(ServerOrderer &o, MockClock &clk, TxnEntry entry, uint64_t at)
+{
+    o.SubmitTxn(std::move(entry), false);
+    clk.Set(at);
+    o.ReleaseDue();
+}
+
+} // namespace
+
+TEST(Exec, CommittedWriteExecutesAndApplies)
+{
+    InMemoryBackend backend;
+    MockClock clk(50);
+    ServerOrderer o(0, 0, &clk, Topology(1), Noop(), &backend);
+    const TxnId id = MakeTxnId(1, 1);
+
+    ReleaseAndCommit(o, clk, MakeWrite(1, 1, 100, "k", "v1"), 100);
+    o.MarkCommitted(id);   // simulate replication reaching COMMITTED
+
+    std::vector<TxnId> done = o.ExecuteReady();
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0], id);
+    EXPECT_EQ(backend.mem_read("k").value_or(""), "v1");
+    EXPECT_EQ(o.speclog_size(), 0u);            // GC'd from memory
+    EXPECT_FALSE(o.speclog_contains(id));
+}
+
+TEST(Exec, WWConflictExecutesInOrderKeyOrder)
+{
+    InMemoryBackend backend;
+    MockClock clk(50);
+    ServerOrderer o(0, 0, &clk, Topology(1), Noop(), &backend);
+    const TxnId t1 = MakeTxnId(1, 1), t2 = MakeTxnId(1, 2);
+
+    ReleaseAndCommit(o, clk, MakeWrite(1, 1, 100, "K", "a"), 100);   // smaller OrderKey
+    ReleaseAndCommit(o, clk, MakeWrite(1, 2, 200, "K", "b"), 200);   // larger, same key
+
+    // Only the larger is COMMITTED → blocked by the un-committed smaller conflicting one.
+    o.MarkCommitted(t2);
+    EXPECT_TRUE(o.ExecuteReady().empty());
+    EXPECT_FALSE(backend.mem_read("K").has_value());
+
+    // Commit the smaller → both execute in OrderKey order; final value is the larger's.
+    o.MarkCommitted(t1);
+    std::vector<TxnId> done = o.ExecuteReady();
+    ASSERT_EQ(done.size(), 2u);
+    EXPECT_EQ(done[0], t1);
+    EXPECT_EQ(done[1], t2);
+    EXPECT_EQ(backend.mem_read("K").value_or(""), "b");
+    EXPECT_EQ(o.speclog_size(), 0u);
+}
+
+TEST(Exec, NonConflictingExecutesDespiteUncommittedSmaller)
+{
+    InMemoryBackend backend;
+    MockClock clk(50);
+    ServerOrderer o(0, 0, &clk, Topology(1), Noop(), &backend);
+    const TxnId small = MakeTxnId(1, 1), big = MakeTxnId(1, 2);
+
+    ReleaseAndCommit(o, clk, MakeWrite(1, 1, 100, "A", "x"), 100);   // stays un-committed
+    ReleaseAndCommit(o, clk, MakeWrite(1, 2, 200, "B", "y"), 200);   // different key
+    o.MarkCommitted(big);   // only the larger, non-conflicting one is committed
+
+    std::vector<TxnId> done = o.ExecuteReady();
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0], big);
+    EXPECT_EQ(backend.mem_read("B").value_or(""), "y");
+    EXPECT_FALSE(backend.mem_read("A").has_value());   // smaller not executed
+    EXPECT_TRUE(o.speclog_contains(small));            // still buffered
+    EXPECT_FALSE(o.speclog_contains(big));             // executed + GC'd
+}
+
+TEST(Exec, DiskPersistIsAsyncMemImmediate)
+{
+    InMemoryBackend backend;
+    MockClock clk(50);
+    ServerOrderer o(0, 0, &clk, Topology(1), Noop(), &backend);
+    const TxnId id = MakeTxnId(1, 1);
+
+    ReleaseAndCommit(o, clk, MakeWrite(1, 1, 100, "k", "v"), 100);
+    o.MarkCommitted(id);
+    ASSERT_EQ(o.ExecuteReady().size(), 1u);
+
+    // Memory is authoritative and visible immediately; disk write was enqueued (async).
+    EXPECT_EQ(backend.mem_read("k").value_or(""), "v");
+    EXPECT_EQ(backend.disk_persist_count(), 1u);
+}

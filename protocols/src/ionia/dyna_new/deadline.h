@@ -127,22 +127,47 @@ public:
         recompute();
     }
 
+    // Congestion feedback (§6.2): the leader's ACTUAL hold for a committed request =
+    // reply.deadline − send. On the fast path this is ≤ our bound (the leader honored
+    // our deadline). If it EXCEEDS our bound, the request arrived after its deadline
+    // and the leader had to reassign it (slow path) — a direct signal that the bound
+    // is too tight for the current load. We raise a separate `congestion_bound_us_`
+    // toward that observed hold (bounded by kCongestionMaxUs) so future deadlines are
+    // generous enough to stay on the fast path, and decay it back when the network
+    // clears. This keeps the OWD-driven bound tight at low load (preserving the
+    // low-latency floor) while preventing the slow-path/healing-storm collapse under
+    // load. See the collapse analysis: bound=40 vs OWD=2000 → 88% slow path.
+    void on_observed_hold(uint64_t send_us, uint64_t reply_deadline_us) {
+        if (reply_deadline_us <= send_us) return;
+        const uint64_t hold_us = reply_deadline_us - send_us;
+        if (hold_us > bound_us_) {
+            const uint64_t capped = std::min(hold_us, kCongestionMaxUs);
+            if (capped > congestion_bound_us_) congestion_bound_us_ = capped;
+        } else if (congestion_bound_us_ > 0) {
+            // Healthy (fast path): relax the congestion allowance back toward 0.
+            congestion_bound_us_ -= (congestion_bound_us_ / 32) + 1;
+        }
+        recompute();
+    }
+
 private:
+    static constexpr uint64_t kCongestionMaxUs = 20000;  // 20ms ceiling on the hold
+
     void recompute() {
         uint64_t m = 0;
         for (uint64_t o : last_owd_) m = std::max(m, o);
-        if (m == 0) {
-            bound_us_ = cfg_.initial_bound_us;
-        } else {
-            // Floor by the cold-start bound (absorbs sync error s + jitter),
-            // cap by max_owd.
-            bound_us_ = std::min(cfg_.max_owd_us, std::max(cfg_.initial_bound_us, m));
-        }
+        // OWD-driven bound: tight, capped by max_owd (keeps the low-load floor).
+        uint64_t owd_bound = (m == 0)
+            ? cfg_.initial_bound_us
+            : std::min(cfg_.max_owd_us, std::max(cfg_.initial_bound_us, m));
+        // Under congestion the observed slow-path hold can exceed max_owd; let it.
+        bound_us_ = std::max(owd_bound, congestion_bound_us_);
     }
 
     DeadlineConfig cfg_;
     std::vector<uint64_t> last_owd_;
     uint64_t bound_us_;
+    uint64_t congestion_bound_us_ = 0;   // slow-path-driven headroom above max_owd
 };
 
 } // namespace dyna_new

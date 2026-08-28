@@ -1,0 +1,20 @@
+20260524-142450-8173 00026 * BindToPort      (udptransport.cc:200): Binding to 0.0.0.0:0
+20260524-142450-8177 00026 * Register        (udptransport.cc:453): Listening on UDP port 42099
+20260524-142450-8180 00026 * BenchmarkClient (benchmark.cc:124): Closed-loop client: send next request after each completion
+20260524-142450-8183 00026 * BenchmarkClient (benchmark.cc:132): Using tracefile: /work/ionia/docker/smoke-output/trace.lowmem1
+20260524-142450-8190 00026 * BenchmarkClient (benchmark.cc:192): Loaded 8 trace ops (numrequests = 4, cycles trace) from tracefile: /work/ionia/docker/smoke-output/trace.lowmem1
+20260524-142450-8193 00026 * main            (client.cc:525):    Bench setup: 1 bench client(s), 1 thread(s)
+20260524-142450-8197 00026 * main            (client.cc:530):    Running client... 0
+20260524-142450-8202 00026 * WarmupDone      (benchmark.cc:295): Completed warmup period of 0 seconds with 0 completions (1 submitted)
+20260524-142450-8206 00026 * Finish          (benchmark.cc:512): Completed 4 requests in 0.000057 seconds (submitted=4)
+
+20260524-142450-8219 00026 * CooldownDone    (benchmark.cc:320): Finished cooldown period.
+20260524-142450-8223 00026 * CooldownDone    (benchmark.cc:331): Median latency is 24250 ns (24 us)
+20260524-142450-8226 00026 * CooldownDone    (benchmark.cc:339): Average latency is 17917 ns (17 us)
+20260524-142450-8230 00026 * CooldownDone    (benchmark.cc:343): 90th percentile latency is 29209 ns (29 us)
+20260524-142450-8237 00026 * CooldownDone    (benchmark.cc:347): 95th percentile latency is 29209 ns (29 us)
+20260524-142450-8241 00026 * CooldownDone    (benchmark.cc:351): 99th percentile latency is 29209 ns (29 us)
+20260524-142450-9191 00026 * operator()      (client.cc:470):    All clients done.
+20260524-142450-9194 00026 * LATENCY total: 8584 ns 17 us/8192 ns 29 us (4 samples, 71 us total)
+20260524-142450-9196 00026 *    8192 ns |          2 | ==
+20260524-142450-9197 00026 *      16 us |          2 | ==
