@@ -46,8 +46,7 @@ python3 create_cluster.py 4 --hosts-file cluster_hosts.json --spread-replica-zon
 # VR (paxos baseline)
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_paxos_vr_cluster.py --hosts-file cluster_hosts.json
 
-# DYNA (after VR or instead of VR — not in parallel). Also installs the
-# dyna_new helpers (start_dyna_new_replica.sh / run_dyna_new_client.sh).
+# DYNA (after VR or instead of VR — not in parallel).
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json
 
 # IONIA (ionia -m vr; two-config layout)
@@ -91,7 +90,7 @@ SSH_USER=nathan python3 run_cluster_bench.py \
 
 
 
-`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`, DYNA `rm` the active WAL dir — `~/bench/wal` or `/dev/shm/dyna-wal` with `--wal-tmpfs`). Use `--no-clean-remote` only if you need to preserve state for debugging.
+`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`; DYNA is in-memory, nothing to wipe). Use `--no-clean-remote` only if you need to preserve state for debugging.
 
 ```bash
 # VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
@@ -111,10 +110,6 @@ SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_ionia_cluster.p
 # Rollback: --ionia-durability-threads 1 or IONIA_DURABILITY_THREADS=1
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol ionia --hosts-file cluster_hosts.json \
   -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
-
-# DYNA — WAL on tmpfs (fsync triage: if mean/p99 drop sharply, disk fsync is the bottleneck)
-SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json \
-  --wal-tmpfs -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
 
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 run_cluster_bench.py --protocol vr --hosts-file cluster_hosts.json \
   -e 150 -w 5 --interval-ms 1000 --trim-pad-sec 10 --poisson-rate 30
@@ -142,9 +137,7 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--poisson-rate` | Open-loop offered load (default `60`) |
 | `--closed-loop` | Disable Poisson; wait for ack before next send |
 | `--interval-ms` | Throughput log interval (`bench/client -i`) |
-| `--no-clean-remote` | Skip wiping remote runs / RocksDB / WAL (default is clean) |
-| `--wal-tmpfs` | DYNA only: `DYNA_WAL_DIR=/dev/shm/dyna-wal` on replicas (fsync isolation) |
-| `--no-eager-fast-reply` | DYNA only: Nezha deadline hold (default: **eager** fast-reply on admit) |
+| `--no-clean-remote` | Skip wiping remote runs / RocksDB (default is clean) |
 | `--offered-ops-per-sec` | Open-loop: per-sender offered ops/s (`-G`; use on WAN instead of `--poisson-rate`) |
 | `--max-inflight` | Open-loop: cap outstanding requests per sender (`-F`; backpressure) |
 | `--wan-open-loop` | Preset: `-G 10`, `-F 500`, no Poisson load during warmup (needs rebuilt `bench/client`) |
@@ -154,11 +147,11 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 | `--ionia-durability-threads` | IONIA only: `bench/replica -j` per replica (default **15**; rollback: `1`) |
 | `--ionia-fast-quorum` | IONIA only: `IONIA_FAST_QUORUM=1` on clients — quorum **1**, writes to **leader** durability only (lower latency / less fan-out than default quorum-3) |
 
-### dyna_new (rewritten DYNA)
+### DYNA details
 
-`dyna_new` is the rewrite in `protocols/src/ionia/dyna_new/` (`bench/replica -m dyna_new`). It reuses the **same** ionia binary, `~/bench/dynaconfig`, and `~/bench/trace.micro` (1000 keys) as `dyna` — the bench picks a **uniformly random key per request**, so load spreads over the 1000-key space exactly like `dyna`. Differences: **InMemoryBackend** (no WAL, no SplinterDB/RocksDB — nothing to wipe between runs), client-side **retransmission** (`DYNA_NEW_RESEND_TIMEOUT_MS`, default 20ms) + at-most-once dedup, and it ignores the old-DYNA knobs (`DYNA_STATS`, `DYNA_EAGER_FAST_REPLY`, `DYNA_FAST_REPLY_SHARDS`, replication budgets, `--wal-tmpfs`).
+DYNA is `protocols/src/ionia/dyna/` (`bench/replica -m dyna`): multi-partition deadline-ordered replication (N = 2f+1 servers, server *i* leads partition *i*). It uses `~/bench/dynaconfig` and `~/bench/trace.micro` (1000 keys) — the bench picks a **uniformly random key per request**. Replicas use an **InMemoryBackend** (no WAL / SplinterDB / RocksDB — nothing to wipe between runs); the client retransmits (`DYNA_RESEND_TIMEOUT_MS`, default 30ms) and replicas answer retries from an at-most-once reply cache.
 
-**Setup:** no separate command — `setup_dyna_cluster.py` also installs the `dyna_new` helpers. Deploy your local tree (which must contain the `dyna_new` code) via `--rsync-from` or push to GitHub first:
+**Setup:** deploy your local tree via `--rsync-from` or push to GitHub first:
 
 ```bash
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py \
@@ -171,7 +164,7 @@ SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote python3 setup_dyna_cluster.py
 # Single run — all common flags shown (values match prior examples where noted)
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \
 python3 run_cluster_bench.py \
-  --protocol dyna_new \
+  --protocol dyna \
   --hosts-file cluster_hosts.json \
   -n 0 \
   -e 150 \
@@ -190,7 +183,7 @@ python3 run_cluster_bench.py \
 # Thread sweep — runs one bench per -j value; default sweep list is 1 2 4 8
 SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \
 python3 run_throughput_sweep.py \
-  --protocol dyna_new \
+  --protocol dyna \
   --hosts-file cluster_hosts.json \
   --threads 1 4 8 \
   -n 0 \
@@ -201,7 +194,7 @@ python3 run_throughput_sweep.py \
   --poisson-rate 60 \
   --offered-ops-per-sec 0 \
   --max-inflight 0
-# Sweep writes results/sweep_dyna_new_<id>/t<threads>/ and sweep.csv
+# Sweep writes results/sweep_dyna_<id>/t<threads>/ and sweep.csv
 ```
 
 | Flag | Default | Meaning |
@@ -218,7 +211,7 @@ python3 run_throughput_sweep.py \
 | `--replica-wait-sec` | `20` | Sleep after starting replicas before clients |
 | `--threads` (sweep only) | `1 2 4 8` | List of `-j` values to run sequentially |
 
-**Manual (SSH):** receivers `~/bench/start_dyna_new_replica.sh <0|1|2>`; sender `~/bench/run_dyna_new_client.sh <client_id> [threads] [poisson-rate] [secs] [warmup]` (open-loop Poisson over `trace.micro`). Deadline env (`DYNA_INITIAL_BOUND_US`, `DYNA_MAX_OWD_US`, `DYNA_OWD_PERCENTILE`) applies to both replicas and senders, same as DYNA.
+**Manual (SSH):** receivers `~/bench/start_dyna_replica.sh <0|1|2>`; sender `~/bench/run_dyna_client.sh <client_id> [threads] [poisson-rate] [secs] [warmup]` (open-loop Poisson over `trace.micro`). Deadline env (`DYNA_INITIAL_BOUND_US`, `DYNA_MAX_OWD_US`, `DYNA_OWD_PERCENTILE`) applies to both replicas and senders.
 
 ### WAN open-loop (VR or DYNA)
 
@@ -295,7 +288,6 @@ results/<run_id>/
 ```bash
 ~/bench/start_paxos_vr_replica.sh 0    # VR on receiver1 (index 0)
 ~/bench/start_dyna_replica.sh 0        # DYNA
-~/bench/start_dyna_replica.sh 0 --wal-tmpfs   # DYNA, WAL on tmpfs
 ```
 
 **Sender (open-loop example):**
@@ -306,26 +298,23 @@ cd ~/Ionia/protocols/src/ionia
   -k ~/bench/trace.micro -O -R 60 -n 0 -e 90 -w 5 -t 1 -j 1 -i 1000 -l ~/bench/latencies
 ```
 
-Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (update these if you want open-loop flags baked in).
+Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (open-loop Poisson).
 
-**DYNA slow-path logs:** `~/bench/start_dyna_replica.sh` sets `DYNA_SLOWPATH_DEBUG=1` by default (logging only; does not force slow path). After a bench run, on each receiver: `grep "DYNA slowpath" ~/bench/replica-*.log`. Disable with `DYNA_SLOWPATH_DEBUG=0` before starting a replica. Re-run `setup_dyna_cluster.py --skip-build` to refresh the helper on existing VMs. Deadlines use **`system_clock`** (Nezha-style), not per-VM `steady_clock`, so senders and replicas should agree under GCP NTP.
-
-**DYNA performance stats (default on via setup helpers):**
+**DYNA env knobs** (defaults in `start_dyna_replica.sh` / `run_dyna_client.sh`; `run_cluster_bench.py` forwards locally-set values). Deadlines use **`system_clock`** (Nezha-style), so senders and replicas should be clock-synced (NTP/PTP).
 
 | Env | Where | Meaning |
 |-----|--------|---------|
-| `DYNA_STATS=1` | replica | Every `DYNA_STATS_INTERVAL_SEC` (default 1s): queue depths, release/slowpath rates, sampled `queue_us` / `hold_us` / `fastQ_us` |
-| `DYNA_STATS_SAMPLE` | replica | Sample 1/N releases for latency breakdown (default 1024) |
-| `DYNA_CLIENT_STATS=1` | client | Every `DYNA_CLIENT_STATS_LOG_EVERY` completions (default 10000): total / first-reply / quorum-wait μs percentiles |
+| `DYNA_INITIAL_BOUND_US` / `DYNA_MAX_OWD_US` | both | Cold-start deadline bound / OWD clamp (μs); deadline = send + bound |
+| `DYNA_OWD_PERCENTILE` / `DYNA_OWD_WINDOW_LEN` | replica | Percentile and window of per-client OWD samples fed back to clients |
+| `DYNA_BUSY_POLL` | both | `1` (default) busy-poll transport + release loop; `0` = epoll / cv park (use on clients at high `-j`) |
+| `DYNA_RESEND_TIMEOUT_MS` | client | Retransmit interval (default 30) |
+| `DYNA_SLOW_TIMEOUT_US` | client | All leaders replied but quorum short → force slow path after max(this, 3×bound) µs (default 2000; raise on WAN) |
+| `DYNA_TS_SCAN_MS` / `DYNA_TS_TIMEOUT_MS` | replica | Background tick (ts-agreement, prepare re-broadcast, stale-commit re-ack, executor backstop; default 50ms) / SPECULATIVE age before ts-agreement (default 100ms) |
+| `DYNA_SIM_DISK_LATENCY_US` | replica | Simulated async disk-persist latency (off the critical path) |
+| `DYNA_DEBUG=1` | both | Log request / reply / quorum flow (verbose) |
 | `BENCH_INFLIGHT_LOG=1` | client | Adds `inflight=` and `submitted=` to throughput interval lines |
 
-Replica lines: `grep "DYNA stats" ~/bench/replica-0.log`. Client lines are in `runs/<id>/client.log`; `aggregate_bench_results.py` pulls `per_sender_diagnostics` (max inflight, client phase p50s) into `summary.json`. Disable any flag with `=0`.
-
-**Replication tuning (defaults in `start_dyna_replica.sh`):** `DYNA_REPLICATION_BUDGET` (normal dequeue batch, default 256), `DYNA_REPLICATION_BURST_BUDGET` (batch when `replQ` ≥ threshold, default 8192), `DYNA_REPLICATION_BACKLOG_THRESHOLD` (default 1000). Sync/fsync/`SendMessageToAll` run **outside** `partitionMu_` so the process thread can release FastReplies while replication catches up.
-
-**DYNA vs VR latency (same open-loop bench):** VR replies as soon as the leader path completes (no hold-until-`deadline_us`); DYNA intentionally waits until **`now >= send_us + bound_us`** before `FastReply`. With correct OWD on GCP, **`bound_us` should be ~100–500 μs** (`DYNA_INITIAL_BOUND_US` / `DYNA_MAX_OWD_US` on replicas and senders via `start_dyna_replica.sh` / `run_dyna_client.sh`). Closed-loop sanity: `--closed-loop` with one sender should land near **bound + quorum RTT** (sub–few ms), not tens of ms. Open-loop at high offered load on a **small keyspace** adds per-key queueing on top of that floor; the default trace uses **1000 keys** so `-R 30` is closer to a defensible paper setup. If closed-loop is fast but open-loop median is still very high, look at pipeline/threading before deadline math.
-
-**Deadline env (GCP defaults in setup helpers):** `DYNA_INITIAL_BOUND_US=500`, `DYNA_MAX_OWD_US=10000`, `DYNA_BOUND_RECOMPUTE_K=1`, `DYNA_FAST_REPLY_SHARDS=16` (UDP send parallelism for FastReply).
+**DYNA vs VR latency (same open-loop bench):** VR replies as soon as the leader path completes; DYNA intentionally holds each request until its deadline (`send + bound`) before the SpecReply, then commits on an f+1 quorum that includes every involved partition leader. Closed-loop sanity: `--closed-loop` with one sender should land near **bound + RTT**.
 
 ---
 

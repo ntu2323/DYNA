@@ -1,26 +1,29 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
+//
+// dyna/replica.h
+//   DynaReplica — the per-server DYNA replica. Owns ONE ServerOrderer
+//   (single per-server ordering domain; spec §1.4) and drives the write path:
+//   ClientRequest → SubmitTxn → (release) → SpecReply; FastCommit/SlowCommit →
+//   ApplyCommit (with FetchRequest/FetchReply when the body is missing).
 
 #ifndef _DYNA_REPLICA_H_
 #define _DYNA_REPLICA_H_
 
-#include "dyna/dyna-proto.pb.h"
-#include "dyna/deadline/deadline_config.h"
-#include "dyna/deadline/replica_owd_estimator.h"
 #include "lib/configuration.h"
 #include "lib/transport.h"
-#include "third_party/concurrentqueue/concurrentqueue.h"
 
-#include <atomic>
-#include <chrono>
-#include <deque>
+#include "dyna/deadline.h"
+#include "dyna/dyna-proto.pb.h"
+#include "dyna/in_memory_backend.h"
+#include "dyna/server_orderer.h"
+#include "dyna/topology.h"
+#include "dyna/txn_types.h"
+#include "dyna/wall_clock.h"
+
+#include <cstdint>
 #include <memory>
 #include <mutex>
-#include <queue>
-#include <string>
-#include <thread>
-#include <unordered_map>
 #include <unordered_set>
-#include <vector>
 
 namespace specpaxos {
 namespace dyna {
@@ -28,7 +31,9 @@ namespace dyna {
 class DynaReplica : public TransportReceiver
 {
 public:
-    DynaReplica(const Configuration &config, int replicaIdx, Transport *transport);
+    DynaReplica(const specpaxos::Configuration &config,
+                     int replicaIdx,
+                     Transport *transport);
     ~DynaReplica() override;
 
     void ReceiveMessage(const TransportAddress &remote,
@@ -37,237 +42,74 @@ public:
                         void *meta_data) override;
 
 private:
-    enum class InboundKind {
-        SHUTDOWN,
-        REQUEST,
-        SYNC_BROADCAST,
-        SYNC_ACK,
-        COMMIT_BROADCAST,
-        LATE_SYNC_BROADCAST,
-        FETCH_REQUEST,
-        FETCH_RESPONSE,
-    };
+    // Message handlers.
+    void HandleClientRequest(const TransportAddress &remote, const proto::ClientRequest &m);
+    void HandleCommit(const TransportAddress &remote, const TxnId &id,
+                      uint64_t agreedT, bool slow);
+    void HandleFetchRequest(const TransportAddress &remote, const proto::FetchRequest &m);
+    void HandleFetchReply(const proto::FetchReply &m);
+    void HandleTsAgree(const proto::TsAgree &m);
 
-    struct InboundWork {
-        InboundKind kind = InboundKind::SHUTDOWN;
-        std::unique_ptr<TransportAddress> remote;
-        std::string payload;
-    };
+    // Background timestamp agreement (spec §3.5): periodic scan + TsAgree fan-out.
+    void TsAgreementTick();
+    void SendTsAgree(const ServerOrderer::TsAgreeAction &action);
 
-    struct RequestKey {
-        uint64_t clientId = 0;
-        uint64_t requestId = 0;
+    // Replication (spec §3.6-3.7): COMMITTING → COMMITTED.
+    void HandleReplicatePrepare(const TransportAddress &remote,
+                                const proto::ReplicatePrepare &m);
+    void HandleReplicatePrepareReply(const proto::ReplicatePrepareReply &m);
+    void HandleReplicateCommit(const proto::ReplicateCommit &m);
+    void SendReplicatePrepare(const ServerOrderer::ReplicateAction &a);
 
-        bool operator==(const RequestKey &other) const {
-            return clientId == other.clientId && requestId == other.requestId;
-        }
-    };
+    // Fired by the orderer when an entry releases (SPECULATIVE): send SpecReply (and
+    // cache it for WRITEs; read retries carry a fresh request_id, so reads aren't cached).
+    void OnSpecReply(const TxnEntry &e);
+    // After a txn became COMMITTING here: if we are its primary leader, broadcast its
+    // ReplicatePrepare now rather than on the next background scan.
+    void ReplicateNowIfPrimary(const TxnId &id);
+    // Outcome of a commit message once the body is present (applied / already executed).
+    void FinishCommit(const TxnId &id, const TxnEntry &out, ServerOrderer::CommitResult r,
+                      bool slow, const TransportAddress *client);
+    // Build the SpecReply proto for a released entry (writes carry no results).
+    proto::SpecReply BuildSpecReply(const TxnEntry &e) const;
+    void SendCommitReply(const TransportAddress &client, const TxnEntry &e);
 
-    struct RequestKeyHash {
-        size_t operator()(const RequestKey &k) const {
-            return std::hash<uint64_t>()(k.clientId) ^ (std::hash<uint64_t>()(k.requestId) << 1);
-        }
-    };
-
-    /** Nezha-style (deadline, reqKey) watermark per KV op-key; reqKey = (client_id<<32)|request_id. */
-    struct ReleasedRank {
-        uint64_t deadlineUs = 0;
-        uint64_t reqKey = 0;
-    };
-
-    struct BufferedRequest {
-        proto::RequestMessage request;
-        std::shared_ptr<TransportAddress> clientAddress;
-        uint64_t sequence = 0;
-        /** Wall time when enqueued on incomingQu_ (DYNA_STATS). */
-        uint64_t enqueuedUs = 0;
-    };
-
-    /** UDP fast reply work (Nezha FastReplyThread); built at release, no PartitionState on send. */
-    struct FastReplySendJob {
-        uint32_t partitionId = 0;
-        std::shared_ptr<TransportAddress> clientAddress;
-        uint64_t clientId = 0;
-        uint64_t requestId = 0;
-        uint64_t deadlineUs = 0;
-        uint32_t viewId = 0;
-        uint64_t owdUs = 0;
-        /** Wall time when enqueued on fastReplyQu_ (DYNA_STATS). */
-        uint64_t queuedUs = 0;
-    };
-
-    struct OwdSample {
-        uint64_t clientId = 0;
-        uint64_t delayUs = 0;
-    };
-
-    struct DeadlineCompare {
-        bool operator()(const BufferedRequest &a, const BufferedRequest &b) const {
-            if (a.request.deadline_us() != b.request.deadline_us()) {
-                return a.request.deadline_us() > b.request.deadline_us();
-            }
-            return a.sequence > b.sequence;
-        }
-    };
-
-    struct LogEntry {
-        bool valid = false;
-        bool committed = false;
-        bool applied = false;
-        uint64_t logIndex = 0;
-        uint64_t clientId = 0;
-        uint64_t requestId = 0;
-        std::string command;
-        uint64_t sendTimeUs = 0;
-        uint64_t deadlineUs = 0;
-        bool isRead = false;
-    };
-
-    struct StoredWrite {
-        uint32_t partitionId = 0;
-        uint64_t logIndex = 0;
-        std::string key;
-        std::string value;
-    };
-
-    struct PartitionState {
-        std::atomic<uint64_t> viewId{0};
-        /** Max applied deadline (read visibility / legacy); not used for fast-path admission. */
-        std::atomic<uint64_t> deadlineCounter{0};
-        uint64_t nextSequence = 0;
-        uint64_t nextLogIndex = 0;
-        uint64_t commitPoint = 0;
-        int64_t walSyncedUpTo = -1;
-        std::priority_queue<BufferedRequest, std::vector<BufferedRequest>, DeadlineCompare> earlyBuffer;
-        std::unordered_map<RequestKey, proto::RequestMessage, RequestKeyHash> latBuffer;
-        std::unordered_map<RequestKey, std::shared_ptr<TransportAddress>, RequestKeyHash> requestClients;
-        std::unordered_map<RequestKey, uint64_t, RequestKeyHash> requestToLogIndex;
-        std::vector<LogEntry> logEntries;
-        std::unordered_map<uint64_t, std::unordered_map<uint32_t, proto::SyncAck>> ackMap;
-        std::unordered_set<uint64_t> repliedReads;
-        std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingSyncByReq;
-        std::unordered_map<RequestKey, std::pair<uint64_t, uint64_t>, RequestKeyHash> pendingLateSyncByReq;
-        std::unordered_map<uint64_t, ReleasedRank> lastReleasedByOpKey;
-    };
-
-    Configuration config;
-    uint32_t numPartitions;
-    uint32_t numFastReplyShards;
+    specpaxos::Configuration config;
     int replicaIdx;
     Transport *transport;
-    std::vector<PartitionState> partitions;
-    /** Guards PartitionState (process, replication, durability threads). */
-    std::vector<std::mutex> partitionMu_;
-    std::deque<StoredWrite> appliedWrites;
-    std::unordered_map<std::string, std::string> kvStore;
-    ReplicaOwdEstimator owdEstimator_;
-    std::string walDir_;
-    mutable std::mutex owdMutex_;
-    mutable std::mutex kvMutex_;
 
-    std::vector<moodycamel::ConcurrentQueue<InboundWork>> replicationQu_;
-    std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> incomingQu_;
-    std::vector<moodycamel::ConcurrentQueue<BufferedRequest>> durabilityQu_;
-    std::vector<moodycamel::ConcurrentQueue<FastReplySendJob>> fastReplyQu_;
-    moodycamel::ConcurrentQueue<OwdSample> owdQu_;
-    std::vector<std::thread> processThreads_;
-    std::vector<std::thread> replicationThreads_;
-    std::vector<std::thread> durabilityThreads_;
-    std::vector<std::thread> fastReplyThreads_;
-    std::thread owdThread_;
-    std::thread statsThread_;
-    std::atomic<bool> workersRunning_{false};
-    bool replicaStatsEnabled_ = false;
-    uint64_t replicaStatsIntervalUs_ = 1000000;
-    uint64_t replicaStatsSampleEvery_ = 1024;
-    std::atomic<uint64_t> replicaStatsSampleCounter_{0};
+    uint64_t viewId_ = 0;
+    bool     debug_ = false;   // DYNA_DEBUG: log request/reply flow
+    uint64_t ts_scan_ms_ = 50;      // background scan cadence (ts-agree / replicate / exec)
+    uint64_t ts_timeout_us_ = 100000; // SPECULATIVE age before ts-agreement kicks in; also
+                                      // the prepare re-broadcast and stale-commit re-ack throttle
+    Topology topo_;
+    std::unique_ptr<InMemoryBackend> backend_;   // KV store for executed writes
+    std::unique_ptr<RealClock>    clock_;
+    std::unique_ptr<ServerOrderer> orderer_;
 
-    void StartWorkers();
-    void StatsThreadLoop();
-    void EmitReplicaStats();
-    void StopWorkers();
-    void ProcessPartitionLoop(uint32_t partitionId);
-    void ReplicationPartitionLoop(uint32_t partitionId);
-    void DurabilityPartitionLoop(uint32_t partitionId);
-    void FastReplyThreadLoop(uint32_t shardId);
-    void OwdThreadLoop();
-    void DispatchCommitInbound(uint32_t partitionId, InboundWork &work);
-    void DrainIncomingBuffered(uint32_t partitionId);
-    void AdmitInboundClientRequest(uint32_t partitionId, BufferedRequest &buffered);
-    bool EnqueueClientRequest(uint32_t partitionId,
-                              const TransportAddress &remote,
-                              const proto::RequestMessage &req);
-    bool EnqueueReplication(uint32_t partitionId,
-                            InboundKind kind,
-                            const TransportAddress &remote,
-                            const std::string_view data);
-    static void UpdateDeadlineCounter(std::atomic<uint64_t> &counter, uint64_t value);
-    static uint64_t OpKeyFromCommand(const std::string &command);
-    static ReleasedRank RankOf(const proto::RequestMessage &req);
-    static bool RankAfter(const ReleasedRank &incoming, const ReleasedRank &released);
-    static bool IsOnTimeForOpKey(const PartitionState &state, const proto::RequestMessage &req);
-    static void RecordReleasedRank(PartitionState &state, const proto::RequestMessage &req);
+    // Per-client OWD estimator (§2); sampled on the transport thread, read on release.
+    std::mutex owd_mu_;
+    ReplicaOwdEstimator owd_;
 
-    uint64_t NowMicros() const;
-    uint32_t PartitionLeader(uint32_t partitionId) const;
-    bool AmLeader(uint32_t partitionId) const;
-    RequestKey KeyOf(const proto::RequestMessage &req) const;
-    PartitionState &StateFor(uint32_t partitionId);
-    const PartitionState &StateFor(uint32_t partitionId) const;
-    void ProcessDueFastReplies(uint32_t partitionId);
-    void ReleaseBufferedRequest(PartitionState &state,
-                                uint32_t partitionId,
-                                BufferedRequest &buffered);
-    void SendFastReplyFromJob(const FastReplySendJob &job);
-    static uint32_t FastReplyShardFor(const proto::RequestMessage &req, uint32_t numShards);
-    static bool EarlyBufferHasDue(const PartitionState &state, uint64_t nowUs);
-    void BufferRequestUntilDeadline(uint32_t partitionId,
-                                    const TransportAddress &remote,
-                                    const proto::RequestMessage &req);
-    void BufferRequestUntilDeadlineLocked(uint32_t partitionId,
-                                          const TransportAddress &remote,
-                                          const proto::RequestMessage &req);
-    void HandleLateRequest(const TransportAddress &remote, const proto::RequestMessage &req, uint32_t partitionId);
-    void HandleLateSyncBroadcast(const TransportAddress &remote, const proto::LateSyncBroadcast &lsb);
-    void HandleSyncBroadcast(const TransportAddress &remote, const proto::SyncBroadcast &sb);
-    void HandleSyncAck(const TransportAddress &remote, const proto::SyncAck &ack);
-    void HandleCommitBroadcast(const TransportAddress &remote, const proto::CommitBroadcast &cb);
-    void HandleFetchRequest(const TransportAddress &remote, const proto::FetchRequest &fr);
-    void HandleFetchResponse(const TransportAddress &remote, const proto::FetchResponse &fr);
-    /** Appends under partitionMu_; returns entry for leader SyncBroadcast after unlock. */
-    bool AppendToLogLocked(uint32_t partitionId, const proto::RequestMessage &req, LogEntry &outEntry);
-    void BroadcastSyncForLogEntry(uint32_t partitionId, uint64_t viewId, const LogEntry &entry);
-    void BroadcastLateSyncForLogEntry(uint32_t partitionId,
-                                      uint64_t viewId,
-                                      const LogEntry &entry,
-                                      uint64_t oldDeadlineUs,
-                                      uint64_t newDeadlineUs);
-    void EnsureFollowerEntryFromSync(uint32_t partitionId, const proto::SyncBroadcast &sb);
-    void TryCommitFromAck(uint32_t partitionId, const proto::SyncAck &ack);
-    bool LeaderCommitToDiskAndBroadcast(uint32_t partitionId, uint64_t upToLogIndex);
-    void ApplyCommittedUpTo(uint32_t partitionId, uint64_t upToLogIndex);
-    void BroadcastCommit(uint32_t partitionId, uint64_t viewId, uint64_t upToLogIndex);
-    bool EntryMatchesSync(const LogEntry &entry, const proto::SyncBroadcast &sb) const;
-    void SendFastReply(uint32_t partitionId,
-                       const TransportAddress &remote,
-                       uint64_t clientId,
-                       uint64_t requestId,
-                       uint64_t deadlineUs);
-    void MaybeSendReadResult(uint32_t partitionId, const TransportAddress &remote, const proto::RequestMessage &req);
-    void RequestFetch(uint32_t partitionId, uint64_t clientId, uint64_t requestId);
-    bool TryPopulateEntryFromBuffers(uint32_t partitionId, const proto::SyncBroadcast &sb);
-    bool PersistCommittedRange(uint32_t partitionId, uint64_t upToLogIndex);
-    std::string WalPath(uint32_t partitionId) const;
-    bool EnsureReadVisibilityBeforeDeadline(uint32_t partitionId, uint64_t readDeadlineUs);
-    bool IsValidSyncBroadcast(uint32_t partitionId, const proto::SyncBroadcast &sb) const;
-    bool IsValidSyncAck(uint32_t partitionId, const proto::SyncAck &ack) const;
-    bool TryGetRequestMessage(uint32_t partitionId, const RequestKey &key, proto::RequestMessage &out) const;
-    bool ParseCommand(const std::string &command, char &op, std::string &key, std::string &value) const;
-    static std::string HexEncode(const std::string &data);
-    bool IsReadOp(char op) const;
+    // At-most-once reply cache (spec §1.4 CachedReply) + in-flight set, so a retried
+    // WRITE ClientRequest is answered from cache and never double-submitted. READs bypass
+    // both: every read attempt carries a fresh request_id and a new t.
+    std::mutex dedup_mu_;
+    HashMap<TxnId, proto::SpecReply> reply_cache_;
+    std::unordered_set<TxnId>        inflight_;
+
+    // A commit that arrived before the body: remember it until the fetch completes.
+    struct PendingCommit {
+        uint64_t agreedT = 0;
+        bool     slow = false;
+        std::shared_ptr<TransportAddress> client_addr;
+    };
+    std::mutex pending_mu_;
+    HashMap<TxnId, PendingCommit> pending_commits_;
 };
 
 } // namespace dyna
 } // namespace specpaxos
 
-#endif  /* _DYNA_REPLICA_H_ */
+#endif // _DYNA_REPLICA_H_

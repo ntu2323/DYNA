@@ -1,24 +1,18 @@
-DYNA commands:
+DYNA commands (DYNA lives in `protocols/src/ionia/dyna/`; see its `README.md` for unit tests):
 
 ### Build image
 ```bash
 docker build --platform linux/amd64 -f docker/Dockerfile.udp -t ionia-udp .
 ```
 
-### Fast path smoke
+### End-to-end smoke (3 replicas)
 ```bash
 SMOKE_PROTOCOL=dyna ./docker/docker-smoke.sh
 ```
 
-### Slow path debug logging
+### Request / reply / quorum debug logging
 ```bash
-SMOKE_PROTOCOL=dyna DYNA_SLOWPATH_DEBUG=1 ./docker/docker-smoke.sh
-```
-
-### Disk writing
-```
-SMOKE_PROTOCOL=dyna SMOKE_SHOW_LOGS=0 DYNA_WAL_DIR=/work/ionia/docker/smoke-output/wal ./docker/docker-smoke.sh
-
+SMOKE_PROTOCOL=dyna DYNA_DEBUG=1 ./docker/docker-smoke.sh
 ```
 
 Changes made so far:
@@ -49,15 +43,15 @@ DYNA happy path (same image build as above; bench uses `-m dyna`):
 SMOKE_PROTOCOL=dyna ./docker/docker-smoke.sh
 ```
 
-The wrapper defaults **`LOW_MEMORY=1`** for VR (single-replica trace). **DYNA cannot use that mode**: commits require follower **`SyncAck`**s, so the smoke script **automatically forces `LOW_MEMORY=0`** when **`SMOKE_PROTOCOL=dyna`**.
+The wrapper defaults **`LOW_MEMORY=1`** for VR (single-replica trace). **DYNA cannot use that mode**: commits require an f+1 replica quorum, so the smoke script **automatically forces `LOW_MEMORY=0`** when **`SMOKE_PROTOCOL=dyna`**.
 For DYNA smoke, the script also forces **`IONIA_DB_MODE=memory`** to avoid stale shared SplinterDB mount state across local container runs.
 DYNA smoke also points bench-client `-c` at the replica config (`sample/config`) so client traffic targets active replica ports.
 The Docker wrapper now forwards `DYNA_*` environment variables into the container, so debug/bound overrides work as expected.
 
-Slow-path debug logging (natural `deadline_us <= deadlineCounter` only; no forced slow path):
+Request / reply / quorum debug logging:
 
 ```bash
-SMOKE_PROTOCOL=dyna DYNA_SLOWPATH_DEBUG=1 ./docker/docker-smoke.sh
+SMOKE_PROTOCOL=dyna DYNA_DEBUG=1 ./docker/docker-smoke.sh
 ```
 
 Inside an interactive container (`docker run ... ionia-udp`), run `SMOKE_PROTOCOL=dyna ./docker/run_udp_smoke.sh`.

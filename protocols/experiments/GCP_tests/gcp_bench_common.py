@@ -22,12 +22,6 @@ PKILL_REPLICA = (
 PKILL_CLIENT = "pkill -f '[b]ench/client' 2>/dev/null || true"
 PGREP_CLIENT = "pgrep -f '[b]ench/client' >/dev/null"
 
-# DYNA WAL paths (see remote/setup_dyna.sh, run_cluster_bench.py --wal-tmpfs).
-DYNA_WAL_DIR_DISK = "$HOME/bench/wal"
-DYNA_WAL_DIR_TMPFS = "/dev/shm/dyna-wal"
-DYNA_WAL_DIR = DYNA_WAL_DIR_DISK
-
-
 def remote_sender_cleanup_cmd() -> str:
     """Stop clients and remove prior run artifacts (logs, latencies) on a sender VM."""
     # Avoid bare glob (fails when runs/ is empty). Do not combine with pkill on one ssh -c
@@ -41,8 +35,6 @@ def remote_sender_cleanup_cmd() -> str:
 def remote_receiver_cleanup_cmd(
     protocol: str,
     replica_idx: int,
-    *,
-    dyna_wal_dir: Optional[str] = None,
 ) -> str:
     """Stop replicas and wipe durable bench state for a clean run.
 
@@ -55,9 +47,7 @@ def remote_receiver_cleanup_cmd(
         # vr baseline (paxos) and ionia (ionia -m vr) both back AppReplica with the
         # rocks/in-mem KV under /dev/shm/rocks<idx>; wipe it for a clean run.
         parts.append(f"rm -rf /dev/shm/rocks{replica_idx}")
-    elif protocol == "dyna":
-        wal = dyna_wal_dir or DYNA_WAL_DIR_DISK
-        parts.append(f"rm -rf {wal}")
+    # dyna keeps all state in memory (InMemoryBackend); nothing on disk to wipe.
     return "; ".join(parts)
 
 

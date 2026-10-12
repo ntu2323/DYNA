@@ -11,7 +11,7 @@ so the knee is visible.
 
 Example:
   python3 plot_sweep.py \
-    dyna_new=results/sweep_dyna_new_<id>/sweep.csv \
+    dyna=results/sweep_dyna_<id>/sweep.csv \
     ionia=results/sweep_ionia_<id>/sweep.csv \
     vr=results/sweep_vr_<id>/sweep.csv \
     --out results/latency_throughput.png

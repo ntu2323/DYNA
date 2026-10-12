@@ -54,7 +54,7 @@ def _row_from_summary(summary: dict, offered: float, threads: int, run_dir: str)
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sweep client threads and aggregate throughput/latency.")
-    ap.add_argument("--protocol", choices=["vr", "dyna", "dyna_new", "ionia"], required=True)
+    ap.add_argument("--protocol", choices=["vr", "dyna", "ionia"], required=True)
     ap.add_argument("--hosts-file", default=os.path.join(_SCRIPT_DIR, "cluster_hosts.json"))
     ap.add_argument("--threads", type=int, nargs="+", default=[1, 2, 4, 8])
     ap.add_argument("-n", "--num-ops", type=int, default=0, help="0 = unlimited (open-loop default).")
@@ -73,16 +73,6 @@ def main() -> None:
         "--no-clean-remote",
         action="store_true",
         help="Pass through to run_cluster_bench.py (default wipes remote state each run).",
-    )
-    ap.add_argument(
-        "--wal-tmpfs",
-        action="store_true",
-        help="Pass through to run_cluster_bench.py (DYNA WAL on tmpfs).",
-    )
-    ap.add_argument(
-        "--no-eager-fast-reply",
-        action="store_true",
-        help="Pass through to run_cluster_bench.py (disable eager fast-reply).",
     )
     ap.add_argument("--offered-ops-per-sec", type=float, default=0.0)
     ap.add_argument(
@@ -164,10 +154,6 @@ def main() -> None:
             run_cmd.append("--closed-loop")
         if args.poisson_rate != 60:
             run_cmd.extend(["--poisson-rate", str(args.poisson_rate)])
-        if args.wal_tmpfs:
-            run_cmd.append("--wal-tmpfs")
-        if args.no_eager_fast_reply:
-            run_cmd.append("--no-eager-fast-reply")
         if point_offered > 0.0:
             run_cmd.extend(["--offered-ops-per-sec", str(point_offered)])
         if point_inflight > 0:

@@ -23,8 +23,6 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from gcp_bench_common import (
-    DYNA_WAL_DIR_DISK,
-    DYNA_WAL_DIR_TMPFS,
     PKILL_CLIENT,
     PKILL_REPLICA,
     fetch_remote_file,
@@ -51,14 +49,6 @@ PROTOCOLS = {
     },
     "dyna": {
         "replica_start": "~/bench/start_dyna_replica.sh {idx}",
-        "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
-        "client_bin": "./bench/client",
-    },
-    # dyna_new = the rewritten DYNA (bench/replica -m dyna_new). Same ionia binary,
-    # config (dynaconfig) and trace (trace.micro, 1000 keys) as dyna; only the -m
-    # flag, a smaller env set, and no WAL/SplinterDB (InMemoryBackend) differ.
-    "dyna_new": {
-        "replica_start": "~/bench/start_dyna_new_replica.sh {idx}",
         "client_cwd": "${HOME}/Ionia/protocols/src/ionia",
         "client_bin": "./bench/client",
     },
@@ -213,7 +203,7 @@ def _build_client_cmd(
             if max_inflight > 0:
                 args.extend(["-F", str(max_inflight)])
     else:
-        # dyna and dyna_new: identical arg layout, single dynaconfig, shared trace.
+        # dyna: single dynaconfig (client and replica), shared trace.
         args = [
             "-s", "$HOME/bench/dynaconfig",
             "-c", "$HOME/bench/dynaconfig",
@@ -238,43 +228,35 @@ def _build_client_cmd(
     quoted = " ".join(_bash_word(a) for a in args)
     dyna_env = ""
     if protocol == "dyna":
-        dyna_env = (
-            "export DYNA_CLIENT_STATS=${DYNA_CLIENT_STATS:-1}; "
-            "export DYNA_CLIENT_STATS_LOG_EVERY=${DYNA_CLIENT_STATS_LOG_EVERY:-10000}; "
-            "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
-        )
-    elif protocol == "dyna_new":
-        # dyna_new ignores DYNA_CLIENT_STATS (not implemented). It reads the shared
-        # deadline vars (deadline.h) plus its own retransmission timeout (spec §5).
+        # The client reads the deadline vars (dyna/deadline.h) plus its resend timeout.
         # BENCH_INFLIGHT_LOG surfaces inflight/submitted on throughput lines.
         # Bound knobs pass through from the LOCAL environment (they're evaluated in
         # the remote shell otherwise, which never sees the local export). Lets you
         # A/B the deadline hold: e.g. DYNA_MAX_OWD_US=40 python3 run_cluster_bench.py …
         # The deadline-hold bound is the dominant client-visible latency term. It is
-        # sized to the real one-way delay: measured OWD on this CloudLab cluster is
+        # sized to the real one-way delay: measured OWD on the CloudLab cluster is
         # ~40µs, so DYNA_MAX_OWD_US=40 caps the (noisy, sometimes-inflated) OWD
-        # estimate at the true wire delay — this removed ~30µs of spurious deadline
-        # hold (290→147µs) with slow-path ≈ 0 and 100% completion. These are
-        # cluster-calibrated defaults, not a temporary experiment; on a slower network
-        # raise them (bound ≈ p50 one-way delay). Override via the local env.
+        # estimate at the true wire delay. These are cluster-calibrated defaults; on a
+        # slower network raise them (bound ≈ p50 one-way delay). Override via local env.
         _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "30")
         _max_owd = os.environ.get("DYNA_MAX_OWD_US", "40")
         # Client transport mode, baked from the LOCAL env (a remote ${VAR:-1} would not
         # see the local export). Default 1 = busy-poll (lowest single-thread latency).
-        # Set DYNA_NEW_BUSY_POLL=0 to make the CLIENT epoll-block: many client threads
+        # Set DYNA_BUSY_POLL=0 to make the CLIENT epoll-block: many client threads
         # (-j N) then PARK when idle instead of each spinning a core, so multi-thread
         # load scales without CPU / NIC-RX-softirq starvation (which collapses busy-poll
         # at high -j). This affects clients only; replicas keep their own default.
-        _client_busy = os.environ.get("DYNA_NEW_BUSY_POLL", "1")
+        _client_busy = os.environ.get("DYNA_BUSY_POLL", "1")
         dyna_env = (
             f"export DYNA_INITIAL_BOUND_US={_init_bound}; "
             f"export DYNA_MAX_OWD_US={_max_owd}; "
-            f"export DYNA_NEW_BUSY_POLL={_client_busy}; "
-            "export DYNA_NEW_RESEND_TIMEOUT_MS=${DYNA_NEW_RESEND_TIMEOUT_MS:-30}; "
-            "export DYNA_NEW_CLIENT_STATS=${DYNA_NEW_CLIENT_STATS:-1}; "
-            "export DYNA_NEW_CLIENT_STATS_LOG_EVERY=${DYNA_NEW_CLIENT_STATS_LOG_EVERY:-2000}; "
+            f"export DYNA_BUSY_POLL={_client_busy}; "
+            "export DYNA_RESEND_TIMEOUT_MS=${DYNA_RESEND_TIMEOUT_MS:-30}; "
             "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
         )
+        # Slow-path trigger (all leaders replied, quorum short): forward if set locally.
+        if "DYNA_SLOW_TIMEOUT_US" in os.environ:
+            dyna_env += f"export DYNA_SLOW_TIMEOUT_US={shlex.quote(os.environ['DYNA_SLOW_TIMEOUT_US'])}; "
     ionia_env = ""
     if protocol == "ionia" and ionia_fast_quorum:
         ionia_env = "export IONIA_FAST_QUORUM=1; "
@@ -294,19 +276,28 @@ def _build_client_cmd(
     )
 
 
-def _dyna_replica_env_prefix(*, wal_tmpfs: bool, eager_fast_reply: bool) -> str:
-    parts: List[str] = []
-    if wal_tmpfs:
-        parts.append(f"mkdir -p {DYNA_WAL_DIR_TMPFS}")
-        parts.append(f"export DYNA_WAL_DIR={DYNA_WAL_DIR_TMPFS}")
-    parts.append(f"export DYNA_EAGER_FAST_REPLY={'1' if eager_fast_reply else '0'}")
-    # dyna_new replica per-second stats (release fast/slow, heal resync/refetch,
-    # backlog gauges) — opt-in via the LOCAL env (baked in here; a remote ${VAR:-0}
-    # would not see the local export). Set DYNA_NEW_STATS=1 to watch the saturation
-    # knee (slow-path / §7 backlog) during a throughput sweep.
-    _dyna_new_stats = os.environ.get("DYNA_NEW_STATS", "0")
-    parts.append(f"export DYNA_NEW_STATS={_dyna_new_stats}")
-    return "; ".join(parts) + "; "
+# Replica-side DYNA knobs forwarded from the LOCAL env when set (a remote ${VAR:-…}
+# would not see the local export); unset knobs fall back to start_dyna_replica.sh.
+_DYNA_REPLICA_ENV_KNOBS = (
+    "DYNA_INITIAL_BOUND_US",
+    "DYNA_MAX_OWD_US",
+    "DYNA_OWD_PERCENTILE",
+    "DYNA_OWD_WINDOW_LEN",
+    "DYNA_BUSY_POLL",
+    "DYNA_TS_SCAN_MS",
+    "DYNA_TS_TIMEOUT_MS",
+    "DYNA_SIM_DISK_LATENCY_US",
+    "DYNA_DEBUG",
+)
+
+
+def _dyna_replica_env_prefix() -> str:
+    parts = [
+        f"export {k}={shlex.quote(os.environ[k])}"
+        for k in _DYNA_REPLICA_ENV_KNOBS
+        if k in os.environ
+    ]
+    return "; ".join(parts) + "; " if parts else ""
 
 
 def _ionia_replica_env_prefix(
@@ -335,8 +326,6 @@ def _start_replica(
     ssh_key: Optional[str],
     *,
     clean_remote: bool,
-    wal_tmpfs: bool,
-    eager_fast_reply: bool,
     ionia_durability_threads: int,
     ionia_per_thread_socket: bool = False,
     ionia_leader_stats: bool = False,
@@ -344,24 +333,14 @@ def _start_replica(
 ) -> tuple[str, bool, str]:
     idx = receiver_index(role)
     cfg = PROTOCOLS[protocol]
-    dyna_wal_dir = DYNA_WAL_DIR_TMPFS if wal_tmpfs else DYNA_WAL_DIR_DISK
     parts = []
     if clean_remote:
-        parts.append(
-            remote_receiver_cleanup_cmd(
-                protocol,
-                idx,
-                dyna_wal_dir=dyna_wal_dir if protocol == "dyna" else None,
-            )
-        )
+        parts.append(remote_receiver_cleanup_cmd(protocol, idx))
     else:
         parts.extend([PKILL_REPLICA, "sleep 1"])
     replica_start = cfg["replica_start"].format(idx=idx)
     if protocol == "dyna":
-        parts.append(
-            _dyna_replica_env_prefix(wal_tmpfs=wal_tmpfs, eager_fast_reply=eager_fast_reply)
-            + replica_start
-        )
+        parts.append(_dyna_replica_env_prefix() + replica_start)
     elif protocol == "ionia":
         # Force the consensus batch size (bench/replica -b) in the remote helper.
         # Matches both the legacy literal (`-b 1`) and the env form (`-b "${BATCH_SIZE}"`),
@@ -633,17 +612,7 @@ def main() -> None:
     ap.add_argument(
         "--no-clean-remote",
         action="store_true",
-        help="Do not wipe remote bench state (default: pkill, rm runs/*, VR rocks, DYNA WAL).",
-    )
-    ap.add_argument(
-        "--wal-tmpfs",
-        action="store_true",
-        help="DYNA only: WAL on /dev/shm/dyna-wal (isolates fsync/disk from latency; for triage).",
-    )
-    ap.add_argument(
-        "--no-eager-fast-reply",
-        action="store_true",
-        help="DYNA only: Nezha-style deadline hold (default is eager fast-reply on admit).",
+        help="Do not wipe remote bench state (default: pkill, rm runs/*, VR rocks).",
     )
     ap.add_argument("--skip-replicas", action="store_true")
     ap.add_argument("--skip-clients", action="store_true", help="Only (re)start replicas.")
@@ -651,8 +620,6 @@ def main() -> None:
 
     if not args.ssh_user:
         sys.exit("Set --ssh-user or SSH_USER")
-    if args.wal_tmpfs and args.protocol != "dyna":
-        sys.exit("--wal-tmpfs applies only to --protocol dyna")
     if args.ionia_fast_quorum and args.protocol != "ionia":
         sys.exit("--ionia-fast-quorum applies only to --protocol ionia")
     if args.ionia_per_thread_socket and args.protocol != "ionia":
@@ -699,7 +666,6 @@ def main() -> None:
 
     ssh_key = args.ssh_key or None
     clean_remote = not args.no_clean_remote
-    eager_fast_reply = not args.no_eager_fast_reply
     open_loop = not args.closed_loop
     if open_loop:
         num_ops = args.num_ops
@@ -753,11 +719,6 @@ def main() -> None:
         "interval_ms": args.interval_ms,
         "trim_pad_sec": args.trim_pad_sec,
         "clean_remote": clean_remote,
-        "wal_tmpfs": args.wal_tmpfs if args.protocol == "dyna" else None,
-        "dyna_wal_dir": (DYNA_WAL_DIR_TMPFS if args.wal_tmpfs else DYNA_WAL_DIR_DISK)
-        if args.protocol == "dyna"
-        else None,
-        "eager_fast_reply": eager_fast_reply if args.protocol == "dyna" else None,
         "threads": args.threads,
         "ionia_durability_threads": (
             args.ionia_durability_threads if args.protocol == "ionia" else None
@@ -794,12 +755,6 @@ def main() -> None:
     if not args.skip_replicas:
         if clean_remote:
             print(f"Cleaning remote replica state ({args.protocol})...")
-        if args.protocol == "dyna":
-            if args.wal_tmpfs:
-                print(f"DYNA WAL: {DYNA_WAL_DIR_TMPFS} (--wal-tmpfs)")
-            print(
-                f"DYNA eager fast-reply: {'on' if eager_fast_reply else 'off (Nezha hold)'}"
-            )
         if args.protocol == "ionia":
             print(
                 f"IONIA durability threads per replica: -j {args.ionia_durability_threads}"
@@ -840,8 +795,6 @@ def main() -> None:
                     args.ssh_user,
                     ssh_key,
                     clean_remote=clean_remote,
-                    wal_tmpfs=args.wal_tmpfs,
-                    eager_fast_reply=eager_fast_reply,
                     ionia_durability_threads=args.ionia_durability_threads,
                     ionia_per_thread_socket=args.ionia_per_thread_socket,
                     ionia_leader_stats=args.ionia_leader_stats,

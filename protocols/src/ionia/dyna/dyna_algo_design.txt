@@ -1,0 +1,154 @@
+Given:
+
+2f+1 servers, the whole key range is divided into (2f+1) partitions. Each server is a Partition Leader, and meanwhile it serves as the follower for the other 2f partitions.
+
+
+Server State:
+- Early-Buffer: Implemented as a priority queue 
+- Later-Buffer: Implemented as a hash map
+- SpecLog: Implemented as a priority queue
+
+
+
+
+Write Path
+
+Given a txn T with write keyset  wSet
+
+Client multicasts T to all servers
+
+When T arrives at server S:
+- If T arrives before T.t, then it is accepted into S’s Early-Buffer
+- Else: 
+-- if S is a Partition Leader for any key in T.wSet, then S update T.t with its current timestamp 
+-- Else: S only serves as follower, S put T into its Late-Buffer
+
+For every T in the Early-Buffer,  S checks its clock time, when the local clock time passes T.t, S will release T, mark T.status=Speculative,  and appends to SpecLog, and sends replies according to the timestamp order, reply includes <viewId, clientID, requestID, timestamp, …> 
+
+
+Client collects replies.
+- (Fast Path) If Client receives (1) replies from the Partition Leaders of every involved partition corresponding to wSet, and (2) at least f+1 replies from every involved partition (3) all these replies in (1) and (2) have consistent views and timestamps, then Client considers this request as committed.
+In this case, the application running atop the Client can move on, but servers still do not know whether T is committed. Therefore, asynchronously Client multicasts a Fast-Commit message including the commonly-agreed timestamp to all servers.  
+Here we use the name Fast-Commit to distinguish from the Slow-Commit message described later. When server receives Fast-Commit, they do not need to send reply to client any more. 
+
+- If Client cannot satisfy (1) replies from the Partition Leaders of every involved partition corresponding to wSet, then it means either client multicast request is dropped or the leader’s reply is dropped, because if there is no drop, then the client should get a reply from the Partition Leader (Partition Leader will not throw T into late buffer even if it comes later). 
+If Client cannot satisfy (1), it triggers timeout and Client retries the request with the same timestamp. Each server will also resend the reply if they have previously replied to the same request (We maintain a memory-based hashMap separate from early and late buffers for each received txnIds and the sent replies: it can grow unboundly as we have more and more txns, but we can do an optimization: we save each txnId and their timestamps in the hashMap, and we set a threshold Tthresh, if a txn’s timestamp + Tthresh < current clock time, then we think this txn is too old, then we can safely delete it from the hashmap, later when a retry request comes, the server can just ignore it. It affects liveness but not safety )
+
+(Slow Path) If Client satisfies (1), but Partition Leaders have inconsistent timestamps or could not get sufficient replica responses, then Client aggregates timestamps by picking the Max among them as agreed timestamp, and multicast Slow-Commit message including the commonly-agreed timestamp to all servers. 
+In this case,  the application running atop the Client can move on, because it is not sure whether the txn is committed. It must wait until it receives enough Commit-Reply messages that satisfy the (1) (2) (3) conditions as Fast Path.
+
+
+When S receives Commit Messages (i.e., Fast-Commit or Slow-Commit), it first checks its SpecLog, if the SpecLog does not contain this txn T, then it continues to check its late-buffer, if late-buffer does not contain T, then it fetches it from the other servers via 1 RPC, then put T into its SpecLog.
+- If S receives Fast-Commit, it finds T in its SpecLog and modifies its timestamp to be the same timestamp carried by Fast-Commit, and mark T.status=Commiting
+- If  S receives Slow-Commit, it executes the same operation as receiving Fast-Commit, but after that, S also sends Commit-Reply <viewId, clientID, requestID, timestamp, …> , because the client is still waiting for quorum check
+
+
+
+Background Ordering
+
+Each Partition Leader checks its SpecLog, the txns in SpecLog have one of two status: Speculative or Committing
+- (Speculative → Commiting) If T.status = Speculative, then that means the Fast-Commit/Slow-Commit message does not come or has been dropped
+If T remains Speculative for sufficiently long time (i.e., a timeout), then the involved Partition Leaders multicast T.t to the other involved Partition Leaders to do timestamp agreement. After that, the involved Partition Leader takes the max as the commonly-agreed timestamp, and mark T.status= Committing
+
+- (Committing → Committed) If T.status = Committing, then that means T already uses the commonly-agreed timestamp, but the Partition Leader is still unsure whether T has been sufficiently replicated to a majority with its commonly agreed timestamp.
+Partition Leader multicast Replicate-Prepare messages to all the other servers, and collects Replicate-PrepareReply, after it collects at least f PrepareReplies from the other replicas, it marks T.status=Committed. 
+After the Partition Leader marks T.status=Committed, it also multicast Replicate-Commit to all the other servers, so that the other servers will also mark T.status=Committed.
+
+
+Following the workflow above, every txn will finally become Committed, 
+There are 1 or multiple disk write threads to execute these txns in batched manner: 
+If T.status = Committed, we need to check whether T’s dependent txns have all become Committed: 
+
+T’s dependent txns are those txns with smaller timestamp but has conflict (read-write conflict or write-write conflict or write-read conflict) with T or T’s dependent txns
+
+If T and T’s dependent txns have all become Committed, then the disk-write threads will execute these write txns in batches and write them to disk. After writing to disk, these txns are removed from S’s memory.
+
+
+Read Path
+
+Given a txn T with read keyset  rSet
+
+Client multicasts T to all servers
+
+When T arrives at server S:
+- If T arrives before T.t, then it is accepted into S’s Early-Buffer
+- Else: 
+-- if S is a Partition Leader for any key in T.rSet, then S update T.t with its current timestamp 
+-- Else: S only serves as follower, S does not need to put it in either Early-Buffer or Late-Buffer
+
+For every T in the Early-Buffer,  S checks its clock time, when the local clock time passes T.t, S will release T, 
+
+- If S is a Partition Leader for any key in T.rset, after T is released, T will wait until all its dependent txns have become Committed and executed to disk, then T will execute disk-read to get results. After S sends replies for T, then T is erased from S’s memory. 
+- Else: S only serves as follower for T.rset, then after T is released, S immediately sends a Reply to client, including <viewId, clientID, requestID, timestamp, …> 
+
+Client collects replies.
+- (Fast Path) If Client receives (1) replies from the Partition Leaders of every involved partition corresponding to rSet, and (2) at least f+1 replies from every involved partition (3) all these replies in (1) and (2) have consistent views and timestamps, then Client considers this request as committed and get the read results from the Partition Leader’s replies.
+- After a timeout, if Client cannot get sufficient replies to satisfy (1)(2)(3), maybe due to message drop, maybe due to late arrival. No matter what anomaly happens, Client retries T with a larger timestamp. Every time T’s timestamp will be current timestamp + one-way delay.  Every retry will use larger one-way delay value.  As Client continues retry, finally it will come to a case that the read-only txn arrives at sufficient number of replicas on time, so that Client can get the valid read results.
+
+Limitation: This design is simpler to understand, but theoretically, it leads to infinite number of retries for read-only txns.  But assuming clocks are well synchronized and one-way-delay are properly measured, read-only txns should also be able to be completed in 1-WAN-RTT.
+
+
+
+Read-Modify-Write (RMW) Path
+
+
+
+Given a txn T with read keyset  rSet,  and write keyset wSet
+
+
+After we implement Write Path and Read Path, we actually already become sufficiently strong to compare with IONIA, because IONIA does not support RMW, and it claims RMW can be transformed into blind writes (last paragraph in Section 2.1). But if we can support it, then that will be an additional stronger point to outperform IONIA.
+
+
+TODO: Supporting RMW is possible but needs some thinking, we can first focus on Read Path and Write Path. 
+
+ 
+
+Advantages over IONIA (Memo)
+
+
+Smaller quorum: f+1, and each txn has its own leader. IONIA requires a super quorum and each includes the same leader. In WAN, if the leader replica is 200ms from the client, then the commit latency is at least 200ms, even if the other replicas are all 50ms from the client.  Besides, a super quorum also prolongs the latency. Given 5 replicas, Dyna’s latency is roughly the 3rd lowest replica-to-client latency but IONIA will be the 4th lowest replica-to-client latency. This is also an advantage over Nezha/Tiga. 
+
+More Scalable Throughput. IONIA is single-leader serving all read, although IONIA claims the meta query is cheap memory operations. If we consider from the network perspective, that can still become a bottleneck compared with Dyna. Dyna can use a thrifty design: every txn is not immediately multicast to all replicas, instead, we only multicast to f+1 replicas, and only multicast to more replicas after timeout.
+
+If IONIA’s leader fails, then not any write/read can be served. But Dyna should still be able to serve the other partitions if a Partition Leader fails. 
+Even if the main leader fails, the client might not know that. There should be a dynamic configuration protocol implemented in Dyna. 
+
+Network partition correctness 
+
+
+
+
+Recovery 
+
+
+Dyna is decomposed into two layers: 
+
+- It used disk-based viewstamp replication protocol (VR), which keeps silent in most cases and do not participate into request processing. 
+- During request processing, it uses the protocol we described above.
+
+When any replica fails (remember each replica is a Partition Leader, any replica failure might cause the service unavailability for a partition of keys):
+
+- If the failed replica is the VR-Leader, then Dyna first follows VR to elect the new VR-leader. Then the new VR-leader will handle the Partition Leader failure
+- Consistent Hashing + Virtual Node 
+https://www.hellointerview.com/learn/system-design/core-concepts/consistent-hashing 
+
+Based on the consistent hashing approach, each remaining server knows its managed range in the new view.
+The remaining servers will split the range of the failed partition and each undertakes part of that. 
+
+Suppose a remaining Partition  Leader PL, its newly assigned partition is delta-p
+Each remaining Partition Leader contacts the other remaining servers, requesting for the key-values belonging to delta-p. 
+
+PL maintains an in-memory buffer M,
+
+After PL contacts f+1 servers (including itself), it will 
+(1) Pick the key-values whose timestamp <= sync-point, and put these key-values in M
+(2) Pick the key-values whose timestamp > sync-point but  exist in at least ceiling(f/2)+1 with the same timestamp, and put these key-values in M. 
+ 
+PL broadcast M to all the other servers. This broadcast request is Recovery-Prepare
+ The other servers, after receiving M, send a reply to PL. This reply is Recovery-PrepareReply
+After collecting f+1 Recovery-PrepareReply,  PL report to VR-Leader
+After VR-Leader receives reports from every remaining server, it broadcasts StartView to every server, then every server dump the outstanding M buffers to disk and enters the normal view again.  
+
+https://github.com/imdea-software/swiftpaxos 
+
+

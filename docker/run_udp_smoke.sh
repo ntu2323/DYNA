@@ -8,19 +8,17 @@ OUT_DIR="${IONIA_SMOKE_OUT:-/work/ionia/docker/smoke-output}"
 LOW_MEMORY="${LOW_MEMORY:-0}"
 SMOKE_SHOW_LOGS="${SMOKE_SHOW_LOGS:-1}"
 SMOKE_TAIL_LINES="${SMOKE_TAIL_LINES:-40}"
-# vr | dyna | dyna_new | dyna_multi (same bench binaries; default keeps historical behavior)
+# vr | dyna (same bench binaries; default keeps historical behavior)
 SMOKE_PROTOCOL="${SMOKE_PROTOCOL:-vr}"
-# VR/IONIA only: durability threads (-j on bench/replica). dyna family always uses 1.
+# VR/IONIA only: durability threads (-j on bench/replica). dyna always uses 1.
 SMOKE_DURABILITY_THREADS="${SMOKE_DURABILITY_THREADS:-1}"
 
-# dyna, dyna_new and dyna_multi share the same deadline/quorum requirements for the smoke.
-IS_DYNA_FAMILY=0
-if [[ "${SMOKE_PROTOCOL}" == "dyna" || "${SMOKE_PROTOCOL}" == "dyna_new" || \
-      "${SMOKE_PROTOCOL}" == "dyna_multi" ]]; then
-    IS_DYNA_FAMILY=1
+IS_DYNA=0
+if [[ "${SMOKE_PROTOCOL}" == "dyna" ]]; then
+    IS_DYNA=1
 fi
 
-if [[ "${IS_DYNA_FAMILY}" == "1" && "${SMOKE_DURABILITY_THREADS}" != "1" ]]; then
+if [[ "${IS_DYNA}" == "1" && "${SMOKE_DURABILITY_THREADS}" != "1" ]]; then
     echo "SMOKE_DURABILITY_THREADS ignored for ${SMOKE_PROTOCOL} (always -j 1)." >&2
 fi
 
@@ -38,26 +36,26 @@ fi
 
 # Docker wrapper defaults LOW_MEMORY=1 (single replica). DYNA commits via an f+1
 # replica quorum, so one replica never reaches commit → client times out. Force
-# multi-replica smoke for the dyna family.
-if [[ "${IS_DYNA_FAMILY}" == "1" && "${LOW_MEMORY}" == "1" ]]; then
+# multi-replica smoke for dyna.
+if [[ "${IS_DYNA}" == "1" && "${LOW_MEMORY}" == "1" ]]; then
     echo "SMOKE_PROTOCOL=${SMOKE_PROTOCOL}: overriding LOW_MEMORY=1 → 0 (needs replica quorum for commit)." >&2
     LOW_MEMORY=0
 fi
 
 # DYNA smoke in container should stay memory-backed: multiple local replicas can
 # otherwise collide with stale/shared on-disk state across runs.
-if [[ "${IS_DYNA_FAMILY}" == "1" ]]; then
+if [[ "${IS_DYNA}" == "1" ]]; then
     export IONIA_DB_MODE=memory
     export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-64}"
     export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-1}"
 fi
 
-# dyna_multi followers silently buffer LATE writes (spec: no endorsement), so the
+# dyna followers silently buffer LATE writes (spec: no endorsement), so the
 # client's f+1 commit needs on-time delivery at ≥ f+1 replicas. On a shared-CPU
 # container localhost delivery is ms-scale, so use a generous deadline (and park the
 # release loops rather than busy-poll, to avoid CPU starvation). All overridable.
-if [[ "${SMOKE_PROTOCOL}" == "dyna_multi" ]]; then
-    export DYNA_MULTI_BUSY_POLL="${DYNA_MULTI_BUSY_POLL:-0}"
+if [[ "${IS_DYNA}" == "1" ]]; then
+    export DYNA_BUSY_POLL="${DYNA_BUSY_POLL:-0}"
     export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-200000}"
     export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-500000}"
 fi
@@ -104,7 +102,7 @@ R user42847818606673772111
 EOF
 fi
 
-if [[ "${IS_DYNA_FAMILY}" == "1" ]]; then
+if [[ "${IS_DYNA}" == "1" ]]; then
     # bench/client currently uses -c as the transport peer config for protocol
     # clients (and does not consume -s). Point -c to active replica endpoints.
     CLIENT_CONFIG="${SERVER_CONFIG}"

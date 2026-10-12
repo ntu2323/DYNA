@@ -1,362 +1,303 @@
 // -*- mode: c++; c-file-style: "k&r"; c-basic-offset: 4 -*-
-
-//MAJOR TODOS: Baseline implementations. View change + failure recovery. Multi partition coordinator. 
-
+//
+// dyna/client.cc
 
 #include "dyna/client.h"
-#include "dyna/stats_util.h"
-#include "dyna/wall_clock.h"
 
-#include "lib/assert.h"
+#include "dyna/wall_clock.h"
 #include "lib/message.h"
 
-#include <algorithm>
-#include <atomic>
-#include <cstdlib>
-#include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
 
 namespace specpaxos {
 namespace dyna {
 
-namespace {
+namespace proto = specpaxos::dyna::proto;
 
-struct ClientRuntimeStats {
-    CounterWindow completions;
-    CounterWindow deadlineMismatchDrops;
-    CounterWindow epochResets;
-    std::atomic<uint64_t> maxPendingPeak{0};
-    LatencySampleBuffer totalUs;
-    LatencySampleBuffer firstReplyUs;
-    LatencySampleBuffer quorumWaitUs;
-
-    void notePendingSize(size_t count)
-    {
-        uint64_t value = static_cast<uint64_t>(count);
-        uint64_t cur = maxPendingPeak.load(std::memory_order_relaxed);
-        while (value > cur &&
-               !maxPendingPeak.compare_exchange_weak(cur, value, std::memory_order_relaxed)) {
-        }
-    }
-
-    uint64_t snapshotMaxPending()
-    {
-        return maxPendingPeak.exchange(0, std::memory_order_relaxed);
-    }
-};
-
-ClientRuntimeStats g_clientStats;
-
-} // namespace
-
-static bool
-SlowPathDebugEnabled()
-{
-    static const bool enabled = []() {
-        const char *v = std::getenv("DYNA_SLOWPATH_DEBUG");
-        return v && *v && std::strcmp(v, "0") != 0;
-    }();
-    return enabled;
-}
-
-DynaClient::DynaClient(const Configuration &config, Transport *transport, uint64_t clientid)
+DynaClient::DynaClient(const specpaxos::Configuration &config,
+                                 Transport *transport,
+                                 uint64_t clientid)
     : Client(config, transport, clientid),
-      lastReqId(0),
-      numPartitions(static_cast<uint32_t>(std::max(1, config.n))),
-      bound_tracker_(DeadlineConfig::FromEnvironment(), config.n),
-      clientStatsEnabled_(EnvFlagEnabled("DYNA_CLIENT_STATS")),
-      clientStatsLogEvery_(std::max<uint64_t>(1, EnvUint64OrDefault("DYNA_CLIENT_STATS_LOG_EVERY", 10000)))
+      topo_(static_cast<uint32_t>(std::max(1, config.n))),
+      write_quorum_(static_cast<size_t>(config.f + 1)),
+      resend_ms_(DeadlineConfig::EnvU64("DYNA_RESEND_TIMEOUT_MS", 30)),
+      slow_timeout_us_(DeadlineConfig::EnvU64("DYNA_SLOW_TIMEOUT_US", 2000)),
+      bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
+    if (resend_ms_ == 0) resend_ms_ = 1;
+    const char *dbg = std::getenv("DYNA_DEBUG");
+    debug_ = (dbg != nullptr && *dbg != '\0' && *dbg != '0');
+    // Sweep often enough to honor both the resend and the slow-path timeouts.
+    uint64_t sweep_ms = std::min<uint64_t>(resend_ms_ / 2, slow_timeout_us_ / 2000);
+    if (sweep_ms == 0) sweep_ms = 1;
+    resend_sweep_timer_ = std::make_unique<Timeout>(
+        transport, sweep_ms, [this]() { ResendSweep(); });
+    resend_sweep_timer_->Start();
 }
 
-DynaClient::~DynaClient()
+DynaClient::~DynaClient() {}
+
+uint64_t DynaClient::NowMicros() const { return WallClockMicros(); }
+
+bool DynaClient::IsReadCommand(const std::string &request) const
 {
-    if (clientStatsEnabled_) {
-        MaybeLogClientStats();
-    }
-}
-
-void
-DynaClient::Invoke(const string &request, continuation_t continuation)
-{
-    ++lastReqId;
-    const uint64_t requestId = lastReqId;
-    const uint64_t send_us = NowMicros();
-    const uint64_t deadline = ComputeDeadline(send_us);
-    const uint32_t partitionId = PartitionForRequest(request);
-
-    PendingRequest pending;
-    pending.request = request;
-    pending.isRead = IsReadCommand(request);
-    pending.partitionId = partitionId;
-    pending.requestId = requestId;
-    pending.sendUs = send_us;
-    pending.deadlineUs = deadline;
-    pending.activeDeadlineUs = deadline;
-    pending.continuation = std::move(continuation);
-
-    pendingRequests[requestId] = std::move(pending);
-    if (clientStatsEnabled_) {
-        g_clientStats.notePendingSize(pendingRequests.size());
-    }
-
-    proto::RequestMessage req;
-    req.set_partition_id(partitionId);
-    req.set_client_id(clientid);
-    req.set_request_id(requestId);
-    req.set_command(request);
-    req.set_send_time_us(send_us);
-    req.set_deadline_us(deadline);
-    req.set_is_read(IsReadCommand(request));
-
-    if (!transport->SendMessageToAll(this, req)) {
-        Warning("Failed to multicast DYNA request");
-    }
-}
-
-void
-DynaClient::InvokeUnlogged(int replicaIdx, const string &request, continuation_t continuation,
-                           timeout_continuation_t timeoutContinuation, uint32_t timeout)
-{
-    (void)replicaIdx;
-    (void)timeoutContinuation;
-    (void)timeout;
-    Invoke(request, std::move(continuation));
-}
-
-void
-DynaClient::ReceiveMessage(const TransportAddress &remote, const std::string_view type,
-                           const std::string_view data, void *meta_data)
-{
-    (void)remote;
-    (void)meta_data;
-    const static auto fastReplyName = proto::FastReply::default_instance().GetDescriptor()->full_name();
-    const static auto readResultName = proto::ReadResult::default_instance().GetDescriptor()->full_name();
-
-    if (type == fastReplyName) {
-        ALLOCATE_MESSAGE(proto::FastReply, reply);
-        reply->ParseFromArray(data.data(), data.length());
-        auto iter = pendingRequests.find(reply->request_id());
-        if (iter == pendingRequests.end()) {
-            return;
-        }
-        // TODO: consider making middle ware
-        
-        // reply should belong to same partition
-        PendingRequest &pending = iter->second;
-        if (reply->partition_id() != pending.partitionId) {
-            return;
-        }
-        if (reply->view_id() != 0) {
-            return;
-        }
-        if (reply->has_owd_us()) {
-            bound_tracker_.on_owd_sample(reply->replica_id(), reply->owd_us());
-        }
-        const uint32_t leaderId = PartitionLeaderFor(pending.partitionId);
-        const bool fromLeader = (reply->replica_id() == leaderId);
-        if (fromLeader && reply->deadline_us() != pending.activeDeadlineUs) {
-            const uint64_t oldDeadline = pending.activeDeadlineUs;
-            // Leader decides epoch for this request 
-            // when it shifts restart quorum + collection on the new deadline.
-            pending.activeDeadlineUs = reply->deadline_us();
-            pending.responders.clear();
-            pending.leaderAcked = false;
-            pending.readResultReceived = false;
-            pending.readResultData.clear();
-            if (clientStatsEnabled_) {
-                g_clientStats.epochResets.add();
-            }
-            if (SlowPathDebugEnabled()) {
-                Notice("DYNA slowpath client epoch switch req=%lu part=%u old_deadline=%lu new_deadline=%lu",
-                       pending.requestId,
-                       pending.partitionId,
-                       oldDeadline,
-                       pending.activeDeadlineUs);
-            }
-        }
-        if (reply->deadline_us() != pending.activeDeadlineUs) {
-            if (clientStatsEnabled_) {
-                g_clientStats.deadlineMismatchDrops.add();
-            }
-            return;
-        }
-        if (clientStatsEnabled_ && pending.firstReplyUs == 0) {
-            pending.firstReplyUs = NowMicros();
-        }
-        pending.responders.insert(reply->replica_id());
-        if (fromLeader) {
-            pending.leaderAcked = true;
-        }
-        TryComplete(pending);
-    } else if (type == readResultName) {
-        ALLOCATE_MESSAGE(proto::ReadResult, result);
-        result->ParseFromArray(data.data(), data.length());
-        auto iter = pendingRequests.find(result->request_id());
-        if (iter == pendingRequests.end()) {
-            return;
-        }
-        PendingRequest &pending = iter->second;
-        if (result->partition_id() != pending.partitionId) {
-            return;
-        }
-        if (!pending.isRead) {
-            return;
-        }
-        if (result->deadline_us() != pending.activeDeadlineUs) {
-            if (clientStatsEnabled_) {
-                g_clientStats.deadlineMismatchDrops.add();
-            }
-            return;
-        }
-        if (result->has_owd_us()) {
-            bound_tracker_.on_owd_sample(PartitionLeaderFor(pending.partitionId), result->owd_us());
-        }
-        pending.readResultData = result->data();
-        pending.readResultReceived = true;
-        TryComplete(pending);
-    } else {
-        Client::ReceiveMessage(remote, type, data, meta_data);
-    }
-}
-
-uint64_t
-DynaClient::NowMicros() const
-{
-    return WallClockMicros();
-}
-
-uint64_t
-DynaClient::ComputeDeadline(uint64_t send_time_us) const
-{
-    return send_time_us + bound_tracker_.bound_us();
-}
-
-bool
-DynaClient::IsReadCommand(const std::string &request) const
-{
-    if (request.empty()) {
-        return false;
-    }
+    if (request.empty()) return false;
     const char op = request[0];
     return op == 'r' || op == 'R';
 }
 
-uint32_t
-DynaClient::PartitionForRequest(const std::string &request) const
+std::string DynaClient::KeyOf(const std::string &request) const
 {
-    if (request.size() < 25) {
-        return 0;
-    }
-    const std::string key = request.substr(1, 24);
-    return static_cast<uint32_t>(std::hash<std::string>()(key) % numPartitions);
+    if (request.size() < 25) return request;   // [op:1][key:24][value...]
+    return request.substr(1, 24);
 }
 
-uint32_t
-DynaClient::PartitionLeaderFor(uint32_t partitionId) const
+std::string DynaClient::ValueOf(const std::string &request) const
 {
-    return static_cast<uint32_t>(partitionId % static_cast<uint32_t>(config.n));
+    if (request.size() <= 25) return std::string();
+    return request.substr(25);
 }
 
-void
-DynaClient::RecordClientCompletion(const PendingRequest &pending)
+void DynaClient::Invoke(const string &request, continuation_t continuation)
 {
-    const uint64_t completeUs = NowMicros();
-    if (pending.sendUs > 0 && completeUs > pending.sendUs) {
-        g_clientStats.totalUs.record(completeUs - pending.sendUs);
+    ++last_req_id_;
+    const uint64_t request_id = last_req_id_;
+
+    const std::string key = KeyOf(request);
+    const bool is_read = IsReadCommand(request);
+    const std::string value = ValueOf(request);
+
+    // Compute involved leaders from the (single-key) transaction. Multi-key txns would
+    // simply produce a larger involved-leader set — the quorum logic is identical.
+    proto::Txn probe;
+    probe.set_client_id(clientid);
+    probe.set_request_id(request_id);
+    probe.set_type(is_read ? proto::READ : proto::WRITE);
+    if (is_read) probe.add_r_set(key);
+    else { proto::KV *kv = probe.add_w_set(); kv->set_key(key); kv->set_value(value); }
+    probe.set_t(0);
+    probe.set_view_id(viewId_);
+    std::set<uint32_t> leaders = topo_.involvedLeaders(probe);
+
+    PendingRequest p;
+    p.request = request;
+    p.request_id = request_id;
+    p.type = is_read ? proto::READ : proto::WRITE;
+    p.key = key;
+    p.value = value;
+    p.phase = Phase::COLLECTING;
+    p.owd = bound_tracker_.bound_us();   // READ deadline seed (grows on retry)
+    p.quorum = TxnQuorum(std::move(leaders), write_quorum_);
+    p.continuation = std::move(continuation);
+    pending_.emplace(request_id, std::move(p));
+
+    SendRequestProto(request_id);
+}
+
+void DynaClient::SendRequestProto(uint64_t request_id)
+{
+    auto it = pending_.find(request_id);
+    if (it == pending_.end()) return;
+    PendingRequest &p = it->second;
+
+    const uint64_t now = NowMicros();
+    if (p.type == proto::READ) {
+        // Reads retry with a LARGER timestamp (spec § read path): a fresh, growing
+        // deadline each send so a retry can arrive on-time at more replicas.
+        if (p.owd == 0) p.owd = bound_tracker_.bound_us();
+        p.currentT = now + p.owd;
+    } else {
+        // Writes retry with the SAME timestamp: fix currentT on the first send.
+        if (p.currentT == 0) p.currentT = now + bound_tracker_.bound_us();
     }
-    if (pending.firstReplyUs > 0 && pending.firstReplyUs > pending.sendUs) {
-        g_clientStats.firstReplyUs.record(pending.firstReplyUs - pending.sendUs);
-        if (completeUs > pending.firstReplyUs) {
-            g_clientStats.quorumWaitUs.record(completeUs - pending.firstReplyUs);
+    p.send_us = now;
+
+    proto::ClientRequest req;
+    proto::Txn *txn = req.mutable_txn();
+    txn->set_client_id(clientid);
+    txn->set_request_id(request_id);
+    txn->set_type(p.type);
+    if (p.type == proto::READ) txn->add_r_set(p.key);
+    else { proto::KV *kv = txn->add_w_set(); kv->set_key(p.key); kv->set_value(p.value); }
+    txn->set_t(p.currentT);
+    txn->set_view_id(viewId_);
+    txn->set_send_time(now);
+
+    if (!transport->SendMessageToAll(this, req)) {
+        Warning("dyna: failed to multicast ClientRequest");
+    }
+}
+
+uint64_t DynaClient::SlowTimeoutUs() const
+{
+    // Leave room for the followers' replies (~ hold + return one-way delay) before
+    // deciding they're late; the env value is a floor for low-latency networks.
+    return std::max<uint64_t>(slow_timeout_us_, 3 * bound_tracker_.bound_us());
+}
+
+void DynaClient::SendSlowCommit(PendingRequest &p)
+{
+    proto::SlowCommit sc;
+    sc.set_client_id(clientid);
+    sc.set_request_id(p.request_id);
+    sc.set_view_id(viewId_);
+    sc.set_agreed_t(p.quorum.slow_agreed_t());
+    transport->SendMessageToAll(this, sc);
+    p.phase = Phase::SLOW_WAIT;
+    p.send_us = NowMicros();
+}
+
+void DynaClient::ResendSweep()
+{
+    const uint64_t now = NowMicros();
+    const uint64_t resend_us = resend_ms_ * 1000;
+    const uint64_t slow_us = SlowTimeoutUs();
+    std::vector<uint64_t> slow, resend;
+    for (auto &kv : pending_) {
+        const PendingRequest &p = kv.second;
+        const uint64_t age = (now > p.send_us) ? now - p.send_us : 0;
+        if (p.type == proto::WRITE && p.phase == Phase::COLLECTING &&
+            p.quorum.all_leaders_present() && !p.quorum.fast_ready() && age >= slow_us) {
+            // Every leader replied but not enough matching replies arrived (followers
+            // late or replies lost) → slow path (design doc: "could not get sufficient
+            // replica responses"). Late followers adopt from their lateBuffer and
+            // answer with CommitReply.
+            slow.push_back(kv.first);
+        } else if (age >= resend_us) {
+            resend.push_back(kv.first);
         }
     }
-    g_clientStats.completions.add();
+    for (uint64_t id : slow) {
+        auto it = pending_.find(id);
+        if (it != pending_.end()) SendSlowCommit(it->second);
+    }
+    for (uint64_t id : resend) {
+        auto it = pending_.find(id);
+        if (it == pending_.end()) continue;
+        if (it->second.phase == Phase::SLOW_WAIT) {
+            SendSlowCommit(it->second);   // re-drive the slow path
+        } else if (it->second.type == proto::READ) {
+            RetryRead(id);                // new attempt at a larger t
+        } else {
+            SendRequestProto(id);         // write: same t (leader reply missing)
+        }
+    }
+    if (resend_sweep_timer_) resend_sweep_timer_->Reset();
 }
 
-void
-DynaClient::MaybeLogClientStats()
+uint64_t DynaClient::RetryRead(uint64_t request_id)
 {
-    const uint64_t completions = g_clientStats.completions.snapshotAndReset();
-    if (completions == 0) {
-        return;
-    }
-    const uint64_t mismatch = g_clientStats.deadlineMismatchDrops.snapshotAndReset();
-    const uint64_t epochs = g_clientStats.epochResets.snapshotAndReset();
-    const uint64_t maxPending = g_clientStats.snapshotMaxPending();
-    const auto totalSnap = g_clientStats.totalUs.snapshotAndClear();
-    const auto firstSnap = g_clientStats.firstReplyUs.snapshotAndClear();
-    const auto quorumSnap = g_clientStats.quorumWaitUs.snapshotAndClear();
+    auto it = pending_.find(request_id);
+    if (it == pending_.end()) return 0;
+    PendingRequest p = std::move(it->second);
+    pending_.erase(it);
 
-    Notice("DYNA client stats client=%lu completions=%lu pending_max=%lu "
-           "deadline_mismatch=%lu epoch_resets=%lu bound_us=%lu",
-           static_cast<unsigned long>(clientid),
-           static_cast<unsigned long>(completions),
-           static_cast<unsigned long>(maxPending),
-           static_cast<unsigned long>(mismatch),
-           static_cast<unsigned long>(epochs),
-           static_cast<unsigned long>(bound_tracker_.bound_us()));
-
-    if (totalSnap.count > 0) {
-        Notice("DYNA client stats client=%lu total_us samples=%lu avg=%lu p50=%lu p99=%lu max=%lu",
-               static_cast<unsigned long>(clientid),
-               static_cast<unsigned long>(totalSnap.count),
-               static_cast<unsigned long>(totalSnap.avg_us),
-               static_cast<unsigned long>(totalSnap.p50_us),
-               static_cast<unsigned long>(totalSnap.p99_us),
-               static_cast<unsigned long>(totalSnap.max_us));
-    }
-    if (firstSnap.count > 0) {
-        Notice("DYNA client stats client=%lu first_reply_us samples=%lu avg=%lu p50=%lu p99=%lu max=%lu",
-               static_cast<unsigned long>(clientid),
-               static_cast<unsigned long>(firstSnap.count),
-               static_cast<unsigned long>(firstSnap.avg_us),
-               static_cast<unsigned long>(firstSnap.p50_us),
-               static_cast<unsigned long>(firstSnap.p99_us),
-               static_cast<unsigned long>(firstSnap.max_us));
-    }
-    if (quorumSnap.count > 0) {
-        Notice("DYNA client stats client=%lu quorum_wait_us samples=%lu avg=%lu p50=%lu p99=%lu max=%lu",
-               static_cast<unsigned long>(clientid),
-               static_cast<unsigned long>(quorumSnap.count),
-               static_cast<unsigned long>(quorumSnap.avg_us),
-               static_cast<unsigned long>(quorumSnap.p50_us),
-               static_cast<unsigned long>(quorumSnap.p99_us),
-               static_cast<unsigned long>(quorumSnap.max_us));
-    }
+    const uint64_t new_id = ++last_req_id_;
+    GrowReadOwd(p);
+    p.request_id = new_id;
+    p.quorum = TxnQuorum(p.quorum.involved_leaders(), write_quorum_);
+    p.results.clear();
+    pending_.emplace(new_id, std::move(p));
+    SendRequestProto(new_id);
+    return new_id;
 }
 
-void
-DynaClient::TryComplete(PendingRequest &pending)
+void DynaClient::Commit(std::unordered_map<uint64_t, PendingRequest>::iterator it,
+                            const std::string &result)
 {
-    const size_t quorum = static_cast<size_t>(config.f + 1);
-    if (!pending.leaderAcked || pending.responders.size() < quorum) {
-        return;
-    }
+    continuation_t cont = std::move(it->second.continuation);
+    pending_.erase(it);
+    cont(std::string(), result);
+}
 
-    if (!pending.isRead) {
-        if (clientStatsEnabled_) {
-            RecordClientCompletion(pending);
-            if (g_clientStats.completions.load() % clientStatsLogEvery_ == 0) {
-                MaybeLogClientStats();
+void DynaClient::GrowReadOwd(PendingRequest &p)
+{
+    const uint64_t base = p.owd ? p.owd : bound_tracker_.bound_us();
+    p.owd = std::min<uint64_t>(base * 2, 10000000);   // double, cap 10s
+}
+
+void DynaClient::InvokeUnlogged(int, const string &request,
+                                     continuation_t continuation,
+                                     timeout_continuation_t, uint32_t)
+{
+    Invoke(request, std::move(continuation));
+}
+
+void DynaClient::ReceiveMessage(const TransportAddress &remote,
+                                     const std::string_view type,
+                                     const std::string_view data,
+                                     void *meta_data)
+{
+    const static auto specName =
+        proto::SpecReply::default_instance().GetDescriptor()->full_name();
+    const static auto commitReplyName =
+        proto::CommitReply::default_instance().GetDescriptor()->full_name();
+
+    if (type == specName) {
+        proto::SpecReply r;
+        if (!r.ParseFromArray(data.data(), data.size())) return;
+        auto it = pending_.find(r.request_id());
+        if (it == pending_.end()) return;
+        PendingRequest &p = it->second;
+
+        bound_tracker_.on_owd_sample(r.server_id(), r.owd_estimate());
+        p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader());
+        // READ: merge the disk-read values from each involved leader's reply.
+        if (p.type == proto::READ && r.is_leader()) {
+            for (const auto &kv : r.results()) p.results[kv.key()] = kv.value();
+        }
+        if (debug_) {
+            Notice("client RECV SpecReply s=%u r=%lu t=%lu leader=%d replies=%zu "
+                   "leaders_present=%d fast=%d disagree=%d", r.server_id(),
+                   (unsigned long)r.request_id(), (unsigned long)r.t(), r.is_leader() ? 1 : 0,
+                   p.quorum.reply_count(), p.quorum.all_leaders_present() ? 1 : 0,
+                   p.quorum.fast_ready() ? 1 : 0, p.quorum.leaders_disagree() ? 1 : 0);
+        }
+
+        if (p.phase == Phase::COLLECTING) {
+            if (p.quorum.fast_ready()) {
+                if (p.type == proto::WRITE) {
+                    // Writes: durability handshake so servers learn of the commit.
+                    proto::FastCommit fc;
+                    fc.set_client_id(clientid);
+                    fc.set_request_id(p.request_id);
+                    fc.set_view_id(viewId_);
+                    fc.set_agreed_t(p.quorum.agreed_t());
+                    transport->SendMessageToAll(this, fc);
+                    Commit(it, std::string());
+                } else {
+                    // Reads aren't logged/committed on servers: just return the value
+                    // read from the involved leaders (no FastCommit).
+                    auto rit = p.results.find(p.key);
+                    Commit(it, rit != p.results.end() ? rit->second : std::string());
+                }
+            } else if (p.type == proto::WRITE && p.quorum.leaders_disagree()) {
+                SendSlowCommit(p);
             }
+            // Otherwise wait for more replies; the sweep forces the slow path (writes)
+            // or retries at a larger t (reads) on timeout.
+        } else if (p.quorum.fast_ready()) {
+            // SLOW_WAIT: a straggling SpecReply already at agreedT completes the quorum
+            // just like a CommitReply would.
+            Commit(it, std::string());
         }
-        pending.continuation("", "");
-        pendingRequests.erase(pending.requestId);
         return;
     }
 
-    if (!pending.readResultReceived) {
+    if (type == commitReplyName) {
+        proto::CommitReply r;
+        if (!r.ParseFromArray(data.data(), data.size())) return;
+        auto it = pending_.find(r.request_id());
+        if (it == pending_.end()) return;
+        PendingRequest &p = it->second;
+        p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader());
+        if (p.quorum.fast_ready()) Commit(it, std::string());   // write quorum re-formed
         return;
     }
 
-    if (clientStatsEnabled_) {
-        RecordClientCompletion(pending);
-        if (g_clientStats.completions.load() % clientStatsLogEvery_ == 0) {
-            MaybeLogClientStats();
-        }
-    }
-    pending.continuation("", pending.readResultData);
-    pendingRequests.erase(pending.requestId);
+    Client::ReceiveMessage(remote, type, data, meta_data);
 }
 
 } // namespace dyna

@@ -38,8 +38,6 @@
 #include "lib/configuration.h"
 #include "lib/cpu_affinity.h"
 #include "dyna/client.h"
-#include "dyna_new/client.h"
-#include "dyna_multi/client.h"
 #include "vr/client.h"
 
 #include <unistd.h>
@@ -53,7 +51,7 @@ Usage(const char *progName)
         fprintf(stderr,
                 "usage: %s [-n max-requests] [-t client-id] [-w warmup-secs] [-l latency-file] "
                 "[-q dscp] [-d delay-ms] [-O] [-R poisson-rate] [-G offered-ops-per-sec] "
-                "[-F max-inflight] -c conf-file -m {vr|dyna|dyna_new|dyna_multi}\n"
+                "[-F max-inflight] -c conf-file -m {vr|dyna}\n"
                 "  default: closed-loop (next request after each completion)\n"
                 "  -O -R <rate>: open-loop Poisson, rate = mean requests per 10ms (~rate*100 ops/s)\n"
                 "  -O -G <ops/s>: open-loop Poisson with target offered ops/s (WAN-friendly)\n"
@@ -92,9 +90,7 @@ int main(int argc, char **argv)
     {
         PROTO_UNKNOWN,
         PROTO_VR,
-        PROTO_DYNA,
-        PROTO_DYNA_NEW,
-        PROTO_DYNA_MULTI
+        PROTO_DYNA
     } proto = PROTO_UNKNOWN;
 
     string latencyFile;
@@ -166,10 +162,6 @@ int main(int argc, char **argv)
                 proto = PROTO_VR;
             } else if (strcasecmp(optarg, "dyna") == 0) {
                 proto = PROTO_DYNA;
-            } else if (strcasecmp(optarg, "dyna_new") == 0) {
-                proto = PROTO_DYNA_NEW;
-            } else if (strcasecmp(optarg, "dyna_multi") == 0) {
-                proto = PROTO_DYNA_MULTI;
             } else {
                 fprintf(stderr, "unknown mode '%s'\n", optarg);
                 Usage(argv[0]);
@@ -377,15 +369,11 @@ int main(int argc, char **argv)
         const size_t num_socket_cores = std::max<std::size_t>(1, CpuCountOnNumaNode(numa_node));
         auto ht_ct = std::max<std::size_t>(1, std::min(num_socket_cores, static_cast<std::size_t>(numRequests)));
 
-        // dyna_new busy-polls too (matches the replica) for low-latency pickup;
-        // DYNA_NEW_BUSY_POLL=0 disables for A/B comparison.
+        // dyna busy-polls too (matches the replica) for low-latency pickup;
+        // DYNA_BUSY_POLL=0 disables (epoll) for A/B comparison.
         bool ionia_multithread = (proto == PROTO_VR);
-        if (proto == PROTO_DYNA_NEW) {
-            const char *bp = std::getenv("DYNA_NEW_BUSY_POLL");
-            ionia_multithread = (bp == nullptr) || (*bp != '0');
-        }
-        if (proto == PROTO_DYNA_MULTI) {
-            const char *bp = std::getenv("DYNA_MULTI_BUSY_POLL");
+        if (proto == PROTO_DYNA) {
+            const char *bp = std::getenv("DYNA_BUSY_POLL");
             ionia_multithread = (bp == nullptr) || (*bp != '0');
         }
         FastTransport transport(config, ht_ct, 1, physical_port, numa_node, thread_id,
@@ -411,12 +399,6 @@ int main(int argc, char **argv)
                 break;
             case PROTO_DYNA:
                 client = new specpaxos::dyna::DynaClient(config, &transport, client_id);
-                break;
-            case PROTO_DYNA_NEW:
-                client = new specpaxos::dyna_new::DynaNewClient(config, &transport, client_id);
-                break;
-            case PROTO_DYNA_MULTI:
-                client = new specpaxos::dyna_multi::DynaMultiClient(config, &transport, client_id);
                 break;
 
             default:
