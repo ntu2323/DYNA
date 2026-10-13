@@ -47,7 +47,14 @@ def remote_receiver_cleanup_cmd(
         # vr baseline (paxos) and ionia (ionia -m vr) both back AppReplica with the
         # rocks/in-mem KV under /dev/shm/rocks<idx>; wipe it for a clean run.
         parts.append(f"rm -rf /dev/shm/rocks{replica_idx}")
-    # dyna keeps all state in memory (InMemoryBackend); nothing on disk to wipe.
+    elif protocol == "dyna":
+        # DYNA's store is the harness SplinterDB file in the replica's working dir;
+        # remove it so each run starts empty (the replica then creates a fresh one).
+        parts.append("rm -f $HOME/Ionia/protocols/src/ionia/splinterdb.db")
+        # ...and its persisted VR state: a leftover dyna-vr-<idx>.state makes a replica
+        # start as a REJOINER (it believes it crashed) instead of in a fresh view 0.
+        parts.append("rm -f $HOME/Ionia/protocols/src/ionia/dyna-vr-*.state "
+                     "$HOME/Ionia/protocols/src/ionia/dyna-vr-*.state.tmp")
     return "; ".join(parts)
 
 

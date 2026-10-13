@@ -88,3 +88,18 @@ TEST(TxnQuorum, StaleFollowerReplyStopsMatching)
     q.AddReply(2, 0, 150, false);             // follower re-reports agreedT
     EXPECT_TRUE(q.fast_ready());              // now 3 at t=150
 }
+
+// A client in view 1 must not count replies from view 2: there the keys may be led by a
+// different server, so two view-2 followers would look like "leader + follower" under the
+// client's view-1 leader set and fake a fast commit.
+TEST(TxnQuorum, RepliesFromAnotherViewIgnored)
+{
+    TxnQuorum q({0}, /*quorum=*/2, /*view=*/1);
+    EXPECT_FALSE(q.AddReply(0, /*view=*/2, 100, false));
+    EXPECT_FALSE(q.AddReply(1, 2, 100, false));
+    EXPECT_FALSE(q.fast_ready());
+    EXPECT_EQ(q.reply_count(), 0u);
+    EXPECT_TRUE(q.AddReply(0, 1, 100, true));
+    EXPECT_TRUE(q.AddReply(1, 1, 100, false));
+    EXPECT_TRUE(q.fast_ready());
+}

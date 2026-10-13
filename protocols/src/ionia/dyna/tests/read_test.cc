@@ -83,7 +83,7 @@ TEST(Read, LeaderReadReturnsCommittedValueAfterWriteExecutes)
     o.ReleaseDue();
     o.MarkCommitted(MakeTxnId(1, 1));
     o.ExecuteReady();
-    ASSERT_EQ(backend.mem_read("K").value_or(""), "v1");
+    ASSERT_EQ(backend.value_or_empty("K"), "v1");
     c.replies.clear();   // drop the write's own reply
 
     // Read K: released (leader read) but NOT replied until the executor services it.

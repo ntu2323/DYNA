@@ -29,15 +29,22 @@ namespace dyna {
 class TxnQuorum {
 public:
     TxnQuorum() = default;
-    TxnQuorum(std::set<uint32_t> involved_leaders, size_t quorum)
-        : involved_leaders_(std::move(involved_leaders)), quorum_(quorum) {}
+    // `view`: the client's view, whose topology produced `involved_leaders`. Replies from
+    // any other view are ignored: a server in a newer view may no longer lead (or may now
+    // lead) these keys, so its reply can't be judged against this leader set — counting
+    // it once let a client in an old view "fast-commit" on two followers of the new view.
+    TxnQuorum(std::set<uint32_t> involved_leaders, size_t quorum, uint64_t view = 0)
+        : involved_leaders_(std::move(involved_leaders)), quorum_(quorum), view_(view) {}
 
     // Record (the latest) reply from a server. SpecReply and CommitReply both feed
     // here; the latest per server overwrites the earlier (so an adopted agreedT
-    // supersedes the original speculative t).
-    void AddReply(uint32_t server_id, uint64_t view_id, uint64_t t, bool is_leader) {
+    // supersedes the original speculative t). Returns false (ignored) if the reply is
+    // from another view.
+    bool AddReply(uint32_t server_id, uint64_t view_id, uint64_t t, bool is_leader) {
+        if (view_id != view_) return false;
         replies_[server_id] = Entry{view_id, t};
         if (is_leader) involved_leaders_.insert(server_id);  // defensive
+        return true;
     }
 
     // Every involved leader has replied.
@@ -108,6 +115,7 @@ private:
 
     std::set<uint32_t>          involved_leaders_;
     size_t                      quorum_ = 1;
+    uint64_t                    view_ = 0;
     std::map<uint32_t, Entry>   replies_;
 };
 

@@ -297,6 +297,9 @@ public:
 	db->Init();
     }
 
+    // The harness key-value store, for protocols that manage their own execution (DYNA).
+    DB *GetDB() { return db.get(); }
+
     void UnRegisterDurabilityThread() {
         db->Close();
     }

@@ -4,8 +4,8 @@
 //   Stage 6 acceptance tests for dependency-gated batched disk execution (spec §3.7):
 //   a COMMITTED write executes and is applied + GC'd; a w-w conflict executes in
 //   OrderKey order (larger blocked until the smaller commits); a non-conflicting txn
-//   executes even while an unrelated smaller txn is un-committed; and disk persistence
-//   is asynchronous (mem visible immediately) — invariant 2.
+//   executes even while an unrelated smaller txn is un-committed; and an applied write
+//   is readable immediately and stored with its commit timestamp.
 
 #include "dyna/in_memory_backend.h"
 #include "dyna/server_orderer.h"
@@ -65,7 +65,7 @@ TEST(Exec, CommittedWriteExecutesAndApplies)
     std::vector<TxnId> done = o.ExecuteReady();
     ASSERT_EQ(done.size(), 1u);
     EXPECT_EQ(done[0], id);
-    EXPECT_EQ(backend.mem_read("k").value_or(""), "v1");
+    EXPECT_EQ(backend.value_or_empty("k"), "v1");
     EXPECT_EQ(o.speclog_size(), 0u);            // GC'd from memory
     EXPECT_FALSE(o.speclog_contains(id));
 }
@@ -83,7 +83,7 @@ TEST(Exec, WWConflictExecutesInOrderKeyOrder)
     // Only the larger is COMMITTED → blocked by the un-committed smaller conflicting one.
     o.MarkCommitted(t2);
     EXPECT_TRUE(o.ExecuteReady().empty());
-    EXPECT_FALSE(backend.mem_read("K").has_value());
+    EXPECT_FALSE(backend.read("K").has_value());
 
     // Commit the smaller → both execute in OrderKey order; final value is the larger's.
     o.MarkCommitted(t1);
@@ -91,7 +91,7 @@ TEST(Exec, WWConflictExecutesInOrderKeyOrder)
     ASSERT_EQ(done.size(), 2u);
     EXPECT_EQ(done[0], t1);
     EXPECT_EQ(done[1], t2);
-    EXPECT_EQ(backend.mem_read("K").value_or(""), "b");
+    EXPECT_EQ(backend.value_or_empty("K"), "b");
     EXPECT_EQ(o.speclog_size(), 0u);
 }
 
@@ -109,13 +109,13 @@ TEST(Exec, NonConflictingExecutesDespiteUncommittedSmaller)
     std::vector<TxnId> done = o.ExecuteReady();
     ASSERT_EQ(done.size(), 1u);
     EXPECT_EQ(done[0], big);
-    EXPECT_EQ(backend.mem_read("B").value_or(""), "y");
-    EXPECT_FALSE(backend.mem_read("A").has_value());   // smaller not executed
+    EXPECT_EQ(backend.value_or_empty("B"), "y");
+    EXPECT_FALSE(backend.read("A").has_value());   // smaller not executed
     EXPECT_TRUE(o.speclog_contains(small));            // still buffered
     EXPECT_FALSE(o.speclog_contains(big));             // executed + GC'd
 }
 
-TEST(Exec, DiskPersistIsAsyncMemImmediate)
+TEST(Exec, AppliedWithCommitTimestamp)
 {
     InMemoryBackend backend;
     MockClock clk(50);
@@ -126,7 +126,10 @@ TEST(Exec, DiskPersistIsAsyncMemImmediate)
     o.MarkCommitted(id);
     ASSERT_EQ(o.ExecuteReady().size(), 1u);
 
-    // Memory is authoritative and visible immediately; disk write was enqueued (async).
-    EXPECT_EQ(backend.mem_read("k").value_or(""), "v");
-    EXPECT_EQ(backend.disk_persist_count(), 1u);
+    // Applied once, readable immediately, stored with its (agreed) commit timestamp.
+    auto v = backend.read("k");
+    ASSERT_TRUE(v.has_value());
+    EXPECT_EQ(v->value, "v");
+    EXPECT_EQ(v->t, 100u);
+    EXPECT_EQ(backend.apply_count(), 1u);
 }

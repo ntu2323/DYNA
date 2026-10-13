@@ -49,6 +49,7 @@ Background Ordering
 Each Partition Leader checks its SpecLog, the txns in SpecLog have one of two status: Speculative or Committing
 - (Speculative → Commiting) If T.status = Speculative, then that means the Fast-Commit/Slow-Commit message does not come or has been dropped
 If T remains Speculative for sufficiently long time (i.e., a timeout), then the involved Partition Leaders multicast T.t to the other involved Partition Leaders to do timestamp agreement. After that, the involved Partition Leader takes the max as the commonly-agreed timestamp, and mark T.status= Committing
+It should also send a commit reply to the client in case it is waiting for a quorum check. 
 
 - (Committing → Committed) If T.status = Committing, then that means T already uses the commonly-agreed timestamp, but the Partition Leader is still unsure whether T has been sufficiently replicated to a majority with its commonly agreed timestamp.
 Partition Leader multicast Replicate-Prepare messages to all the other servers, and collects Replicate-PrepareReply, after it collects at least f PrepareReplies from the other replicas, it marks T.status=Committed. 
@@ -141,13 +142,28 @@ Each remaining Partition Leader contacts the other remaining servers, requesting
 PL maintains an in-memory buffer M,
 
 After PL contacts f+1 servers (including itself), it will 
-(1) Pick the key-values whose timestamp <= sync-point, and put these key-values in M
-(2) Pick the key-values whose timestamp > sync-point but  exist in at least ceiling(f/2)+1 with the same timestamp, and put these key-values in M. 
+(1) Pick any key-values are "speculative", "commiting" or "committed" and put these key-values in M while keeping their respective titles
  
 PL broadcast M to all the other servers. This broadcast request is Recovery-Prepare
  The other servers, after receiving M, send a reply to PL. This reply is Recovery-PrepareReply
 After collecting f+1 Recovery-PrepareReply,  PL report to VR-Leader
 After VR-Leader receives reports from every remaining server, it broadcasts StartView to every server, then every server dump the outstanding M buffers to disk and enters the normal view again.  
+
+For all the new "comitting" and "commited" requests nothing needs to be done. But for the new "speculative" requests for
+which our replica is now the leader, we need to ensure they can be commited. So we identify a couple possible cases.
+
+1: The client just sent this txn and is waiting on reply. 
+2: The client thinks this is fast commited and sent a fast commit msg that was dropped.
+3: The client thinks this is slow commited and sent a slow commit msg that was dropped. 
+
+(If the client succesfully sends the fast or slow commit message to all replicas after recovery then we have no issues)
+
+So we need to be able to handle these 3 cases correctly. We do this using the leader sync functionality. Typicaly, 
+if a replica is a leader for some txn and does recieve a commit message after a certain amount of time it leader syncs. 
+(If the txn is single leader then that leader's txn info is the truth) after syncing we commit reply to the client in case
+it was waiting for that. Then the txn is set to "commiting" and continues as normal. 
+
+
 
 https://github.com/imdea-software/swiftpaxos 
 

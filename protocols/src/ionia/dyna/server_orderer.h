@@ -15,6 +15,7 @@
 #define _DYNA_SERVER_ORDERER_H_
 
 #include "dyna/indexed_min_pq.h"
+#include "dyna/recovery.h"
 #include "dyna/storage_backend.h"
 #include "dyna/topology.h"
 #include "dyna/txn_types.h"
@@ -25,7 +26,9 @@
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 namespace specpaxos {
@@ -150,7 +153,7 @@ public:
     // --- dependency-gated batched execution (spec §3.7) ---
     // Stateless conflict-based pass over an OrderKey-sorted specLog snapshot: apply any
     // COMMITTED write with no smaller un-executed conflicting txn (r-w/w-w/w-r) to the
-    // backend (mem_apply + async disk_persist) and GC it from specLog. Returns the
+    // backend (apply, with its commit t) and GC it from specLog. Returns the
     // TxnIds executed this pass. No-op if no backend was provided. Serialized: concurrent
     // callers (executor thread, tests) never interleave applies.
     std::vector<TxnId> ExecuteReady();
@@ -167,6 +170,58 @@ public:
     void Start();
     void Stop();
 
+    // --- views + recovery (design doc § Recovery) ---
+    // Pause/resume the release loop (normal processing is paused during a view change;
+    // entries due meanwhile release on resume).
+    void SetPaused(bool paused);
+
+    // A survivor's contribution to a PL's buffer M: every SPECULATIVE / COMMITTING /
+    // COMMITTED write txn in specLog touching a key in delta-p (`in_delta`), plus every
+    // executed key-value in delta-p with its commit t (read from the store on the
+    // executor thread).
+    RecoveryData CollectRecovery(const std::function<bool(const std::string &)> &in_delta);
+
+    // StartView: switch to the new view's topology (recomputing leadership of every held
+    // entry) and install the Ms buffered from each PL:
+    //   - key-values are applied to the store iff newer than what it holds (t-guard), and
+    //     remembered so a later, older execution of the same key can't overwrite them;
+    //   - txns are adopted with their M status and t (never downgrading a local copy),
+    //     materialized from the body if absent; executed txns are skipped.
+    // Entries held here but absent from every M are KEPT (user decision); `leftovers`
+    // counts the uncommitted ones in the failed range (they block execution of those keys
+    // until their client resends in the new view).
+    struct InstallStats {
+        size_t txns_installed = 0;
+        size_t kvs_applied = 0;
+        size_t leftovers = 0;
+    };
+    InstallStats InstallView(const Topology &topo, uint64_t view_id,
+                             const std::vector<RecoveryData> &ms,
+                             const std::function<bool(const std::string &)> &in_failed_range);
+
+    // Live (t, leadership) of a txn held in specLog or already executed — used to answer
+    // a client's resend with current state rather than a cached reply. False if neither.
+    bool LiveState(const TxnId &id, uint64_t *t, bool *is_leader);
+
+    // --- rejoin ---
+    // Drop all ordering state (buffers, specLog, executed_) — a server left out of a view
+    // rejoins from scratch. The store is kept: catch-up applies newer values t-guarded.
+    void Reset();
+    // Donor side of catch-up: every key this server has applied (sorted, so a joiner can
+    // page through it by offset), and the stored (value, t) of keys[offset, offset+count).
+    std::vector<std::string> SnapshotKeys();
+    std::vector<RecoveredKV> SnapshotRead(const std::vector<std::string> &keys,
+                                          size_t offset, size_t count);
+    // COMMITTING / COMMITTED write txns not yet executed (the snapshot's last chunk).
+    std::vector<RecoveredTxn> CommittedTxns();
+    // Joiner side: install a snapshot chunk (key-values t-guarded, txns as in InstallView).
+    // Returns the number of key-values applied.
+    size_t InstallSnapshot(const RecoveryData &d);
+
+    // Run `fn` on the thread that owns the store (the executor thread when running, else
+    // inline), serialized with ExecuteReady; blocks until it has run.
+    void RunOnStoreThread(const std::function<void()> &fn);
+
     // --- inspection (locked snapshots) ---
     OrderKey highest_released_t();
     size_t   early_size();
@@ -176,6 +231,11 @@ public:
     // Test helper: status + live t of a specLog entry (false if absent).
     bool     speclog_entry(const TxnId &id, Status *status, uint64_t *t);
     bool     executed(const TxnId &id);
+    size_t   executed_count();
+    uint64_t view_id();
+    Topology topology();
+    // Debug: the smallest-OrderKey specLog entry (what blocks execution), or "".
+    std::string DebugOldestEntry();
 
 private:
     void ReleaseLoop();
@@ -194,6 +254,12 @@ private:
     bool IsPrimaryLeaderLocked(const proto::Txn &txn) const;
     // Requires mu_. Move/materialize the txn into specLog at agreedT as COMMITTING.
     void InstallCommittingLocked(const TxnId &id, uint64_t agreedT, const proto::Txn &body);
+    // Requires mu_. Adopt one M txn (status precedence, never downgrade). Returns true if
+    // it changed local state; sets *kick if it became COMMITTED here.
+    bool InstallRecoveredLocked(const RecoveredTxn &r, uint64_t now, bool *kick);
+    // Requires exec_run_mu_ (store thread). Apply key-values iff newer than the store's
+    // (t-guard) and remember their t in recovered_t_. Returns the number applied.
+    size_t ApplyKVsGuardedLocked(const std::vector<RecoveredKV> &kvs);
 
     uint32_t        server_id_;
     uint64_t        view_id_;
@@ -217,6 +283,7 @@ private:
 
     std::thread       release_thread_;
     std::atomic<bool> running_{false};
+    std::atomic<bool> paused_{false};
 
     // Executor thread (event-driven ExecuteReady) + serialization of ExecuteReady.
     std::mutex              exec_run_mu_;
@@ -224,6 +291,15 @@ private:
     std::condition_variable exec_cv_;
     bool                    exec_pending_ = false;
     std::thread             exec_thread_;
+    std::vector<std::function<void()>> exec_jobs_;   // RunOnStoreThread (under exec_mu_)
+
+    // Store-side recovery state, guarded by exec_run_mu_ (only the store thread touches
+    // the store). written_keys_: every key this server has applied (the store offers no
+    // usable scan, so recovery enumerates delta-p keys from here; bounded by the key
+    // space, not by history). recovered_t_: per key, the t of a value installed from an
+    // M; an older committed write executed later must not overwrite it.
+    std::unordered_set<std::string> written_keys_;
+    HashMap<std::string, uint64_t>  recovered_t_;
 };
 
 } // namespace dyna

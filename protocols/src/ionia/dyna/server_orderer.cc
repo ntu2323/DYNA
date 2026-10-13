@@ -35,11 +35,10 @@ void ServerOrderer::ComputeLeadership(TxnEntry &e) const
 {
     e.led_keys.clear();
     for (const auto &k : e.txn.r_set()) {
-        if (topo_.leaderOf(topo_.partitionOf(k)) == server_id_) e.led_keys.insert(k);
+        if (topo_.ownerOf(k) == server_id_) e.led_keys.insert(k);
     }
     for (const auto &kv : e.txn.w_set()) {
-        if (topo_.leaderOf(topo_.partitionOf(kv.key())) == server_id_)
-            e.led_keys.insert(kv.key());
+        if (topo_.ownerOf(kv.key()) == server_id_) e.led_keys.insert(kv.key());
     }
     e.is_leader_for_this = !e.led_keys.empty();
 }
@@ -56,11 +55,44 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
     {
         std::lock_guard<std::mutex> lk(mu_);
         // A delayed / retried request for a txn we already executed and GC'd must not
-        // be re-admitted (it would be re-applied on top of newer writes).
-        if (executed_.find(key) != executed_.end()) return;
+        // be re-admitted (it would be re-applied on top of newer writes) — but a WRITE
+        // resend is answered with its final t: its client may still be collecting a
+        // quorum (e.g. this server missed the original while paused for a view change
+        // and the txn committed via leader sync), and silence would stall it.
+        auto xit = executed_.find(key);
+        if (xit != executed_.end()) {
+            if (!is_read) {
+                entry.t = xit->second.t;
+                entry.status = Status::COMMITTED;
+                released.push_back(std::move(entry));
+            } else {
+                return;
+            }
+        }
+
+        // Already held (a resend the replica's dedup didn't catch, e.g. after a view
+        // change installed it from M): never hold two entries for one id. specLog →
+        // answer with the live entry; earlyBuffer → it will reply on release; lateBuffer
+        // → re-classify the fresh arrival (we may lead it now).
+        bool duplicate = (xit != executed_.end());
+        if (duplicate) {
+            // answered above
+        } else if (TxnEntry *cur = spec_log_.find(key)) {
+            if (!is_read) {
+                if (!cur->client_addr) cur->client_addr = entry.client_addr;
+                released.push_back(*cur);
+            }
+            duplicate = true;
+        } else if (early_buffer_.contains(key)) {
+            duplicate = true;
+        } else {
+            late_buffer_.erase(key);
+        }
 
         const uint64_t now = clock_->Now();
-        if (now <= entry.t) {
+        if (duplicate) {
+            // handled above
+        } else if (now <= entry.t) {
             // On-time (design doc: arrives before T.t) → earlyBuffer.
             early_buffer_.push(key, std::move(entry));
         } else if (entry.is_leader_for_this) {
@@ -480,23 +512,29 @@ std::vector<TxnId> ServerOrderer::ExecuteReady()
         for (const TxnId &id : to_erase) spec_log_.erase(id);
     }
 
-    // Run outside the ordering lock, in OrderKey order. mem_apply is authoritative
-    // (visible immediately); disk_persist is async / off the critical path (invariant 2).
+    // Run outside the ordering lock, in OrderKey order. Each write is applied to the
+    // store with its commit timestamp; it is readable immediately. This is after commit,
+    // so it never sits on the commit path (invariant 2), and there is no fsync: a
+    // committed txn already lives on f+1 replicas.
     for (TxnEntry &e : to_run) {
         if (e.txn.type() == proto::WRITE) {
             for (const auto &kv : e.txn.w_set()) {
-                if (backend_) {
-                    backend_->mem_apply(kv.key(), kv.value());
-                    backend_->disk_persist(kv.key(), kv.value());
+                if (!backend_) continue;
+                // A value installed by recovery may be newer than this (leftover) write.
+                if (!recovered_t_.empty()) {
+                    auto rit = recovered_t_.find(kv.key());
+                    if (rit != recovered_t_.end() && e.t < rit->second) continue;
                 }
+                backend_->apply(kv.key(), kv.value(), e.t);
+                written_keys_.insert(kv.key());
             }
         } else {
-            // Leader READ: disk-read the keys THIS server leads; the client merges
-            // results across involved leaders (spec § read path).
+            // Leader READ: read the keys THIS server leads; the client merges results
+            // across involved leaders (spec § read path).
             for (const auto &k : e.txn.r_set()) {
                 if (e.led_keys.count(k) && backend_) {
-                    auto v = backend_->mem_read(k);
-                    e.results[k] = v.value_or(std::string());
+                    auto v = backend_->read(k);
+                    e.results[k] = v ? v->value : std::string();
                 }
             }
             if (on_spec_reply_) on_spec_reply_(e);   // SpecReply carrying the read results
@@ -516,15 +554,25 @@ void ServerOrderer::KickExecutor()
 
 void ServerOrderer::ExecutorLoop()
 {
+    // The executor is the only thread that touches the store in a running replica
+    // (stores like SplinterDB require per-thread registration).
+    if (backend_) backend_->RegisterThread();
     while (true) {
+        std::vector<std::function<void()>> jobs;
         {
             std::unique_lock<std::mutex> lk(exec_mu_);
-            exec_cv_.wait(lk, [this] { return exec_pending_ || !running_.load(); });
-            if (!running_.load()) break;
+            exec_cv_.wait(lk, [this] {
+                return exec_pending_ || !exec_jobs_.empty() || !running_.load();
+            });
+            jobs.swap(exec_jobs_);
+            if (!running_.load() && jobs.empty()) break;
             exec_pending_ = false;   // coalesce: kicks during the pass trigger one more
         }
+        for (auto &job : jobs) job();   // RunOnStoreThread (each wrapper serializes)
+        if (!running_.load()) break;
         ExecuteReady();
     }
+    if (backend_) backend_->UnregisterThread();
 }
 
 size_t ServerOrderer::DrainDueLocked(std::vector<TxnEntry> &out, bool *kick)
@@ -592,8 +640,12 @@ void ServerOrderer::ReleaseLoop()
         uint64_t next;
         {
             std::lock_guard<std::mutex> lk(mu_);
-            DrainDueLocked(released, &kick);
-            next = NextDeadlineLocked();
+            if (paused_.load()) {
+                next = Clock::kNever;   // parked until SetPaused(false) interrupts us
+            } else {
+                DrainDueLocked(released, &kick);
+                next = NextDeadlineLocked();
+            }
         }
         for (const auto &e : released) {
             if (on_spec_reply_) on_spec_reply_(e);
@@ -623,6 +675,291 @@ void ServerOrderer::Stop()
     exec_cv_.notify_all();
     if (release_thread_.joinable()) release_thread_.join();
     if (exec_thread_.joinable()) exec_thread_.join();
+}
+
+void ServerOrderer::SetPaused(bool paused)
+{
+    paused_.store(paused);
+    clock_->Interrupt();   // resume: drain whatever came due meanwhile
+}
+
+void ServerOrderer::RunOnStoreThread(const std::function<void()> &fn)
+{
+    if (!running_.load() || !exec_thread_.joinable() ||
+        std::this_thread::get_id() == exec_thread_.get_id()) {
+        std::lock_guard<std::mutex> run_lk(exec_run_mu_);
+        fn();
+        return;
+    }
+    std::mutex done_mu;
+    std::condition_variable done_cv;
+    bool done = false;
+    {
+        std::lock_guard<std::mutex> lk(exec_mu_);
+        exec_jobs_.push_back([&]() {
+            {
+                std::lock_guard<std::mutex> run_lk(exec_run_mu_);
+                fn();
+            }
+            std::lock_guard<std::mutex> dl(done_mu);
+            done = true;
+            done_cv.notify_all();
+        });
+    }
+    exec_cv_.notify_one();
+    std::unique_lock<std::mutex> dl(done_mu);
+    done_cv.wait(dl, [&] { return done; });
+}
+
+RecoveryData
+ServerOrderer::CollectRecovery(const std::function<bool(const std::string &)> &in_delta)
+{
+    RecoveryData d;
+    {
+        // Txns first: an entry the executor erases from specLog after this snapshot is
+        // applied to the store before the store scan below runs (same serialization).
+        std::lock_guard<std::mutex> lk(mu_);
+        spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
+            if (e.txn.type() != proto::WRITE) return;   // reads hold no state
+            if (!TxnTouches(e.txn, in_delta)) return;
+            d.txns.push_back(RecoveredTxn{e.txn, e.t, e.status});
+        });
+    }
+    RunOnStoreThread([&]() {
+        if (!backend_) return;
+        for (const std::string &key : written_keys_) {
+            if (!in_delta(key)) continue;
+            auto v = backend_->read(key);
+            if (v) d.kvs.push_back(RecoveredKV{key, v->value, v->t});
+        }
+    });
+    return d;
+}
+
+bool ServerOrderer::InstallRecoveredLocked(const RecoveredTxn &r, uint64_t now, bool *kick)
+{
+    const TxnId id = r.Key();
+    if (executed_.find(id) != executed_.end()) return false;
+
+    if (TxnEntry *e = spec_log_.find(id)) {
+        if (StatusRank(r.status) <= StatusRank(e->status)) return false;   // never downgrade
+        if (e->status == Status::SPECULATIVE) e->committing_us = now;
+        e->t = r.t;
+        e->status = r.status;
+        highest_released_t_ = std::max(highest_released_t_, e->Order());
+        spec_log_.update_key(id);   // `e` is invalid past this point
+        if (r.status == Status::COMMITTED) *kick = true;
+        return true;
+    }
+
+    TxnEntry e;
+    if (early_buffer_.contains(id)) {
+        // Not yet released here: it releases on its own at the client's t, which is what
+        // a SPECULATIVE copy in M carries anyway.
+        if (r.status == Status::SPECULATIVE) return false;
+        e = *early_buffer_.find(id);
+        early_buffer_.erase(id);
+    } else if (auto it = late_buffer_.find(id); it != late_buffer_.end()) {
+        e = std::move(it->second);
+        late_buffer_.erase(it);
+    } else {
+        e.txn = r.txn;
+        ComputeLeadership(e);
+    }
+    e.t = r.t;
+    e.status = r.status;
+    e.released_us = now;
+    if (r.status != Status::SPECULATIVE) e.committing_us = now;
+    highest_released_t_ = std::max(highest_released_t_, e.Order());
+    spec_log_.push(id, std::move(e));
+    if (r.status == Status::COMMITTED) *kick = true;
+    return true;
+}
+
+ServerOrderer::InstallStats
+ServerOrderer::InstallView(const Topology &topo, uint64_t view_id,
+                           const std::vector<RecoveryData> &ms,
+                           const std::function<bool(const std::string &)> &in_failed_range)
+{
+    InstallStats st;
+
+    // 1. Executed key-values → store (t-guarded), on the store thread.
+    RunOnStoreThread([&]() {
+        for (const RecoveryData &m : ms) st.kvs_applied += ApplyKVsGuardedLocked(m.kvs);
+    });
+
+    bool kick = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const uint64_t now = clock_->Now();
+
+        // 2. New view: every held entry's leadership follows the new owner map. Primary
+        //    replication may have moved too, so let the (new) primary prepare promptly.
+        topo_ = topo;
+        view_id_ = view_id;
+        std::vector<TxnId> ids;
+        spec_log_.for_each([&](const TxnId &id, const TxnEntry &) { ids.push_back(id); });
+        for (const TxnId &id : ids) {
+            TxnEntry *e = spec_log_.find(id);
+            ComputeLeadership(*e);   // leadership doesn't affect the OrderKey
+            e->last_replicate_us = 0;
+            e->prepare_replies.clear();
+        }
+        ids.clear();
+        early_buffer_.for_each([&](const TxnId &id, const TxnEntry &) { ids.push_back(id); });
+        for (const TxnId &id : ids) ComputeLeadership(*early_buffer_.find(id));
+        for (auto &kv : late_buffer_) ComputeLeadership(kv.second);
+
+        // 3. M txns.
+        std::unordered_set<TxnId> in_m;
+        for (const RecoveryData &m : ms) {
+            for (const RecoveredTxn &r : m.txns) {
+                in_m.insert(r.Key());
+                if (InstallRecoveredLocked(r, now, &kick)) ++st.txns_installed;
+            }
+        }
+
+        // 4. Leftovers: uncommitted entries in the failed range that no M carried. Kept;
+        //    counted so they show up in testing.
+        auto leftover = [&](const TxnEntry &e) {
+            return e.status != Status::COMMITTED && e.txn.type() == proto::WRITE &&
+                   in_m.find(e.Key()) == in_m.end() && TxnTouches(e.txn, in_failed_range);
+        };
+        spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
+            if (leftover(e)) ++st.leftovers;
+        });
+        for (const auto &kv : late_buffer_) if (leftover(kv.second)) ++st.leftovers;
+    }
+    if (kick) KickExecutor();
+    clock_->Interrupt();
+    return st;
+}
+
+size_t ServerOrderer::ApplyKVsGuardedLocked(const std::vector<RecoveredKV> &kvs)
+{
+    size_t applied = 0;
+    for (const RecoveredKV &kv : kvs) {
+        uint64_t &rt = recovered_t_[kv.key];
+        rt = std::max(rt, kv.t);
+        if (!backend_) continue;
+        auto cur = backend_->read(kv.key);
+        if (cur && cur->t >= kv.t) continue;
+        backend_->apply(kv.key, kv.value, kv.t);
+        written_keys_.insert(kv.key);
+        ++applied;
+    }
+    return applied;
+}
+
+void ServerOrderer::Reset()
+{
+    std::lock_guard<std::mutex> run_lk(exec_run_mu_);
+    std::lock_guard<std::mutex> lk(mu_);
+    early_buffer_ = decltype(early_buffer_)();
+    spec_log_ = decltype(spec_log_)();
+    late_buffer_.clear();
+    executed_.clear();
+    highest_released_t_ = OrderKey{};
+    // written_keys_ / recovered_t_ describe the store, which is kept.
+}
+
+std::vector<std::string> ServerOrderer::SnapshotKeys()
+{
+    std::vector<std::string> keys;
+    RunOnStoreThread([&]() { keys.assign(written_keys_.begin(), written_keys_.end()); });
+    std::sort(keys.begin(), keys.end());
+    return keys;
+}
+
+std::vector<RecoveredKV> ServerOrderer::SnapshotRead(const std::vector<std::string> &keys,
+                                                     size_t offset, size_t count)
+{
+    std::vector<RecoveredKV> out;
+    RunOnStoreThread([&]() {
+        if (!backend_) return;
+        for (size_t i = offset; i < keys.size() && i < offset + count; ++i) {
+            auto v = backend_->read(keys[i]);
+            if (v) out.push_back(RecoveredKV{keys[i], v->value, v->t});
+        }
+    });
+    return out;
+}
+
+std::vector<RecoveredTxn> ServerOrderer::CommittedTxns()
+{
+    std::vector<RecoveredTxn> out;
+    std::lock_guard<std::mutex> lk(mu_);
+    spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
+        if (e.txn.type() == proto::WRITE && e.status != Status::SPECULATIVE) {
+            out.push_back(RecoveredTxn{e.txn, e.t, e.status});
+        }
+    });
+    return out;
+}
+
+size_t ServerOrderer::InstallSnapshot(const RecoveryData &d)
+{
+    size_t applied = 0;
+    if (!d.kvs.empty()) {
+        RunOnStoreThread([&]() { applied = ApplyKVsGuardedLocked(d.kvs); });
+    }
+    bool kick = false;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        const uint64_t now = clock_->Now();
+        for (const RecoveredTxn &r : d.txns) InstallRecoveredLocked(r, now, &kick);
+    }
+    if (kick) KickExecutor();
+    return applied;
+}
+
+bool ServerOrderer::LiveState(const TxnId &id, uint64_t *t, bool *is_leader)
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    auto xit = executed_.find(id);
+    if (xit != executed_.end()) {
+        *t = xit->second.t;
+        *is_leader = xit->second.is_leader;
+        return true;
+    }
+    if (const TxnEntry *e = spec_log_.find(id)) {
+        *t = e->t;
+        *is_leader = e->is_leader_for_this;
+        return true;
+    }
+    return false;
+}
+
+std::string ServerOrderer::DebugOldestEntry()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    const TxnEntry *best = nullptr;
+    spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
+        if (!best || e.Order() < best->Order()) best = &e;
+    });
+    if (!best) return std::string();
+    static const char *kStatus[] = {"SPEC", "COMMITTING", "COMMITTED"};
+    std::string keys;
+    for (const auto &kv : best->txn.w_set()) keys += kv.key().substr(0, 8) + ",";
+    for (const auto &k : best->txn.r_set()) keys += "r:" + k.substr(0, 8) + ",";
+    char buf[256];
+    snprintf(buf, sizeof(buf), "c=%lu r=%lu t=%lu %s leader=%d keys=%s",
+             (unsigned long)best->txn.client_id(), (unsigned long)best->txn.request_id(),
+             (unsigned long)best->t, kStatus[StatusRank(best->status)],
+             best->is_leader_for_this ? 1 : 0, keys.c_str());
+    return buf;
+}
+
+uint64_t ServerOrderer::view_id()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return view_id_;
+}
+
+Topology ServerOrderer::topology()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return topo_;
 }
 
 OrderKey ServerOrderer::highest_released_t()
@@ -669,6 +1006,12 @@ bool ServerOrderer::executed(const TxnId &id)
 {
     std::lock_guard<std::mutex> lk(mu_);
     return executed_.find(id) != executed_.end();
+}
+
+size_t ServerOrderer::executed_count()
+{
+    std::lock_guard<std::mutex> lk(mu_);
+    return executed_.size();
 }
 
 } // namespace dyna

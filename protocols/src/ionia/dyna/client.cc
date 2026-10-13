@@ -69,18 +69,6 @@ void DynaClient::Invoke(const string &request, continuation_t continuation)
     const bool is_read = IsReadCommand(request);
     const std::string value = ValueOf(request);
 
-    // Compute involved leaders from the (single-key) transaction. Multi-key txns would
-    // simply produce a larger involved-leader set — the quorum logic is identical.
-    proto::Txn probe;
-    probe.set_client_id(clientid);
-    probe.set_request_id(request_id);
-    probe.set_type(is_read ? proto::READ : proto::WRITE);
-    if (is_read) probe.add_r_set(key);
-    else { proto::KV *kv = probe.add_w_set(); kv->set_key(key); kv->set_value(value); }
-    probe.set_t(0);
-    probe.set_view_id(viewId_);
-    std::set<uint32_t> leaders = topo_.involvedLeaders(probe);
-
     PendingRequest p;
     p.request = request;
     p.request_id = request_id;
@@ -89,7 +77,7 @@ void DynaClient::Invoke(const string &request, continuation_t continuation)
     p.value = value;
     p.phase = Phase::COLLECTING;
     p.owd = bound_tracker_.bound_us();   // READ deadline seed (grows on retry)
-    p.quorum = TxnQuorum(std::move(leaders), write_quorum_);
+    p.quorum = TxnQuorum(LeadersFor(p), write_quorum_, viewId_);
     p.continuation = std::move(continuation);
     pending_.emplace(request_id, std::move(p));
 
@@ -127,6 +115,47 @@ void DynaClient::SendRequestProto(uint64_t request_id)
 
     if (!transport->SendMessageToAll(this, req)) {
         Warning("dyna: failed to multicast ClientRequest");
+    }
+}
+
+std::set<uint32_t> DynaClient::LeadersFor(const PendingRequest &p) const
+{
+    // Involved leaders of the (single-key) transaction. Multi-key txns would simply
+    // produce a larger involved-leader set — the quorum logic is identical.
+    proto::Txn probe;
+    probe.set_client_id(clientid);
+    probe.set_request_id(p.request_id);
+    probe.set_type(p.type);
+    if (p.type == proto::READ) probe.add_r_set(p.key);
+    else { proto::KV *kv = probe.add_w_set(); kv->set_key(p.key); kv->set_value(p.value); }
+    probe.set_t(0);
+    probe.set_view_id(viewId_);
+    return topo_.involvedLeaders(probe);
+}
+
+void DynaClient::HandleViewInfo(const proto::ViewInfo &m)
+{
+    if (m.view_id() <= viewId_) return;
+    viewId_ = m.view_id();
+    topo_ = topo_.WithAlive(m.alive());
+    if (debug_) {
+        Notice("client view %lu alive=%#lx: restarting %zu pending", (unsigned long)viewId_,
+               (unsigned long)m.alive(), pending_.size());
+    }
+    std::vector<uint64_t> ids;
+    for (const auto &kv : pending_) ids.push_back(kv.first);
+    for (uint64_t id : ids) {
+        auto it = pending_.find(id);
+        if (it == pending_.end()) continue;
+        PendingRequest &p = it->second;
+        p.phase = Phase::COLLECTING;
+        p.quorum = TxnQuorum(LeadersFor(p), write_quorum_, viewId_);
+        if (p.type == proto::READ) {
+            RetryRead(id);
+        } else {
+            p.results.clear();
+            SendRequestProto(id);   // same t, new view
+        }
     }
 }
 
@@ -197,7 +226,7 @@ uint64_t DynaClient::RetryRead(uint64_t request_id)
     const uint64_t new_id = ++last_req_id_;
     GrowReadOwd(p);
     p.request_id = new_id;
-    p.quorum = TxnQuorum(p.quorum.involved_leaders(), write_quorum_);
+    p.quorum = TxnQuorum(LeadersFor(p), write_quorum_, viewId_);
     p.results.clear();
     pending_.emplace(new_id, std::move(p));
     SendRequestProto(new_id);
@@ -234,6 +263,14 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
         proto::SpecReply::default_instance().GetDescriptor()->full_name();
     const static auto commitReplyName =
         proto::CommitReply::default_instance().GetDescriptor()->full_name();
+    const static auto viewInfoName =
+        proto::ViewInfo::default_instance().GetDescriptor()->full_name();
+
+    if (type == viewInfoName) {
+        proto::ViewInfo m;
+        if (m.ParseFromArray(data.data(), data.size())) HandleViewInfo(m);
+        return;
+    }
 
     if (type == specName) {
         proto::SpecReply r;
@@ -243,7 +280,9 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
         PendingRequest &p = it->second;
 
         bound_tracker_.on_owd_sample(r.server_id(), r.owd_estimate());
-        p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader());
+        // Another view's reply doesn't count (see TxnQuorum); a server in a newer view
+        // answers our next resend with ViewInfo, and we restart the request there.
+        if (!p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader())) return;
         // READ: merge the disk-read values from each involved leader's reply.
         if (p.type == proto::READ && r.is_leader()) {
             for (const auto &kv : r.results()) p.results[kv.key()] = kv.value();
@@ -292,7 +331,7 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
         auto it = pending_.find(r.request_id());
         if (it == pending_.end()) return;
         PendingRequest &p = it->second;
-        p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader());
+        if (!p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader())) return;
         if (p.quorum.fast_ready()) Commit(it, std::string());   // write quorum re-formed
         return;
     }

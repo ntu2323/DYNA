@@ -130,3 +130,157 @@ message ReplicateCommit {
     required uint64 view_id    = 3;
     required uint32 leader_id  = 4;
 }
+
+// ---------------------------------------------------------------------------------------
+// Views + recovery (design doc § Recovery). A view is (view_id, alive set); `alive` is a
+// bitmask over server ids (bit i ⇔ server i alive). The VR layer is silent in normal
+// operation apart from heartbeats; it only changes views. The VR leader of a view is the
+// min-id alive server.
+// ---------------------------------------------------------------------------------------
+
+// 13. Heartbeat — server → all servers, periodic failure detection.
+message Heartbeat {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+}
+
+// 14. StartViewChange — server → all: propose / join the change to view_id with `alive`.
+message StartViewChange {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 alive     = 3;
+}
+
+// 15. DoViewChange — server → new VR leader, after f matching StartViewChanges.
+message DoViewChange {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 alive     = 3;
+    required uint64 old_alive = 4;   // sender's last NORMAL alive set
+    optional uint64 last_normal_view = 5;   // the view whose alive set old_alive is
+}
+
+// 16. StartRecovery — VR leader → all, once f+1 servers agreed on the view change: every
+//     survivor pauses normal processing and acts as Partition Leader for its delta-p.
+message StartRecovery {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 alive     = 3;
+    required uint64 old_alive = 4;   // the view being replaced (defines the failed range)
+}
+
+// A transaction copy reported for recovery: its body, live t and status.
+message RecTxn {
+    required Txn    txn    = 1;
+    required uint64 t      = 2;
+    required uint32 status = 3;      // 0 SPECULATIVE, 1 COMMITTING, 2 COMMITTED
+}
+
+// An executed key-value with the commit timestamp of the write that produced it.
+message RecKV {
+    required bytes  key   = 1;
+    required bytes  value = 2;
+    required uint64 t     = 3;
+}
+
+// 17. RecoveryRequest — PL → all alive servers: send me what you hold in my delta-p.
+//     Carries the view so a server that missed StartRecovery can join it.
+message RecoveryRequest {
+    required uint64 view_id      = 1;
+    required uint32 requester_id = 2;
+    required uint64 alive        = 3;
+    required uint64 old_alive    = 4;
+}
+
+// 18. RecoveryReply — server → PL: its spec/committing/committed txns and executed
+//     key-values in the PL's delta-p.
+message RecoveryReply {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    repeated RecTxn txns      = 3;
+    repeated RecKV  kvs       = 4;
+}
+
+// 19. RecoveryPrepare — PL → all alive servers: the merged buffer M for its delta-p.
+message RecoveryPrepare {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 alive     = 3;
+    required uint64 old_alive = 4;
+    repeated RecTxn txns      = 5;
+    repeated RecKV  kvs       = 6;
+}
+
+// 20. RecoveryPrepareReply — server → PL: M buffered.
+message RecoveryPrepareReply {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint32 pl_id     = 3;
+}
+
+// 21. RecoveryReport — PL → VR leader: f+1 servers hold my M.
+message RecoveryReport {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+}
+
+// 22. StartView — VR leader → all: every PL reported; install the buffered Ms and resume.
+message StartView {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 alive     = 3;
+}
+
+// 23. ViewInfo — server → client whose request carried an old view.
+message ViewInfo {
+    required uint64 view_id = 1;
+    required uint64 alive   = 2;
+}
+
+// ---------------------------------------------------------------------------------------
+// Rejoin. A restarted server (it finds its persisted VR state file) starts JOINING: it
+// learns the current view, adopts it as a NON-member, catches up via a chunked snapshot
+// from the VR leader (while also applying live replication traffic), then asks to be
+// added; the VR leader runs a normal view change that adds it, in which consistent
+// hashing hands its home range back (it is PL for exactly that range).
+// ---------------------------------------------------------------------------------------
+
+// 24. JoinRequest — joiner → all: I restarted (lost my in-memory state); what's the view?
+message JoinRequest {
+    required uint32 sender_id = 1;
+}
+
+// 25. JoinInfo — member → joiner: the current view (the joiner is not in `alive`).
+message JoinInfo {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 alive     = 3;
+}
+
+// 26. SnapshotRequest — joiner → donor (VR leader): the next chunk of executed state.
+message SnapshotRequest {
+    required uint64 view_id      = 1;
+    required uint32 requester_id = 2;
+    required uint64 session      = 3;   // a new session restarts the key enumeration
+    required uint64 offset       = 4;   // index into the donor's sorted key list
+}
+
+// 27. SnapshotChunk — donor → joiner: up to DYNA_SNAPSHOT_CHUNK executed key-values (with
+//     their t); the last chunk also carries the donor's COMMITTING/COMMITTED write txns.
+message SnapshotChunk {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+    required uint64 session   = 3;
+    required uint64 offset    = 4;
+    required uint64 total     = 5;
+    required bool   done      = 6;
+    repeated RecKV  kvs       = 7;
+    repeated RecTxn txns      = 8;
+    required uint64 next_offset = 9;   // where the joiner's next request starts
+}
+
+// 28. JoinReady — joiner → VR leader: caught up; add me (view change to view_id + 1).
+message JoinReady {
+    required uint64 view_id   = 1;
+    required uint32 sender_id = 2;
+}

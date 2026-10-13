@@ -14,7 +14,9 @@ GTEST_SRCS += $(addprefix $(d), \
 		exec_test.cc \
 		read_test.cc \
 		slowpath_test.cc \
-		robust_test.cc)
+		robust_test.cc \
+		storage_test.cc \
+		recovery_test.cc)
 
 $(d)dyna-types-test: $(o)types_test.o \
 	.obj/dyna/dyna-proto.o \
@@ -92,3 +94,22 @@ $(d)dyna-robust-test: $(o)robust_test.o \
 	$(GTEST_MAIN)
 
 TEST_BINS += $(d)dyna-robust-test
+
+$(d)dyna-storage-test: $(o)storage_test.o \
+	.obj/dyna/db_backend.o \
+	.obj/dyna/server_orderer.o \
+	.obj/dyna/dyna-proto.o \
+	$(LIB-db) $(LIB-message) \
+	$(GTEST_MAIN)
+
+TEST_BINS += $(d)dyna-storage-test
+
+$(d)dyna-recovery-test: $(o)recovery_test.o \
+	.obj/dyna/server_orderer.o \
+	.obj/dyna/in_memory_backend.o \
+	.obj/dyna/recovery.o \
+	.obj/dyna/view_coordinator.o \
+	.obj/dyna/dyna-proto.o \
+	$(GTEST_MAIN)
+
+TEST_BINS += $(d)dyna-recovery-test

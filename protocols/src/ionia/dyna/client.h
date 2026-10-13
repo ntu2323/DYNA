@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <map>
+#include <set>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -78,6 +79,11 @@ private:
     // larger t. Returns the new request_id.
     uint64_t RetryRead(uint64_t request_id);
     void SendSlowCommit(PendingRequest &p);
+    // Involved leaders of a pending request under the current view's topology.
+    std::set<uint32_t> LeadersFor(const PendingRequest &p) const;
+    // A replica told us about a newer view: adopt its topology and restart every pending
+    // request there (writes resend at the same t; reads retry as fresh attempts).
+    void HandleViewInfo(const proto::ViewInfo &m);
     uint64_t SlowTimeoutUs() const;
     void Commit(std::unordered_map<uint64_t, PendingRequest>::iterator it,
                 const std::string &result);

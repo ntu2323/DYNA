@@ -37,8 +37,9 @@ runs it. A green run ends with `[  PASSED  ]`.
 ### Check WRITE correctness
 
 Writes execute in dependency order and apply the correct values to the KV store
-(`mem_apply`), with w-w conflicts serialized by `OrderKey` and disk persistence async
-(invariant 2).
+(`apply`, stored with their commit timestamp), with w-w conflicts serialized by `OrderKey`.
+The store is the harness DB (SplinterDB by default; `dyna-storage-test` covers the
+`DbBackend` + value encoding); commit never waits on it (invariant 2).
 
 ```bash
 docker run --rm --platform linux/amd64 ionia-udp bash -lc \
@@ -84,13 +85,13 @@ docker run --rm --platform linux/amd64 ionia-udp bash -lc \
    ./dyna/tests/dyna-slowpath-test'
 ```
 
-### Run the whole unit-test suite (all 11 binaries)
+### Run the whole unit-test suite (all 13 binaries, 93 tests)
 
 ```bash
 docker run --rm --platform linux/amd64 ionia-udp bash -lc \
   'cd protocols/src/ionia && \
    for t in types indexed-pq orderer-release quorum orderer-commit \
-            tsagree replicate exec read slowpath robust; do \
+            tsagree replicate exec read slowpath robust storage recovery; do \
      make dyna/tests/dyna-$t-test >/dev/null 2>&1 && \
      printf "%-16s " "$t" && \
      ./dyna/tests/dyna-$t-test 2>&1 | grep -E "PASSED|FAILED" | tail -1; done'
@@ -105,6 +106,23 @@ docker run --rm --platform linux/amd64 ionia-udp bash -lc \
 
 Expect `UDP smoke test finished successfully.` (rc=0). `DYNA_DEBUG=1` logs the
 request/reply/quorum flow.
+
+### Recovery smoke (kill a replica mid-run)
+
+```bash
+SMOKE_PROTOCOL=dyna SMOKE_KILL_REPLICA=2 ./docker/docker-smoke.sh   # or 0 = the VR leader
+```
+
+`kill -9`s the replica 1.5 s (`SMOKE_KILL_AFTER_MS`) into an 8 s closed-loop run (bound
+20 ms, `DYNA_FAIL_TIMEOUT_MS=500`) and fails unless every survivor logs
+`view 1 installed`; it then prints how many requests the client completed across the
+failure. With `sample/test` the trace keys are homed at servers 0 and 2, so kill 0 or 2
+to exercise a range takeover (killing 1 still exercises the view change, with an empty
+delta-p). Add `SMOKE_DYNA_DB=splinter` for real SplinterDB.
+
+Rejoin: add `SMOKE_RESTART_AFTER_MS=2000` — the killed replica is restarted (log
+`replica-<i>.restart.log`); it finds `dyna-vr-<i>.state`, catches up as a non-member and is
+re-added; the run requires `view 2 installed` on all three replicas.
 
 ---
 
@@ -140,4 +158,8 @@ request/reply/quorum flow.
 | Read       | `dyna-read-test`         | leader read returns the committed value; read blocked until conflicting write executes; late follower read dropped silently; on-time follower endorse |
 | Robustness | `dyna-robust-test`       | no veto drop; commit never downgrades / re-applies after GC; lost TsAgree / ReplicateCommit recover; event-driven executor serves reads |
 | Slow path  | `dyna-slowpath-test`     | leader disagreement → `SlowCommit(max)` → servers adopt → quorum re-forms at the max; follower adopts from lateBuffer |
+| Recovery   | `dyna-recovery-test`     | consistent-hash takeover; M merge precedence; fast-committed (leader dead) / slow-committed writes survive at their t; executed key-values recovered (t-guarded); leftovers kept; no downgrade / duplicate; VR view change converges (follower or VR-leader death, message loss, n=5 sequential failures, VR leader dying after a partial StartView → recover from the oldest last-normal view); fencing |
 | End-to-end | `run_udp_smoke.sh`             | 3 real UDP replicas commit a mixed write/read trace |
+| Rejoin     | `dyna-recovery-test` (`Rejoin.*`) | restarted server rejoins (follower / VR leader); restart before detection; falsely excluded server rejoins; whole-cluster restart starts fresh (incl. staggered); joiner never votes before caught up; snapshot paging + t-guard; home range handed back with state; executed-write resend answered |
+| Failover   | `run_udp_smoke.sh` + `SMOKE_KILL_REPLICA` | survivors install view 1; the client keeps completing requests |
+| Rejoin E2E | `run_udp_smoke.sh` + `SMOKE_RESTART_AFTER_MS` | the restarted replica rejoins; all install view 2; the client keeps completing requests |

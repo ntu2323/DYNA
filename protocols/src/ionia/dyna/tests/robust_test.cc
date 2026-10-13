@@ -189,7 +189,7 @@ TEST(Robust, ExecutedTxnIsNeverReinstalledOrReapplied)
     o.MarkCommitted(w1);
     o.MarkCommitted(w2);
     ASSERT_EQ(o.ExecuteReady().size(), 2u);
-    ASSERT_EQ(backend.mem_read("K").value_or(""), "v2");
+    ASSERT_EQ(backend.value_or_empty("K"), "v2");
     ASSERT_TRUE(o.executed(w1));
 
     TxnEntry out;
@@ -204,7 +204,7 @@ TEST(Robust, ExecutedTxnIsNeverReinstalledOrReapplied)
     EXPECT_EQ(o.early_size(), 0u);
     EXPECT_FALSE(o.speclog_contains(w1));
     EXPECT_TRUE(o.ExecuteReady().empty());
-    EXPECT_EQ(backend.mem_read("K").value_or(""), "v2");
+    EXPECT_EQ(backend.value_or_empty("K"), "v2");
 }
 
 // --- retransmission (B4) ----------------------------------------------------------
@@ -353,7 +353,7 @@ TEST(Robust, ExecutorServicesReadAfterCommitWithoutTick)
     TxnEntry out;
     ASSERT_EQ(o.ApplyCommit(w, 100, &out), ServerOrderer::CommitResult::kApplied);
     o.MarkCommitted(w);                                      // kicks the executor
-    ASSERT_TRUE(WaitFor([&] { return backend.mem_read("K").value_or("") == "v1"; }));
+    ASSERT_TRUE(WaitFor([&] { return backend.value_or_empty("K") == "v1"; }));
 
     o.SubmitTxn(MakeRead(1, 2, 200, "K"));
     clk.Set(200);                                            // release → kick → serve

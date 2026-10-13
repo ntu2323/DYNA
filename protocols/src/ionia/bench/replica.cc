@@ -288,7 +288,8 @@ main(int argc, char **argv)
         const char *bp = std::getenv("DYNA_BUSY_POLL");
         const bool busyPoll = (bp == nullptr) || (*bp != '0');
         FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, busyPoll);
-        specpaxos::dyna::DynaReplica replica(internalConfig, index, &transport);
+        // DYNA executes into the harness store (same SplinterDB config as IONIA).
+        specpaxos::dyna::DynaReplica replica(internalConfig, index, &transport, nullApp->GetDB());
         transport.Run();
         return 0;
     }

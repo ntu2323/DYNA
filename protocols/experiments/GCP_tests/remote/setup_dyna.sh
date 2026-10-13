@@ -56,8 +56,13 @@ install_helpers() {
 set -euo pipefail
 # Usage: start_dyna_replica.sh <idx>
 IDX="${1:?replica index 0|1|2}"
-# DYNA uses an in-memory backend; IONIA_DB_MODE keeps the bench AppReplica in memory too.
-export IONIA_DB_MODE="${IONIA_DB_MODE:-memory}"
+# DYNA executes committed writes into the harness store: SplinterDB by default (real
+# disk; same cache/disk sizes as start_ionia_replica.sh). The DB file is splinterdb.db in
+# the replica's working directory (~/Ionia/protocols/src/ionia). IONIA_DB_MODE=memory uses
+# lib's in-memory store instead.
+export IONIA_DB_MODE="${IONIA_DB_MODE:-splinter}"
+export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
+export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
 # Deadline / OWD (dyna/deadline.h). Steady-state bound is OWD-driven; INITIAL_BOUND
 # only matters for the first few ops; MAX_OWD caps OWD spikes.
 export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"

@@ -4,9 +4,18 @@
 
 #include "dyna/replica.h"
 
+#include "dyna/db_backend.h"
+#include "dyna/in_memory_backend.h"
+
 #include "lib/message.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <utility>
@@ -17,8 +26,9 @@ namespace dyna {
 namespace proto = specpaxos::dyna::proto;
 
 DynaReplica::DynaReplica(const specpaxos::Configuration &config,
-                                   int replicaIdx,
-                                   Transport *transport)
+                         int replicaIdx,
+                         Transport *transport,
+                         DB *db)
     : config(config), replicaIdx(replicaIdx), transport(transport),
       topo_(static_cast<uint32_t>(config.n)),
       owd_(DeadlineConfig::FromEnv())
@@ -28,7 +38,8 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
     const char *dbg = std::getenv("DYNA_DEBUG");
     debug_ = (dbg != nullptr && *dbg != '\0' && *dbg != '0');
     clock_ = std::make_unique<RealClock>(busyPoll);
-    backend_ = std::make_unique<InMemoryBackend>(InMemoryBackend::LatencyFromEnv());
+    if (db != nullptr) backend_ = std::make_unique<DbBackend>(db);
+    else backend_ = std::make_unique<InMemoryBackend>();
     orderer_ = std::make_unique<ServerOrderer>(
         static_cast<uint32_t>(replicaIdx), viewId_, clock_.get(), topo_,
         [this](const TxnEntry &e) { OnSpecReply(e); }, backend_.get());
@@ -38,11 +49,42 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
     if (ts_scan_ms_ == 0) ts_scan_ms_ = 1;
     ts_timeout_us_ = DeadlineConfig::EnvU64("DYNA_TS_TIMEOUT_MS", 100) * 1000;
 
+    // VR layer (recovery). DYNA_FAIL_TIMEOUT_MS=0 disables failure detection.
+    ViewCoordinator::Config vcfg;
+    vcfg.self = static_cast<uint32_t>(replicaIdx);
+    vcfg.n = static_cast<uint32_t>(config.n);
+    vcfg.f = static_cast<uint32_t>(config.f);
+    vcfg.fail_timeout_us = DeadlineConfig::EnvU64("DYNA_FAIL_TIMEOUT_MS", 1000) * 1000;
+    vcfg.grace_us = DeadlineConfig::EnvU64("DYNA_FAIL_GRACE_MS", 10000) * 1000;
+    hb_ms_ = DeadlineConfig::EnvU64("DYNA_HB_MS", 20);
+    if (hb_ms_ == 0) hb_ms_ = 1;
+    vcfg.resend_us = std::max<uint64_t>(ts_scan_ms_, hb_ms_) * 1000;
+    snapshot_chunk_ = std::max<uint64_t>(1, DeadlineConfig::EnvU64("DYNA_SNAPSHOT_CHUNK", 512));
+    if (const char *d = std::getenv("DYNA_VR_STATE_DIR"); d != nullptr && *d != '\0') {
+        vr_state_dir_ = d;
+    }
+    {
+        // Durable VR state: if we were a member before, our in-memory state is gone —
+        // rejoin rather than start in view 0.
+        std::ifstream in(VrStatePath());
+        vcfg.start_joining = in.good();
+    }
+    vc_ = std::make_unique<ViewCoordinator>(vcfg, WallClockMicros());
+    if (vcfg.start_joining) {
+        Notice("r%d found %s: restarted, rejoining", replicaIdx, VrStatePath().c_str());
+        paused_ = true;
+        orderer_->SetPaused(true);
+    } else {
+        PersistVrState(0, topo_.alive_mask);
+    }
+
     transport->Register(this, config, 0, replicaIdx);
     // Background ts-agreement scan (spec §3.5). Re-arms itself in TsAgreementTick.
     transport->Timer(ts_scan_ms_, [this]() { TsAgreementTick(); });
-    Notice("DYNA r%d up: n=%d f=%d busyPoll=%d", replicaIdx, config.n, config.f,
-           busyPoll ? 1 : 0);
+    transport->Timer(hb_ms_, [this]() { HeartbeatTick(); });
+    Notice("DYNA r%d up: n=%d f=%d busyPoll=%d store=%s failTimeoutMs=%lu", replicaIdx,
+           config.n, config.f, busyPoll ? 1 : 0, db != nullptr ? "harness-db" : "in-memory",
+           (unsigned long)(vcfg.fail_timeout_us / 1000));
 }
 
 DynaReplica::~DynaReplica()
@@ -75,31 +117,211 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote,
         proto::ReplicatePrepareReply::default_instance().GetDescriptor()->full_name();
     const static auto repCommitName =
         proto::ReplicateCommit::default_instance().GetDescriptor()->full_name();
+    const static auto hbName =
+        proto::Heartbeat::default_instance().GetDescriptor()->full_name();
+    const static auto svcName =
+        proto::StartViewChange::default_instance().GetDescriptor()->full_name();
+    const static auto dvcName =
+        proto::DoViewChange::default_instance().GetDescriptor()->full_name();
+    const static auto startRecName =
+        proto::StartRecovery::default_instance().GetDescriptor()->full_name();
+    const static auto recReqName =
+        proto::RecoveryRequest::default_instance().GetDescriptor()->full_name();
+    const static auto recRepName =
+        proto::RecoveryReply::default_instance().GetDescriptor()->full_name();
+    const static auto recPrepName =
+        proto::RecoveryPrepare::default_instance().GetDescriptor()->full_name();
+    const static auto recPrepReplyName =
+        proto::RecoveryPrepareReply::default_instance().GetDescriptor()->full_name();
+    const static auto recReportName =
+        proto::RecoveryReport::default_instance().GetDescriptor()->full_name();
+    const static auto startViewName =
+        proto::StartView::default_instance().GetDescriptor()->full_name();
+    const static auto joinReqName =
+        proto::JoinRequest::default_instance().GetDescriptor()->full_name();
+    const static auto joinInfoName =
+        proto::JoinInfo::default_instance().GetDescriptor()->full_name();
+    const static auto joinReadyName =
+        proto::JoinReady::default_instance().GetDescriptor()->full_name();
+    const static auto snapReqName =
+        proto::SnapshotRequest::default_instance().GetDescriptor()->full_name();
+    const static auto snapChunkName =
+        proto::SnapshotChunk::default_instance().GetDescriptor()->full_name();
+
+    // --- VR layer + recovery (always processed) ---
+    ViewCoordinator::Effects fx;
+    const uint64_t now = WallClockMicros();
+    if (type == hbName) {
+        proto::Heartbeat m;
+        if (!m.ParseFromArray(data.data(), data.size())) return;
+        vc_->OnHeard(m.sender_id(), now);
+        if (m.view_id() > viewId_.load() && Normal()) {
+            // We missed a whole view change: ask (the VR leader answers with StartView).
+            proto::StartViewChange q;
+            q.set_view_id(m.view_id());
+            q.set_sender_id(static_cast<uint32_t>(replicaIdx));
+            q.set_alive(vc_->alive());
+            transport->SendMessageToAll(this, q);
+        }
+        return;
+    }
+    if (type == svcName) {
+        proto::StartViewChange m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnStartViewChange(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == dvcName) {
+        proto::DoViewChange m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnDoViewChange(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == startRecName) {
+        proto::StartRecovery m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnStartRecovery(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == recReqName) {
+        proto::RecoveryRequest m;
+        if (m.ParseFromArray(data.data(), data.size())) HandleRecoveryRequest(m);
+        return;
+    }
+    if (type == recRepName) {
+        proto::RecoveryReply m;
+        if (m.ParseFromArray(data.data(), data.size())) {
+            vc_->OnHeard(m.sender_id(), now);
+            vc_->OnRecoveryReply(m, &fx);
+        }
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == recPrepName) {
+        proto::RecoveryPrepare m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnRecoveryPrepare(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == recPrepReplyName) {
+        proto::RecoveryPrepareReply m;
+        if (m.ParseFromArray(data.data(), data.size())) {
+            vc_->OnHeard(m.sender_id(), now);
+            vc_->OnRecoveryPrepareReply(m, &fx);
+        }
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == recReportName) {
+        proto::RecoveryReport m;
+        if (m.ParseFromArray(data.data(), data.size())) {
+            vc_->OnHeard(m.sender_id(), now);
+            vc_->OnRecoveryReport(m, &fx);
+        }
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == startViewName) {
+        proto::StartView m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnStartView(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+
+    // --- rejoin ---
+    if (type == joinReqName) {
+        proto::JoinRequest m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnJoinRequest(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == joinInfoName) {
+        proto::JoinInfo m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnJoinInfo(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == joinReadyName) {
+        proto::JoinReady m;
+        if (m.ParseFromArray(data.data(), data.size())) vc_->OnJoinReady(m, now, &fx);
+        ApplyEffects(fx);
+        return;
+    }
+    if (type == snapReqName) {
+        proto::SnapshotRequest m;
+        if (m.ParseFromArray(data.data(), data.size())) HandleSnapshotRequest(remote, m);
+        return;
+    }
+    if (type == snapChunkName) {
+        proto::SnapshotChunk m;
+        if (m.ParseFromArray(data.data(), data.size())) HandleSnapshotChunk(m);
+        return;
+    }
+
+    // A JOINING server that adopted the current view applies live replication traffic
+    // (without acking: it is not a member yet), so nothing committed while it catches up
+    // falls between the snapshot and the view change that re-adds it.
+    if (vc_->phase() == ViewCoordinator::Phase::JOINING && vc_->has_view()) {
+        const uint64_t jv = viewId_.load();
+        if (type == repPrepName) {
+            proto::ReplicatePrepare m;
+            if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == jv && m.has_txn()) {
+                orderer_->HandleReplicatePrepare(TxnId{m.client_id(), m.request_id()},
+                                                 m.agreed_t(), m.txn());
+            }
+        } else if (type == repCommitName) {
+            proto::ReplicateCommit m;
+            if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == jv) {
+                orderer_->MarkCommitted(TxnId{m.client_id(), m.request_id()});
+            }
+        }
+        return;
+    }
+
+    // --- normal processing: paused outside NORMAL; other-view messages are dropped
+    //     (clients on an old view are told the current one) ---
+    if (!Normal()) return;
+    const uint64_t view = viewId_.load();
 
     if (type == requestName) {
         proto::ClientRequest m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleClientRequest(remote, m);
+        if (!m.ParseFromArray(data.data(), data.size())) return;
+        if (m.txn().view_id() != view) {
+            if (m.txn().view_id() < view) SendViewInfo(remote);
+            return;
+        }
+        HandleClientRequest(remote, m);
         return;
     }
     if (type == fastName) {
         proto::FastCommit m;
-        if (m.ParseFromArray(data.data(), data.size())) {
-            HandleCommit(remote, TxnId{m.client_id(), m.request_id()}, m.agreed_t(),
-                         /*slow=*/false);
+        if (!m.ParseFromArray(data.data(), data.size())) return;
+        if (m.view_id() != view) {
+            // An old-view decision is not adopted: the new view re-derives the txn's t
+            // (recovery + leader sync), so a stale agreedT could diverge from it.
+            if (m.view_id() < view) SendViewInfo(remote);
+            return;
         }
+        HandleCommit(remote, TxnId{m.client_id(), m.request_id()}, m.agreed_t(),
+                     /*slow=*/false);
         return;
     }
     if (type == slowName) {
         proto::SlowCommit m;
-        if (m.ParseFromArray(data.data(), data.size())) {
-            HandleCommit(remote, TxnId{m.client_id(), m.request_id()}, m.agreed_t(),
-                         /*slow=*/true);
+        if (!m.ParseFromArray(data.data(), data.size())) return;
+        if (m.view_id() != view) {
+            if (m.view_id() < view) SendViewInfo(remote);
+            return;
         }
+        HandleCommit(remote, TxnId{m.client_id(), m.request_id()}, m.agreed_t(),
+                     /*slow=*/true);
         return;
     }
     if (type == fetchReqName) {
         proto::FetchRequest m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleFetchRequest(remote, m);
+        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) {
+            HandleFetchRequest(remote, m);
+        }
         return;
     }
     if (type == fetchRepName) {
@@ -109,22 +331,22 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote,
     }
     if (type == tsAgreeName) {
         proto::TsAgree m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleTsAgree(m);
+        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleTsAgree(m);
         return;
     }
     if (type == repPrepName) {
         proto::ReplicatePrepare m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleReplicatePrepare(remote, m);
+        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleReplicatePrepare(remote, m);
         return;
     }
     if (type == repPrepReplyName) {
         proto::ReplicatePrepareReply m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleReplicatePrepareReply(m);
+        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleReplicatePrepareReply(m);
         return;
     }
     if (type == repCommitName) {
         proto::ReplicateCommit m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleReplicateCommit(m);
+        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleReplicateCommit(m);
         return;
     }
 }
@@ -195,6 +417,10 @@ DynaReplica::HandleTsAgree(const proto::TsAgree &m)
 void
 DynaReplica::TsAgreementTick()
 {
+    if (!Normal()) {   // paused during a view change
+        transport->Timer(ts_scan_ms_, [this]() { TsAgreementTick(); });
+        return;
+    }
     std::vector<ServerOrderer::TsAgreeAction> actions;
     std::vector<TxnEntry> committed;
     orderer_->DriveTsAgreement(ts_timeout_us_, &actions, &committed);
@@ -224,6 +450,17 @@ DynaReplica::TsAgreementTick()
     // Execution (spec §3.7) runs on the orderer's executor thread, woken on commit /
     // leader-read events; kick it here too as a backstop.
     orderer_->KickExecutor();
+
+    if (debug_) {
+        const size_t executed = orderer_->executed_count();
+        if (executed != last_logged_executed_) {
+            last_logged_executed_ = executed;
+            const size_t spec = orderer_->speclog_size();
+            Notice("r%d progress: executed_writes=%zu speclog=%zu late=%zu%s%s", replicaIdx,
+                   executed, spec, orderer_->late_size(), spec > 4 ? " oldest: " : "",
+                   spec > 4 ? orderer_->DebugOldestEntry().c_str() : "");
+        }
+    }
 
     transport->Timer(ts_scan_ms_, [this]() { TsAgreementTick(); });   // re-arm
 }
@@ -259,6 +496,19 @@ DynaReplica::HandleClientRequest(const TransportAddress &remote,
         auto cit = reply_cache_.find(id);
         if (cit != reply_cache_.end()) {
             proto::SpecReply cached = cit->second;
+            // Answer with the txn's CURRENT state: after a commit or a view change its t
+            // and our leadership may differ from the cached release.
+            uint64_t live_t = 0;
+            bool live_leader = false;
+            if (orderer_->LiveState(id, &live_t, &live_leader)) cached.set_t(live_t);
+            // Leadership in the CURRENT view (the cached / executed flag may predate a
+            // view change).
+            bool leads = false;
+            for (const auto &kv : txn.w_set()) {
+                if (topo_.ownerOf(kv.key()) == static_cast<uint32_t>(replicaIdx)) leads = true;
+            }
+            cached.set_is_leader(leads);
+            cached.set_view_id(viewId_);
             // (unlock happens at scope exit; send after is fine — retry window is ms)
             transport->SendMessage(this, remote, cached);
             return;
@@ -427,6 +677,275 @@ DynaReplica::SendCommitReply(const TransportAddress &client, const TxnEntry &e)
     r.set_t(e.t);
     r.set_is_leader(e.is_leader_for_this);
     transport->SendMessage(this, client, r);
+}
+
+// ---------------------------------------------------------------------------------------
+// Views + recovery
+// ---------------------------------------------------------------------------------------
+
+void
+DynaReplica::HeartbeatTick()
+{
+    proto::Heartbeat hb;
+    hb.set_view_id(viewId_);
+    hb.set_sender_id(static_cast<uint32_t>(replicaIdx));
+    transport->SendMessageToAll(this, hb);
+
+    ViewCoordinator::Effects fx;
+    const uint64_t now = WallClockMicros();
+    vc_->Tick(now, &fx);
+    ApplyEffects(fx);
+    // Joiner: re-request a lost snapshot chunk.
+    if (catchup_.active && now >= catchup_.last_req_us + 4 * ts_scan_ms_ * 1000) {
+        SendSnapshotRequest();
+    }
+    transport->Timer(hb_ms_, [this]() { HeartbeatTick(); });   // re-arm
+}
+
+void
+DynaReplica::ApplyEffects(ViewCoordinator::Effects &fx)
+{
+    for (const auto &o : fx.out) {
+        if (o.to == ViewCoordinator::kAll) transport->SendMessageToAll(this, *o.msg);
+        else transport->SendMessageToReplica(this, o.to, *o.msg);
+    }
+    if (!Normal() && !paused_) {
+        paused_ = true;
+        orderer_->SetPaused(true);
+        Notice("r%d view change: pausing (view %lu -> %lu, alive %#lx -> %#lx)", replicaIdx,
+               (unsigned long)viewId_.load(), (unsigned long)vc_->target_view(),
+               (unsigned long)vc_->alive(), (unsigned long)vc_->target_alive());
+    }
+    if (fx.excluded) {
+        Warning("r%d left out of a started view: resetting state and rejoining", replicaIdx);
+        ResetForRejoin();
+    }
+    if (fx.adopt_view) AdoptViewAsNonMember();
+    if (fx.fresh_start) {
+        // Whole-cluster restart: nothing survives to rejoin; start over in view 0.
+        Warning("r%d every server is rejoining: starting fresh in view 0", replicaIdx);
+        catchup_ = CatchUp();
+        topo_ = topo_.WithAlive(vc_->alive());
+        orderer_->InstallView(topo_, 0, {}, [](const std::string &) { return false; });
+        viewId_ = 0;
+        PersistVrState(0, vc_->alive());
+        paused_ = false;
+        orderer_->SetPaused(false);
+    }
+    if (fx.begin_recovery) BeginRecovery();
+    if (fx.install) InstallNewView();
+}
+
+void
+DynaReplica::BeginRecovery()
+{
+    // Our own contribution to the M for our delta-p (the keys of the failed range that
+    // consistent hashing now assigns to us).
+    const uint32_t self = static_cast<uint32_t>(replicaIdx);
+    const Topology old_topo = topo_.WithAlive(vc_->old_alive());
+    const Topology new_topo = topo_.WithAlive(vc_->target_alive());
+    RecoveryData own = orderer_->CollectRecovery([&](const std::string &k) {
+        return InDeltaP(old_topo, new_topo, k, self);
+    });
+    if (debug_) {
+        Notice("r%d recovery view %lu: own delta-p txns=%zu kvs=%zu", replicaIdx,
+               (unsigned long)vc_->target_view(), own.txns.size(), own.kvs.size());
+    }
+    ViewCoordinator::Effects fx;
+    vc_->OnLocalRecoveryData(std::move(own), &fx);
+    ApplyEffects(fx);
+}
+
+void
+DynaReplica::HandleRecoveryRequest(const proto::RecoveryRequest &m)
+{
+    ViewCoordinator::Effects fx;
+    const uint64_t now = WallClockMicros();
+    vc_->OnHeard(m.requester_id(), now);
+    const bool ok = vc_->AcceptRecoveryView(m.view_id(), m.alive(), m.old_alive(), now, &fx);
+    ApplyEffects(fx);   // may begin our own recovery (and pause) first
+    if (!ok || m.requester_id() == static_cast<uint32_t>(replicaIdx)) return;
+
+    const uint32_t pl = m.requester_id();
+    const Topology old_topo = topo_.WithAlive(m.old_alive());
+    const Topology new_topo = topo_.WithAlive(m.alive());
+    RecoveryData d = orderer_->CollectRecovery([&](const std::string &k) {
+        return InDeltaP(old_topo, new_topo, k, pl);
+    });
+    proto::RecoveryReply r;
+    r.set_view_id(m.view_id());
+    r.set_sender_id(static_cast<uint32_t>(replicaIdx));
+    ToProto(d, r.mutable_txns(), r.mutable_kvs());
+    transport->SendMessageToReplica(this, pl, r);
+}
+
+void
+DynaReplica::InstallNewView()
+{
+    ViewCoordinator::Install in = vc_->TakeInstall(WallClockMicros());
+    const Topology old_topo = topo_.WithAlive(in.old_alive);
+    const Topology new_topo = topo_.WithAlive(in.alive);
+    ServerOrderer::InstallStats st = orderer_->InstallView(
+        new_topo, in.view, in.ms,
+        [&](const std::string &k) { return InFailedRange(old_topo, new_topo, k); });
+    topo_ = new_topo;
+    viewId_ = in.view;
+    {
+        // Resends in the new view must reach the orderer (which dedups by id itself):
+        // an id stuck "in flight" here (e.g. late-buffered) would otherwise be dropped.
+        std::lock_guard<std::mutex> lk(dedup_mu_);
+        inflight_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        pending_commits_.clear();
+    }
+    catchup_ = CatchUp();   // a joiner is a member from here on
+    PersistVrState(in.view, in.alive);
+    Notice("r%d view %lu installed: alive=%#lx Ms=%zu txns_installed=%zu kvs_applied=%zu "
+           "leftovers=%zu", replicaIdx, (unsigned long)in.view, (unsigned long)in.alive,
+           in.ms.size(), st.txns_installed, st.kvs_applied, st.leftovers);
+    paused_ = false;
+    orderer_->SetPaused(false);
+}
+
+void
+DynaReplica::SendViewInfo(const TransportAddress &client)
+{
+    proto::ViewInfo vi;
+    vi.set_view_id(viewId_);
+    vi.set_alive(topo_.alive_mask);
+    transport->SendMessage(this, client, vi);
+}
+
+// ---------------------------------------------------------------------------------------
+// Rejoin
+// ---------------------------------------------------------------------------------------
+
+std::string
+DynaReplica::VrStatePath() const
+{
+    return vr_state_dir_ + "/dyna-vr-" + std::to_string(replicaIdx) + ".state";
+}
+
+void
+DynaReplica::PersistVrState(uint64_t view, uint64_t alive)
+{
+    // Rare (once per view): write-temp + fsync + rename, so a crash leaves either the old
+    // or the new state.
+    const std::string path = VrStatePath();
+    const std::string tmp = path + ".tmp";
+    const std::string body = std::to_string(view) + " " + std::to_string(alive) + "\n";
+    const int fd = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        Warning("r%d cannot write VR state %s", replicaIdx, tmp.c_str());
+        return;
+    }
+    const bool ok = ::write(fd, body.data(), body.size()) == static_cast<ssize_t>(body.size());
+    ::fsync(fd);
+    ::close(fd);
+    if (!ok || std::rename(tmp.c_str(), path.c_str()) != 0) {
+        Warning("r%d cannot persist VR state %s", replicaIdx, path.c_str());
+    }
+}
+
+void
+DynaReplica::ResetForRejoin()
+{
+    orderer_->Reset();
+    {
+        std::lock_guard<std::mutex> lk(dedup_mu_);
+        reply_cache_.clear();
+        inflight_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lk(pending_mu_);
+        pending_commits_.clear();
+    }
+    catchup_ = CatchUp();
+}
+
+void
+DynaReplica::AdoptViewAsNonMember()
+{
+    topo_ = topo_.WithAlive(vc_->alive());
+    viewId_ = vc_->view();
+    orderer_->InstallView(topo_, vc_->view(), {}, [](const std::string &) { return false; });
+    // (Re)start catch-up from this view's VR leader: a new session re-enumerates its keys
+    // (anything already applied is skipped by the t-guard).
+    catchup_.active = true;
+    catchup_.donor = ViewCoordinator::LeaderOf(vc_->alive());
+    catchup_.view = vc_->view();
+    catchup_.session += 1;
+    catchup_.next_offset = 0;
+    catchup_.kvs_applied = 0;
+    Notice("r%d rejoining: adopted view %lu (alive=%#lx) as non-member; catching up from r%u",
+           replicaIdx, (unsigned long)catchup_.view, (unsigned long)vc_->alive(),
+           catchup_.donor);
+    SendSnapshotRequest();
+}
+
+void
+DynaReplica::SendSnapshotRequest()
+{
+    proto::SnapshotRequest m;
+    m.set_view_id(catchup_.view);
+    m.set_requester_id(static_cast<uint32_t>(replicaIdx));
+    m.set_session(catchup_.session);
+    m.set_offset(catchup_.next_offset);
+    catchup_.last_req_us = WallClockMicros();
+    transport->SendMessageToReplica(this, catchup_.donor, m);
+}
+
+void
+DynaReplica::HandleSnapshotRequest(const TransportAddress &remote,
+                                   const proto::SnapshotRequest &m)
+{
+    if (!Normal() || m.view_id() != viewId_.load()) return;   // it re-syncs its view
+    DonorSession &sess = donor_sessions_[m.requester_id()];
+    if (sess.session != m.session()) {
+        sess.session = m.session();
+        sess.keys = orderer_->SnapshotKeys();
+    }
+    const size_t off = static_cast<size_t>(m.offset());
+    RecoveryData d;
+    d.kvs = orderer_->SnapshotRead(sess.keys, off, snapshot_chunk_);
+    const bool done = off + snapshot_chunk_ >= sess.keys.size();
+    if (done) d.txns = orderer_->CommittedTxns();
+
+    proto::SnapshotChunk c;
+    c.set_view_id(m.view_id());
+    c.set_sender_id(static_cast<uint32_t>(replicaIdx));
+    c.set_session(m.session());
+    c.set_offset(m.offset());
+    c.set_total(sess.keys.size());
+    c.set_done(done);
+    c.set_next_offset(off + snapshot_chunk_);
+    ToProto(d, c.mutable_txns(), c.mutable_kvs());
+    transport->SendMessage(this, remote, c);
+}
+
+void
+DynaReplica::HandleSnapshotChunk(const proto::SnapshotChunk &m)
+{
+    if (!catchup_.active || m.session() != catchup_.session ||
+        m.offset() != catchup_.next_offset || m.view_id() != catchup_.view) {
+        return;   // stale / duplicate
+    }
+    RecoveryData d = FromProto(m.txns(), m.kvs());
+    catchup_.kvs_applied += orderer_->InstallSnapshot(d);
+    catchup_.next_offset = m.next_offset();
+    if (!m.done()) {
+        SendSnapshotRequest();
+        return;
+    }
+    catchup_.active = false;
+    Notice("r%d caught up in view %lu: %lu keys from r%u (%zu applied), %d txns; asking to "
+           "rejoin", replicaIdx, (unsigned long)catchup_.view, (unsigned long)m.total(),
+           catchup_.donor, catchup_.kvs_applied, m.txns_size());
+    ViewCoordinator::Effects fx;
+    vc_->OnCaughtUp(&fx);
+    ApplyEffects(fx);
 }
 
 } // namespace dyna

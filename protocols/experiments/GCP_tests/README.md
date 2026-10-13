@@ -90,7 +90,7 @@ SSH_USER=nathan python3 run_cluster_bench.py \
 
 
 
-`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`; DYNA is in-memory, nothing to wipe). Use `--no-clean-remote` only if you need to preserve state for debugging.
+`run_cluster_bench.py` starts replicas, launches clients in the background, waits, fetches logs. Each run **clears remote bench state by default** (stops old processes, `rm ~/bench/runs/*` on senders, VR `rm /dev/shm/rocks{idx}`; DYNA `rm ~/Ionia/protocols/src/ionia/splinterdb.db`). Use `--no-clean-remote` only if you need to preserve state for debugging.
 
 ```bash
 # VR — open-loop default (~6000 offered ops/s with --poisson-rate 60)
@@ -149,7 +149,7 @@ SSH_USER=$SSH_USER python3 run_throughput_sweep.py --protocol dyna --threads 1 4
 
 ### DYNA details
 
-DYNA is `protocols/src/ionia/dyna/` (`bench/replica -m dyna`): multi-partition deadline-ordered replication (N = 2f+1 servers, server *i* leads partition *i*). It uses `~/bench/dynaconfig` and `~/bench/trace.micro` (1000 keys) — the bench picks a **uniformly random key per request**. Replicas use an **InMemoryBackend** (no WAL / SplinterDB / RocksDB — nothing to wipe between runs); the client retransmits (`DYNA_RESEND_TIMEOUT_MS`, default 30ms) and replicas answer retries from an at-most-once reply cache.
+DYNA is `protocols/src/ionia/dyna/` (`bench/replica -m dyna`): multi-partition deadline-ordered replication (N = 2f+1 servers, server *i* leads partition *i*). It uses `~/bench/dynaconfig` and `~/bench/trace.micro` (1000 keys) — the bench picks a **uniformly random key per request**. Replicas execute committed writes into the harness **SplinterDB** (`IONIA_DB_MODE=splinter` default, 256MB cache / 2GB disk like IONIA's helper, `use_log=0`, no fsync — durability comes from f+1 replication; `IONIA_DB_MODE=memory` for lib's in-memory store); the client retransmits (`DYNA_RESEND_TIMEOUT_MS`, default 30ms) and replicas answer retries from an at-most-once reply cache.
 
 **Setup:** deploy your local tree via `--rsync-from` or push to GitHub first:
 
@@ -310,7 +310,9 @@ Helpers: `~/bench/run_paxos_vr_client.sh`, `~/bench/run_dyna_client.sh` (open-lo
 | `DYNA_RESEND_TIMEOUT_MS` | client | Retransmit interval (default 30) |
 | `DYNA_SLOW_TIMEOUT_US` | client | All leaders replied but quorum short → force slow path after max(this, 3×bound) µs (default 2000; raise on WAN) |
 | `DYNA_TS_SCAN_MS` / `DYNA_TS_TIMEOUT_MS` | replica | Background tick (ts-agreement, prepare re-broadcast, stale-commit re-ack, executor backstop; default 50ms) / SPECULATIVE age before ts-agreement (default 100ms) |
-| `DYNA_SIM_DISK_LATENCY_US` | replica | Simulated async disk-persist latency (off the critical path) |
+| `DYNA_FAIL_TIMEOUT_MS` | replica | Recovery: a peer silent this long is suspected → view change (default 1000; `0` disables failure detection — no false view changes under extreme load) |
+| `DYNA_FAIL_GRACE_MS` / `DYNA_HB_MS` | replica | Allowance for a peer never heard from since start (default 10000; also how long a whole-cluster restart waits before starting fresh) / heartbeat + VR tick period (default 20) |
+| `DYNA_VR_STATE_DIR` / `DYNA_SNAPSHOT_CHUNK` | replica | Where `dyna-vr-<idx>.state` (persisted view; its presence at startup ⇒ rejoin) lives (default cwd; the dyna cleanup removes it) / key-values per rejoin catch-up chunk (default 512) |
 | `DYNA_DEBUG=1` | both | Log request / reply / quorum flow (verbose) |
 | `BENCH_INFLIGHT_LOG=1` | client | Adds `inflight=` and `submitted=` to throughput interval lines |
 
