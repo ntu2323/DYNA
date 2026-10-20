@@ -28,7 +28,8 @@ namespace dyna {
 
 // Compare is a strict-weak "less" on Value: comp(a, b) == true means a orders
 // before b (a is nearer the top / min). Default std::less<Value>.
-template <class Id, class Value, class Compare = std::less<Value>>
+template <class Id, class Value, class Compare = std::less<Value>,
+          class Hash = ankerl::unordered_dense::hash<Id>>
 class IndexedMinPQ {
 public:
     IndexedMinPQ() = default;
@@ -159,7 +160,7 @@ private:
     }
 
     std::vector<std::pair<Id, Value>> heap_;   // OrderKey-ordered binary min-heap
-    HashMap<Id, size_t>               pos_;    // id -> heap index (kept in sync)
+    ankerl::unordered_dense::map<Id, size_t, Hash> pos_;   // id -> heap index (kept in sync)
     Compare                           comp_{};
 };
 

@@ -270,16 +270,16 @@ private:
     StorageBackend *backend_;    // KV store for executed writes (nullptr in unit tests)
 
     std::mutex mu_;
-    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess> early_buffer_;
-    HashMap<TxnId, TxnEntry>                     late_buffer_;   // late follower arrivals
-    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess> spec_log_;
+    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> early_buffer_;
+    TxnMap<TxnEntry>                             late_buffer_;   // late follower arrivals
+    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> spec_log_;
     OrderKey highest_released_t_{};   // max OrderKey ever appended to specLog
 
     // Writes this server executed and GC'd from specLog: id -> (final t, led by us).
     // Guards against re-inserting (and re-applying) a txn after GC via a late commit,
     // prepare, fetch, or client retry. GC deferred (grows with history).
     struct ExecutedInfo { uint64_t t = 0; bool is_leader = false; };
-    HashMap<TxnId, ExecutedInfo> executed_;
+    TxnMap<ExecutedInfo> executed_;
 
     std::thread       release_thread_;
     std::atomic<bool> running_{false};

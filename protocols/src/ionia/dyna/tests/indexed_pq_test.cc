@@ -185,7 +185,7 @@ TEST(IndexedMinPQ, RandomizedMatchesOracle)
 // bumps the live t and re-heapifies (specLog behavior).
 TEST(IndexedMinPQ, TxnEntryByOrderKey)
 {
-    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess> spec;
+    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> spec;
 
     auto make = [](uint64_t c, uint64_t r, uint64_t t) {
         TxnEntry e;

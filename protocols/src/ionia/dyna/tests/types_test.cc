@@ -218,3 +218,33 @@ TEST(Clock, MockClockIsControllable)
     clk.Set(42);
     EXPECT_EQ(clk.Now(), 42u);
 }
+
+// ---------------------------------------------------------------------------
+// TxnIdHash — must spread ids (the framework's std::hash<ClientAndReqId> returns 0
+// for every id, which turned every TxnId-keyed lookup into a linear scan).
+// ---------------------------------------------------------------------------
+
+TEST(TxnIdHash, DistinctForSequentialIds)
+{
+    TxnIdHash h;
+    std::set<uint64_t> seen;
+    for (uint64_t c = 1; c <= 24; c++) {
+        for (uint64_t r = 1; r <= 1000; r++) seen.insert(h(TxnId{c, r}));
+    }
+    EXPECT_EQ(seen.size(), 24u * 1000u);
+    EXPECT_NE(h(TxnId{1, 2}), h(TxnId{2, 1}));   // not symmetric in (client, req)
+}
+
+TEST(TxnIdHash, TxnMapLookupsWork)
+{
+    TxnMap<int> m;
+    TxnSet s;
+    for (uint64_t r = 1; r <= 5000; r++) {
+        m[TxnId{7, r}] = static_cast<int>(r);
+        s.insert(TxnId{7, r});
+    }
+    EXPECT_EQ(m.size(), 5000u);
+    EXPECT_EQ(m.at(TxnId{7, 4321}), 4321);
+    EXPECT_TRUE(s.contains(TxnId{7, 1}));
+    EXPECT_FALSE(s.contains(TxnId{8, 1}));
+}

@@ -811,7 +811,7 @@ ServerOrderer::InstallView(const Topology &topo, uint64_t view_id,
         for (auto &kv : late_buffer_) ComputeLeadership(kv.second);
 
         // 3. M txns.
-        std::unordered_set<TxnId> in_m;
+        TxnSet in_m;
         for (const RecoveryData &m : ms) {
             for (const RecoveredTxn &r : m.txns) {
                 in_m.insert(r.Key());

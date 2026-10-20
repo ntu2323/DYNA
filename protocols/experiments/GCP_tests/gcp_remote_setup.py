@@ -111,6 +111,8 @@ def rsync_ionia(local_root: str, host: str, ssh_user: str, ssh_key: Optional[str
             "protocols/src/paxos/.obj",
             "--exclude",
             "docker/smoke-output",
+            "--exclude",
+            "protocols/experiments/GCP_tests/secrets",
             "-e",
             f"ssh {ssh_part}",
             f"{local_root.rstrip('/')}/",

@@ -22,6 +22,11 @@ PKILL_REPLICA = (
 PKILL_CLIENT = "pkill -f '[b]ench/client' 2>/dev/null || true"
 PGREP_CLIENT = "pgrep -f '[b]ench/client' >/dev/null"
 
+# Possible DYNA replica working dirs (start_dyna_replica.sh uses /mydata/dyna when it
+# exists: SplinterDB needs fallocate, which CloudLab's ext3 root filesystem lacks).
+DYNA_RUN_DIRS = "$HOME/Ionia/protocols/src/ionia /mydata/dyna"
+
+
 def remote_sender_cleanup_cmd() -> str:
     """Stop clients and remove prior run artifacts (logs, latencies) on a sender VM."""
     # Avoid bare glob (fails when runs/ is empty). Do not combine with pkill on one ssh -c
@@ -48,13 +53,15 @@ def remote_receiver_cleanup_cmd(
         # rocks/in-mem KV under /dev/shm/rocks<idx>; wipe it for a clean run.
         parts.append(f"rm -rf /dev/shm/rocks{replica_idx}")
     elif protocol == "dyna":
-        # DYNA's store is the harness SplinterDB file in the replica's working dir;
+        # DYNA's store is the harness SplinterDB file in the replica's working dir
+        # (DYNA_RUN_DIRS: /mydata/dyna when that ext4 disk exists, else the source dir);
         # remove it so each run starts empty (the replica then creates a fresh one).
-        parts.append("rm -f $HOME/Ionia/protocols/src/ionia/splinterdb.db")
         # ...and its persisted VR state: a leftover dyna-vr-<idx>.state makes a replica
         # start as a REJOINER (it believes it crashed) instead of in a fresh view 0.
-        parts.append("rm -f $HOME/Ionia/protocols/src/ionia/dyna-vr-*.state "
-                     "$HOME/Ionia/protocols/src/ionia/dyna-vr-*.state.tmp")
+        parts.append(
+            f"for d in {DYNA_RUN_DIRS}; do "
+            "rm -f $d/splinterdb.db $d/dyna-vr-*.state $d/dyna-vr-*.state.tmp; done"
+        )
     return "; ".join(parts)
 
 

@@ -58,8 +58,9 @@ set -euo pipefail
 IDX="${1:?replica index 0|1|2}"
 # DYNA executes committed writes into the harness store: SplinterDB by default (real
 # disk; same cache/disk sizes as start_ionia_replica.sh). The DB file is splinterdb.db in
-# the replica's working directory (~/Ionia/protocols/src/ionia). IONIA_DB_MODE=memory uses
-# lib's in-memory store instead.
+# the replica's working directory: /mydata/dyna when it exists (an ext4 disk; SplinterDB
+# needs fallocate, which CloudLab's ext3 root lacks), else ~/Ionia/protocols/src/ionia.
+# IONIA_DB_MODE=memory uses lib's in-memory store instead.
 export IONIA_DB_MODE="${IONIA_DB_MODE:-splinter}"
 export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
 export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
@@ -74,10 +75,12 @@ export DYNA_BUSY_POLL="${DYNA_BUSY_POLL:-1}"
 # Background ts-agreement / replication / execution tick, and SPECULATIVE timeout.
 export DYNA_TS_SCAN_MS="${DYNA_TS_SCAN_MS:-50}"
 export DYNA_TS_TIMEOUT_MS="${DYNA_TS_TIMEOUT_MS:-100}"
-cd "${HOME}/Ionia/protocols/src/ionia"
+RUN_DIR="${HOME}/Ionia/protocols/src/ionia"
+if [[ -d /mydata/dyna ]]; then RUN_DIR=/mydata/dyna; fi
+cd "${RUN_DIR}"
 pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
-nohup ./bench/replica -i "${IDX}" -j 1 -b 1 -c ~/bench/dynaconfig -m dyna \
+nohup "${HOME}/Ionia/protocols/src/ionia/bench/replica" -i "${IDX}" -j 1 -b 1 -c ~/bench/dynaconfig -m dyna \
   > ~/bench/replica-"${IDX}".log 2>&1 &
 echo "Started DYNA replica index=${IDX} pid=$!"
 EOF

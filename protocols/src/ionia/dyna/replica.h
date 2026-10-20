@@ -159,8 +159,8 @@ private:
     // WRITE ClientRequest is answered from cache and never double-submitted. READs bypass
     // both: every read attempt carries a fresh request_id and a new t.
     std::mutex dedup_mu_;
-    HashMap<TxnId, proto::SpecReply> reply_cache_;
-    std::unordered_set<TxnId>        inflight_;
+    TxnMap<proto::SpecReply>        reply_cache_;
+    TxnSet                           inflight_;
 
     // A commit that arrived before the body: remember it until the fetch completes.
     struct PendingCommit {
@@ -169,7 +169,7 @@ private:
         std::shared_ptr<TransportAddress> client_addr;
     };
     std::mutex pending_mu_;
-    HashMap<TxnId, PendingCommit> pending_commits_;
+    TxnMap<PendingCommit> pending_commits_;
 };
 
 } // namespace dyna

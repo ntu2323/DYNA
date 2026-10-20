@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from gcp_bench_common import (
+    DYNA_RUN_DIRS,
     PKILL_CLIENT,
     PKILL_REPLICA,
     fetch_remote_file,
@@ -245,8 +246,11 @@ def _build_client_cmd(
         # Set DYNA_BUSY_POLL=0 to make the CLIENT epoll-block: many client threads
         # (-j N) then PARK when idle instead of each spinning a core, so multi-thread
         # load scales without CPU / NIC-RX-softirq starvation (which collapses busy-poll
-        # at high -j). This affects clients only; replicas keep their own default.
-        _client_busy = os.environ.get("DYNA_BUSY_POLL", "1")
+        # at high -j). DYNA_CLIENT_BUSY_POLL sets the clients alone (e.g. epoll clients
+        # with busy-poll replicas); DYNA_BUSY_POLL also reaches the replicas.
+        _client_busy = os.environ.get(
+            "DYNA_CLIENT_BUSY_POLL", os.environ.get("DYNA_BUSY_POLL", "1")
+        )
         dyna_env = (
             f"export DYNA_INITIAL_BOUND_US={_init_bound}; "
             f"export DYNA_MAX_OWD_US={_max_owd}; "
@@ -292,6 +296,7 @@ _DYNA_REPLICA_ENV_KNOBS = (
     "DYNA_HB_MS",
     "DYNA_SNAPSHOT_CHUNK",
     "DYNA_VR_STATE_DIR",
+    "IONIA_DB_MODE",
 )
 
 
@@ -475,7 +480,8 @@ def _fetch_replica_log(
     ssh_user: str,
     ssh_key: Optional[str],
 ) -> tuple[str, bool, str]:
-    """Pull ~/bench/replica-<idx>.log from a receiver (best-effort, for debugging)."""
+    """Pull ~/bench/replica-<idx>.log from a receiver (best-effort, for debugging), plus
+    replica-<idx>.killed.log (the pre-kill log of a --restart-at-sec failover run)."""
     idx = receiver_index(role)
     local_dir = os.path.join(local_run_dir, role)
     os.makedirs(local_dir, exist_ok=True)
@@ -491,9 +497,134 @@ def _fetch_replica_log(
             remote,
             os.path.join(local_dir, f"replica-{idx}.log"),
         )
+        killed = f"~/bench/replica-{idx}.killed.log"
+        r = ssh_run(host, ssh_user, ssh_key, f"test -f {killed} && echo yes")
+        if "yes" in (r.stdout or ""):
+            fetch_remote_file(
+                host,
+                ssh_user,
+                ssh_key,
+                killed,
+                os.path.join(local_dir, f"replica-{idx}.killed.log"),
+            )
         return role, True, ""
     except subprocess.CalledProcessError as e:
         return role, False, str(e)
+
+
+# ---------------------------------------------------------------------------------------
+# DYNA failover (--kill-replica / --kill-at-sec / --restart-at-sec)
+# ---------------------------------------------------------------------------------------
+
+def _failover_driver(
+    role: str,
+    host: str,
+    idx: int,
+    t0: float,
+    kill_at: float,
+    restart_at: Optional[float],
+    ssh_user: str,
+    ssh_key: Optional[str],
+    events: List[str],
+) -> None:
+    """Kill replica `idx` (kill -9: a crash, not a shutdown) at t0+kill_at; optionally
+    restart it at t0+restart_at. The restart keeps dyna-vr-<idx>.state (that is what
+    makes it rejoin) but drops splinterdb.db (not trusted across a crash; catch-up
+    refills it), and keeps the pre-kill log as replica-<idx>.killed.log."""
+    time.sleep(max(0.0, t0 + kill_at - time.time()))
+    r = ssh_run(host, ssh_user, ssh_key, "pkill -9 -f '[b]ench/replica' 2>/dev/null || true")
+    events.append(f"+{time.time() - t0:.1f}s killed replica {idx} on {role} (rc={r.returncode})")
+    print(f"  [failover] {events[-1]}")
+    if restart_at is None:
+        return
+    time.sleep(max(0.0, t0 + restart_at - time.time()))
+    cmd = (
+        f"mv -f ~/bench/replica-{idx}.log ~/bench/replica-{idx}.killed.log 2>/dev/null || true; "
+        f"for d in {DYNA_RUN_DIRS}; do rm -f $d/splinterdb.db; done; "
+        + _dyna_replica_env_prefix()
+        + PROTOCOLS["dyna"]["replica_start"].format(idx=idx)
+    )
+    r = ssh_run(host, ssh_user, ssh_key, cmd)
+    events.append(
+        f"+{time.time() - t0:.1f}s restarted replica {idx} on {role} (rc={r.returncode})"
+    )
+    print(f"  [failover] {events[-1]}")
+
+
+_FAILOVER_MARKERS = (
+    "view change: pausing",
+    "installed:",
+    "caught up",
+    "rejoining",
+    "left out of a started view",
+    "every server is rejoining",
+)
+
+
+def _summarize_dyna_views(
+    local_run_dir: str,
+    receiver_roles: List[str],
+    sender_roles: List[str],
+    kill_idx: Optional[int],
+    restarted: bool,
+) -> bool:
+    """Print every view-change line from the fetched replica logs and each sender's
+    throughput timeline; check the expected views were installed. Returns ok."""
+    import glob
+    import re
+
+    print("\n=== DYNA view changes (replica logs) ===")
+    installed: Dict[str, set] = {}
+    pauses = 0
+    for role in receiver_roles:
+        for path in sorted(glob.glob(os.path.join(local_run_dir, role, "replica-*.log"))):
+            name = f"{role}/{os.path.basename(path)}"
+            installed[name] = set()
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if any(m in line for m in _FAILOVER_MARKERS):
+                        print(f"  {name}: {line.strip().split(':  ', 1)[-1]}")
+                    if "view change: pausing" in line:
+                        pauses += 1
+                    m = re.search(r"view (\d+) installed", line)
+                    if m:
+                        installed[name].add(int(m.group(1)))
+
+    print("\n=== Client throughput timeline (ops per interval) ===")
+    for role in sender_roles:
+        path = os.path.join(local_run_dir, role, "client.log")
+        if not os.path.isfile(path):
+            continue
+        samples = []
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                m = re.search(r"Completed (\d+) requests at (\d+) ms", line)
+                if m:
+                    samples.append(m.group(1))
+        print(f"  {role}: {' '.join(samples) if samples else '(no interval lines)'}")
+
+    ok = True
+    if kill_idx is None:
+        if pauses:
+            print(f"\nWARNING: {pauses} view-change pause(s) without a planned failure "
+                  "(false suspicion? raise DYNA_FAIL_TIMEOUT_MS)", file=sys.stderr)
+            ok = False
+        return ok
+    for name, views in installed.items():
+        if f"replica-{kill_idx}.killed.log" in name:
+            continue   # the crashed incarnation
+        if restarted:
+            want = 2
+        elif name.endswith(f"replica-{kill_idx}.log"):
+            continue   # the killed replica's (only) log, no restart
+        else:
+            want = 1
+        if want not in views:
+            print(f"FAILOVER CHECK FAILED: {name} never installed view {want} "
+                  f"(installed: {sorted(views) or 'none'})", file=sys.stderr)
+            ok = False
+    print("\nFailover check:", "OK" if ok else "FAILED")
+    return ok
 
 
 def main() -> None:
@@ -618,6 +749,25 @@ def main() -> None:
         action="store_true",
         help="Do not wipe remote bench state (default: pkill, rm runs/*, VR rocks).",
     )
+    ap.add_argument(
+        "--kill-replica",
+        type=int,
+        default=None,
+        help="DYNA failover: kill -9 this replica index (0..2) mid-run.",
+    )
+    ap.add_argument(
+        "--kill-at-sec",
+        type=float,
+        default=10.0,
+        help="With --kill-replica: seconds after the clients launch (default 10).",
+    )
+    ap.add_argument(
+        "--restart-at-sec",
+        type=float,
+        default=None,
+        help="With --kill-replica: restart it at this many seconds after the clients launch "
+        "(it rejoins: catch-up, then a view change that re-adds it).",
+    )
     ap.add_argument("--skip-replicas", action="store_true")
     ap.add_argument("--skip-clients", action="store_true", help="Only (re)start replicas.")
     args = ap.parse_args()
@@ -636,6 +786,15 @@ def main() -> None:
         sys.exit("--wan-open-loop requires open-loop (omit --closed-loop)")
     if args.high_throughput_latency and args.closed_loop:
         sys.exit("--high-throughput-latency requires open-loop (omit --closed-loop)")
+    if args.kill_replica is not None:
+        if args.protocol != "dyna":
+            sys.exit("--kill-replica applies only to --protocol dyna")
+        if args.restart_at_sec is not None and args.restart_at_sec <= args.kill_at_sec:
+            sys.exit("--restart-at-sec must be after --kill-at-sec")
+        if args.kill_at_sec >= args.warmup_sec + args.experiment_sec:
+            sys.exit("--kill-at-sec must fall inside the run (warmup + experiment)")
+    elif args.restart_at_sec is not None:
+        sys.exit("--restart-at-sec needs --kill-replica")
 
     offered_ops_per_sec = args.offered_ops_per_sec
     max_inflight = args.max_inflight
@@ -750,6 +909,10 @@ def main() -> None:
             if args.protocol == "ionia"
             else None
         ),
+        "kill_replica": args.kill_replica,
+        "kill_at_sec": args.kill_at_sec if args.kill_replica is not None else None,
+        "restart_at_sec": args.restart_at_sec,
+        "failover_events": [],
         "receivers": [{"role": r, "host": hosts[r], "index": receiver_index(r)} for r in receiver_roles],
         "senders": senders_meta,
         "t0_unix": None,
@@ -882,6 +1045,34 @@ def main() -> None:
                 sys.exit(f"Client launch failed on {role}: {err}")
             print(f"  [{role}] client launched")
 
+    failover_thread = None
+    if args.kill_replica is not None:
+        import threading
+
+        kill_role = next((r for r in receiver_roles if receiver_index(r) == args.kill_replica), None)
+        if kill_role is None:
+            sys.exit(f"--kill-replica {args.kill_replica}: no such receiver")
+        when = f"kill at +{args.kill_at_sec:g}s"
+        if args.restart_at_sec is not None:
+            when += f", restart at +{args.restart_at_sec:g}s"
+        print(f"Failover: replica {args.kill_replica} ({kill_role}): {when}")
+        failover_thread = threading.Thread(
+            target=_failover_driver,
+            args=(
+                kill_role,
+                hosts[kill_role],
+                args.kill_replica,
+                t0,
+                args.kill_at_sec,
+                args.restart_at_sec,
+                args.ssh_user,
+                ssh_key,
+                meta["failover_events"],
+            ),
+            daemon=True,
+        )
+        failover_thread.start()
+
     print("Waiting for clients to finish...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(sender_roles)) as ex:
         futs = [
@@ -902,6 +1093,9 @@ def main() -> None:
                 print(f"  [{role}] WARNING: wait timed out or failed: {err}", file=sys.stderr)
             else:
                 print(f"  [{role}] client done")
+
+    if failover_thread is not None:
+        failover_thread.join()
 
     print("Fetching logs...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(sender_roles)) as ex:
@@ -945,12 +1139,25 @@ def main() -> None:
             else:
                 print(f"  [{role}] no replica log ({err})", file=sys.stderr)
 
+    failover_ok = True
+    if args.protocol == "dyna":
+        failover_ok = _summarize_dyna_views(
+            local_run_dir,
+            receiver_roles,
+            sender_roles,
+            args.kill_replica,
+            args.restart_at_sec is not None,
+        )
+        meta["failover_ok"] = failover_ok
+
     meta_path = os.path.join(local_run_dir, "run_meta.json")
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     print(f"\nRun complete. Local results: {local_run_dir}")
     print(f"  python3 aggregate_bench_results.py {local_run_dir}")
+    if args.kill_replica is not None and not failover_ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -213,6 +213,56 @@ python3 run_throughput_sweep.py \
 
 **Manual (SSH):** receivers `~/bench/start_dyna_replica.sh <0|1|2>`; sender `~/bench/run_dyna_client.sh <client_id> [threads] [poisson-rate] [secs] [warmup]` (open-loop Poisson over `trace.micro`). Deadline env (`DYNA_INITIAL_BOUND_US`, `DYNA_MAX_OWD_US`, `DYNA_OWD_PERCENTILE`) applies to both replicas and senders.
 
+### CloudLab (or any existing machines): just fill in the IPs
+
+`create_cluster.py` is GCP-only; on CloudLab skip it and write `cluster_hosts.json` by hand —
+only `hosts` (public IPs, for SSH) and `receiver_internal` (experiment-LAN IPs, used in
+`~/bench/dynaconfig`) are read:
+
+```json
+{
+  "hosts": {
+    "receiver1": "<public>", "receiver2": "<public>", "receiver3": "<public>",
+    "sender1": "<public>"
+  },
+  "receiver_internal": {
+    "receiver1": "10.10.1.1", "receiver2": "10.10.1.2", "receiver3": "10.10.1.3"
+  }
+}
+```
+
+Then deploy the local tree (`--rsync-from`; needed for uncommitted work) and run:
+
+```bash
+SSH_USER=<cloudlab-user> SSH_KEY_FILE=<key> python3 setup_dyna_cluster.py \
+  --hosts-file cluster_hosts.json --rsync-from /path/to/Ionia          # add --skip-build later
+SSH_USER=<cloudlab-user> SSH_KEY_FILE=<key> python3 run_cluster_bench.py --protocol dyna \
+  --hosts-file cluster_hosts.json -e 20
+```
+
+After a DYNA run the script prints every view-change line from the replica logs and each
+sender's per-interval throughput; a normal run should show **no** `view change: pausing`
+(otherwise the failure detector fired falsely — raise `DYNA_FAIL_TIMEOUT_MS`).
+
+### DYNA failover (recovery / rejoin)
+
+```bash
+# kill -9 replica 1 at +10s (survivors must install view 1)
+python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json -e 30 \
+  --kill-replica 1 --kill-at-sec 10
+# ...and restart it at +15s (it rejoins; everyone must install view 2)
+python3 run_cluster_bench.py --protocol dyna --hosts-file cluster_hosts.json -e 30 \
+  --kill-replica 0 --kill-at-sec 10 --restart-at-sec 15
+```
+
+Times are seconds after the clients launch. The restart keeps `dyna-vr-<idx>.state` (so it
+rejoins) and deletes `splinterdb.db`; the pre-kill log is kept as
+`replica-<idx>.killed.log`. The run exits non-zero if the expected views weren't installed.
+To stress the recovery transfer size (M / rejoin snapshot, currently plain UDP with 9000-byte
+fragments), redeploy with a larger key space, e.g. `BENCH_TRACE_NUM_KEYS=100000
+python3 setup_dyna_cluster.py ... --skip-build`, and watch for `Sending large` in the replica
+logs and for recoveries that stall.
+
 ### WAN open-loop (VR or DYNA)
 
 Wide RTT makes `--poisson-rate 50` (~5k offered ops/s per sender) stall the client (0 experiment completions). Use:

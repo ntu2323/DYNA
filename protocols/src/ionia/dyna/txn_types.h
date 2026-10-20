@@ -23,9 +23,27 @@ namespace specpaxos {
 namespace dyna {
 
 // Globally-unique transaction identifier: (client_id, request_id). Identical to
-// the framework's ClientAndReqId (two uint64s) so it reuses its std::hash and
-// slots straight into HashMap without a custom hasher.
+// the framework's ClientAndReqId (two uint64s).
 using TxnId = ClientAndReqId;
+
+// Hash for TxnId-keyed containers. Do NOT use the framework's std::hash<ClientAndReqId>
+// (common/log.h): it discards hash_combine's return value and always yields 0, so every
+// lookup degenerates into a linear scan that grows with the map (measured on CloudLab:
+// throughput collapsed below 1k ops/s and kept falling). Always key DYNA containers with
+// TxnMap / TxnSet / TxnIdHash.
+struct TxnIdHash {
+    using is_avalanching = void;   // ankerl: output is already well mixed
+    uint64_t operator()(const TxnId &x) const noexcept {
+        uint64_t h = x.clientid * 0x9E3779B97F4A7C15ULL ^ x.clientreqid;
+        h ^= h >> 30; h *= 0xBF58476D1CE4E5B9ULL;   // splitmix64 finalizer
+        h ^= h >> 27; h *= 0x94D049BB133111EBULL;
+        return h ^ (h >> 31);
+    }
+};
+
+template <class V>
+using TxnMap = ankerl::unordered_dense::map<TxnId, V, TxnIdHash>;
+using TxnSet = ankerl::unordered_dense::set<TxnId, TxnIdHash>;
 
 inline TxnId MakeTxnId(uint64_t client_id, uint64_t request_id) {
     return TxnId{client_id, request_id};
