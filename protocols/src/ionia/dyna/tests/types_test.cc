@@ -5,6 +5,7 @@
 //   (spec §1.1, the basis of the total-order / Invariant-1 proof), protobuf
 //   round-trips for the wire messages (§2), and TxnEntry Key()/Order() derivation.
 
+#include "dyna/bg_outbox.h"
 #include "dyna/dyna-proto.pb.h"
 #include "dyna/txn_types.h"
 #include "dyna/wall_clock.h"
@@ -247,4 +248,74 @@ TEST(TxnIdHash, TxnMapLookupsWork)
     EXPECT_EQ(m.at(TxnId{7, 4321}), 4321);
     EXPECT_TRUE(s.contains(TxnId{7, 1}));
     EXPECT_FALSE(s.contains(TxnId{8, 1}));
+}
+
+// ---------------------------------------------------------------------------
+// BgOutbox — per-destination batching of background messages (bg_outbox.h).
+// ---------------------------------------------------------------------------
+
+namespace {
+proto::ReplicatePrepareReply Ack(uint64_t req)
+{
+    proto::ReplicatePrepareReply a;
+    a.set_client_id(7);
+    a.set_request_id(req);
+    a.set_view_id(0);
+    a.set_server_id(1);
+    return a;
+}
+} // namespace
+
+TEST(BgOutbox, FullByEntryCountAndTakeEmpties)
+{
+    BgOutbox box(3, /*max_entries=*/3, /*max_bytes=*/0);
+    EXPECT_FALSE(box.AddPrepareReply(1, Ack(1)));
+    EXPECT_FALSE(box.AddPrepareReply(1, Ack(2)));
+    EXPECT_FALSE(box.AddPrepareReply(2, Ack(3)));   // other destination: own count
+    EXPECT_TRUE(box.AddPrepareReply(1, Ack(4)));    // 3rd entry for r1 -> full
+
+    proto::BgBatch b;
+    size_t n = 0;
+    ASSERT_TRUE(box.Take(1, &b, &n));
+    EXPECT_EQ(n, 3u);
+    ASSERT_EQ(b.prepare_replies_size(), 3);
+    EXPECT_EQ(b.prepare_replies(0).request_id(), 1u);   // per-txn entries kept in order
+    EXPECT_EQ(b.prepare_replies(2).request_id(), 4u);
+    EXPECT_EQ(box.pending(1), 0u);
+    EXPECT_FALSE(box.Take(1, &b));                       // now empty
+    EXPECT_EQ(box.pending(2), 1u);
+}
+
+TEST(BgOutbox, FullByBytesAndTakeAllMixesKinds)
+{
+    BgOutbox box(3, /*max_entries=*/1000, /*max_bytes=*/200);
+    proto::ReplicateCommit c;
+    c.set_client_id(1);
+    c.set_request_id(1);
+    c.set_view_id(0);
+    c.set_leader_id(0);
+    EXPECT_FALSE(box.AddCommit(2, c));                   // small: not full
+    EXPECT_FALSE(box.AddCommit(0, c));
+    EXPECT_FALSE(box.AddCommit(9, c));                   // out of range: ignored
+
+    proto::ReplicatePrepare p;
+    p.set_client_id(1);
+    p.set_request_id(2);
+    p.set_view_id(0);
+    p.set_leader_id(0);
+    p.set_agreed_t(100);
+    proto::KV *kv = p.mutable_txn()->add_w_set();
+    kv->set_key(std::string(24, 'k'));
+    kv->set_value(std::string(300, 'v'));
+    EXPECT_TRUE(box.AddPrepare(2, p));                   // the big body crosses 200 bytes
+
+    auto all = box.TakeAll();
+    ASSERT_EQ(all.size(), 2u);
+    EXPECT_EQ(all[0].first, 0u);
+    EXPECT_EQ(all[0].second.commits_size(), 1);
+    EXPECT_EQ(all[1].first, 2u);
+    EXPECT_EQ(all[1].second.commits_size(), 1);          // kinds share one batch
+    ASSERT_EQ(all[1].second.prepares_size(), 1);
+    EXPECT_EQ(all[1].second.prepares(0).txn().w_set(0).value(), std::string(300, 'v'));
+    EXPECT_TRUE(box.TakeAll().empty());
 }

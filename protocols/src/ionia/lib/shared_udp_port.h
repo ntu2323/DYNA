@@ -93,6 +93,7 @@ private:
     struct FragInfo {
         uint64_t msgId = 0;
         std::string data;
+        size_t received = 0;   // bytes copied so far (data is pre-sized to msg_len)
     };
     std::map<UDPTransportAddress, FragInfo> frag_info_;
 

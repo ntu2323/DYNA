@@ -231,18 +231,59 @@ only `hosts` (public IPs, for SSH) and `receiver_internal` (experiment-LAN IPs, 
 }
 ```
 
-Then deploy the local tree (`--rsync-from`; needed for uncommitted work) and run:
+Then prepare the nodes, deploy the local tree (`--rsync-from`; needed for uncommitted
+work) and run:
 
 ```bash
-SSH_USER=<cloudlab-user> SSH_KEY_FILE=<key> python3 setup_dyna_cluster.py \
-  --hosts-file cluster_hosts.json --rsync-from /path/to/Ionia          # add --skip-build later
-SSH_USER=<cloudlab-user> SSH_KEY_FILE=<key> python3 run_cluster_bench.py --protocol dyna \
-  --hosts-file cluster_hosts.json -e 20
+export SSH_USER=<cloudlab-user> SSH_KEY_FILE=<key>       # e.g. nathantu, ~/.ssh/corfu_remote
+python3 prepare_cluster.py --hosts-file cluster_hosts.json   # per reservation / after reboot
+python3 setup_dyna_cluster.py --hosts-file cluster_hosts.json --rsync-from /path/to/Ionia
+#   (add --skip-build after the first full build)
+DYNA_CLIENT_BUSY_POLL=0 DYNA_STATS=1 python3 run_cluster_bench.py --protocol dyna \
+  --hosts-file cluster_hosts.json -e 20 -j 8 --offered-ops-per-sec 2000
 ```
+
+`prepare_cluster.py` (idempotent) does what a fresh CloudLab node needs before DYNA numbers
+mean anything:
+- **Host tuning** (`remote/tune_node.sh`): `performance` governor, C-states deeper than C1
+  off. Deep C-states added ~30 µs to every packet on c6320 (ping RTT 64 → 33 µs).
+- **`/mydata/dyna` on receivers** (`remote/prepare_data_disk.sh`): the Ubuntu image's root
+  fs is ext3, which SplinterDB can't use (no fallocate → `clockcache_get_internal`
+  assertion at replica start). Formats the first *completely blank* disk as ext4 (never a
+  disk with partitions / a filesystem signature); not in fstab, so re-run after a reboot.
+  `start_dyna_replica.sh` runs the replica from `/mydata/dyna` when it exists.
+- **Clock sync** (`sync_cluster_clocks.py` → `clock_sync.sh`): chrony by default; the
+  master serves its own clock (no internet upstream — that left the master 414 µs off its
+  followers). `--clock-mode ptp` uses hardware PTP (ptp4l + phc2sys) instead; both measured
+  ~1.6 µs worst pairwise on c6320.
+- **Verification** (`check_clock_sync.py`): measures pairwise `CLOCK_REALTIME` offsets with
+  UDP probes (min-RTT filtered) and fails above `--max-offset-us` (default 10). Run it any
+  time; it does not trust the daemons' own offset reports.
+
+**Check node health once per reservation.** On the Clemson c6320 reservation one node
+(node1) ran at 1.64 GHz vs 2.49 GHz on the rest (hardware cap; same OS settings): as a
+replica it went late on ~95% of requests and dragged the whole cluster into the slow path.
+Compare `sudo perf stat -e cycles taskset -c 7 python3 -c 's=0
+for i in range(2000000): s+=i*i'` (look at the GHz) across nodes, and keep slow nodes as
+senders.
 
 After a DYNA run the script prints every view-change line from the replica logs and each
 sender's per-interval throughput; a normal run should show **no** `view change: pausing`
-(otherwise the failure detector fired falsely — raise `DYNA_FAIL_TIMEOUT_MS`).
+(otherwise the failure detector fired falsely — the replica log's `rX suspects rY: silent …
+(own tick gap …)` line says whether the peer or the suspecting server stalled).
+
+**Diagnosing performance:**
+- `DYNA_STATS=1` (replicas + clients): one line per second. Replica: `busy` (time inside
+  message handlers, summed over receive threads), `hmax`, messages/s by type, arrivals
+  `on`-time / `lateL` (late at leader, re-timestamped) / `lateF` (late at follower, silent),
+  deadline `slack` / `late` / release-loop `relLag`, executor lock time + passes, lock
+  waits (`muWait`, `dedupWait`, …), heartbeat / tick gaps, buffer sizes. Distributions print
+  `avg/max/nCOUNT` (µs). Client: fast vs slow commits (and why), resends, latency per path.
+  Most-late arrivals at one replica = that replica (or its node) is the bottleneck.
+- `profile_replicas.py --delay-sec 35 --duration-sec 5 --out prof/` in a second terminal
+  during a run: per-thread CPU and hottest symbols on every receiver (installs perf).
+- `DYNA_RX_THREADS=N` (replicas): N receive threads (SO_REUSEPORT). Measured *worse* at
+  N=4 today (contention on the ordering lock), so keep 1 unless that changes.
 
 ### DYNA failover (recovery / rejoin)
 

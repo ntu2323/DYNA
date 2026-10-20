@@ -12,6 +12,11 @@
 //   Invariant: `pos_[id]` is the current heap index of `id`, kept in sync on every
 //   swap. This is the only correctness-critical property of the structure; it is
 //   validated by CheckInvariants() (used in tests).
+//
+//   Values live out of line (the heap holds unique_ptrs): a sift swaps two pointers
+//   instead of two whole values. TxnEntry carries a protobuf, sets and hash maps, and
+//   moving those on every sift was the executor's main cost under the ordering lock
+//   (CloudLab profile). It also makes value addresses stable until erase / pop.
 
 #ifndef _DYNA_INDEXED_MIN_PQ_H_
 #define _DYNA_INDEXED_MIN_PQ_H_
@@ -20,6 +25,7 @@
 
 #include <cstddef>
 #include <functional>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -42,7 +48,7 @@ public:
     // Insert. Returns false (no-op) if `id` is already present.
     bool push(const Id &id, Value v) {
         if (pos_.find(id) != pos_.end()) return false;
-        heap_.emplace_back(id, std::move(v));
+        heap_.emplace_back(id, std::make_unique<Value>(std::move(v)));
         size_t i = heap_.size() - 1;
         pos_[id] = i;
         sift_up(i);
@@ -50,12 +56,12 @@ public:
     }
 
     const Id    &peek_min_id() const { return heap_.front().first; }
-    const Value &peek_min()    const { return heap_.front().second; }
+    const Value &peek_min()    const { return *heap_.front().second; }
 
     // Remove and return the minimum. Precondition: !empty().
     Value pop_min() {
         Id id = heap_.front().first;
-        Value out = std::move(heap_.front().second);
+        Value out = std::move(*heap_.front().second);
         remove_at(0);
         pos_.erase(id);
         return out;
@@ -65,11 +71,11 @@ public:
     // order, the caller must call update_key(id). Returns nullptr if absent.
     Value *find(const Id &id) {
         auto it = pos_.find(id);
-        return it == pos_.end() ? nullptr : &heap_[it->second].second;
+        return it == pos_.end() ? nullptr : heap_[it->second].second.get();
     }
     const Value *find(const Id &id) const {
         auto it = pos_.find(id);
-        return it == pos_.end() ? nullptr : &heap_[it->second].second;
+        return it == pos_.end() ? nullptr : heap_[it->second].second.get();
     }
 
     // Re-establish heap order for `id` after the caller mutated its value. O(log n).
@@ -93,7 +99,7 @@ public:
     // The callback must NOT mutate the heap; collect ids first, then mutate.
     template <class F>
     void for_each(F &&f) const {
-        for (const auto &kv : heap_) f(kv.first, kv.second);
+        for (const auto &kv : heap_) f(kv.first, *kv.second);
     }
 
     // Test/debug: verify heap property and that pos_ mirrors heap_ exactly.
@@ -105,14 +111,14 @@ public:
         }
         for (size_t i = 1; i < heap_.size(); ++i) {
             size_t parent = (i - 1) / 2;
-            if (comp_(heap_[i].second, heap_[parent].second)) return false; // child < parent
+            if (comp_(*heap_[i].second, *heap_[parent].second)) return false; // child < parent
         }
         return true;
     }
 
 private:
     bool less(size_t a, size_t b) const {
-        return comp_(heap_[a].second, heap_[b].second);
+        return comp_(*heap_[a].second, *heap_[b].second);
     }
 
     void swap_nodes(size_t a, size_t b) {
@@ -159,7 +165,7 @@ private:
         if (i < heap_.size()) restore(i);
     }
 
-    std::vector<std::pair<Id, Value>> heap_;   // OrderKey-ordered binary min-heap
+    std::vector<std::pair<Id, std::unique_ptr<Value>>> heap_;   // OrderKey-ordered min-heap
     ankerl::unordered_dense::map<Id, size_t, Hash> pos_;   // id -> heap index (kept in sync)
     Compare                           comp_{};
 };

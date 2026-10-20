@@ -1,19 +1,20 @@
 {
+  "_note": "node1 (130.127.133.153) runs at 1.64 GHz vs 2.49 GHz elsewhere (hardware cap): keep it a sender, never a replica",
   "hosts": {
     "receiver1": "130.127.133.179",
-    "receiver2": "130.127.133.153",
-    "receiver3": "130.127.133.184",
-    "sender1": "130.127.133.161",
+    "receiver2": "130.127.133.184",
+    "receiver3": "130.127.133.161",
+    "sender1": "130.127.133.153",
     "sender2": "130.127.133.166",
     "sender3": "130.127.133.160"
   },
   "receiver_internal": {
     "receiver1": "10.10.1.1",
-    "receiver2": "10.10.1.2",
-    "receiver3": "10.10.1.3"
+    "receiver2": "10.10.1.3",
+    "receiver3": "10.10.1.4"
   },
   "sender_internal": {
-    "sender1": "10.10.1.4",
+    "sender1": "10.10.1.2",
     "sender2": "10.10.1.5",
     "sender3": "10.10.1.6"
   }

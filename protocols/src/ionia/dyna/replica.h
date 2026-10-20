@@ -12,9 +12,12 @@
 #include "lib/configuration.h"
 #include "lib/transport.h"
 
+#include "dyna/bg_outbox.h"
 #include "dyna/deadline.h"
 #include "dyna/dyna-proto.pb.h"
+#include "dyna/rw_lock.h"
 #include "dyna/server_orderer.h"
+#include "dyna/stats.h"
 #include "dyna/storage_backend.h"
 #include "dyna/topology.h"
 #include "dyna/txn_types.h"
@@ -52,7 +55,26 @@ public:
                         const std::string_view data,
                         void *meta_data) override;
 
+    // Multi-threaded receive (bench/replica.cc, DYNA_RX_THREADS > 1): each extra
+    // transport binds the same host:port (SO_REUSEPORT) and is run by its own thread,
+    // so ReceiveMessage is called concurrently. Hot messages (requests, commits,
+    // replication, ts-agreement, fetch) run under the shared side of state_lock_; view
+    // change / recovery / join messages and the heartbeat tick take it exclusively, so
+    // they stay serialized against normal processing exactly as with one thread.
+    void AddReceiveTransport(Transport *t);
+    // Call on each extra receive thread before running its transport: sends made on
+    // that thread go out through its own transport (each transport's address maps and
+    // fragment counter are then touched by one receive thread only).
+    static void BindThreadTransport(Transport *t);
+
 private:
+    // Transport to send on from the calling thread (its own receive transport, else the
+    // primary one — the timer thread, release and executor threads).
+    Transport *Tx() const;
+    // The real dispatcher; ReceiveMessage wraps it with DYNA_STATS timing.
+    void ReceiveMessageImpl(const TransportAddress &remote, const std::string_view type,
+                            const std::string_view data, void *meta_data);
+
     // Message handlers.
     void HandleClientRequest(const TransportAddress &remote, const proto::ClientRequest &m);
     void HandleCommit(const TransportAddress &remote, const TxnId &id,
@@ -66,11 +88,27 @@ private:
     void SendTsAgree(const ServerOrderer::TsAgreeAction &action);
 
     // Replication (spec §3.6-3.7): COMMITTING → COMMITTED.
-    void HandleReplicatePrepare(const TransportAddress &remote,
+    // `remote`: the sender's address for an unbatched prepare (the ack goes straight
+    // back), null for a batched one (the ack is queued to the leader).
+    void HandleReplicatePrepare(const TransportAddress *remote,
                                 const proto::ReplicatePrepare &m);
     void HandleReplicatePrepareReply(const proto::ReplicatePrepareReply &m);
     void HandleReplicateCommit(const proto::ReplicateCommit &m);
     void SendReplicatePrepare(const ServerOrderer::ReplicateAction &a);
+
+    // --- background batching (DYNA_REPL_BATCH > 1): replication + ts-agreement traffic
+    //     queues per destination and leaves as one BgBatch per flush (bg_outbox.h). With
+    //     batching off these send each message immediately, as before.
+    static constexpr int32_t kBgAll = -1;   // every other replica
+    void BgPrepare(const proto::ReplicatePrepare &m);
+    void BgPrepareReply(uint32_t to, const proto::ReplicatePrepareReply &m,
+                        const TransportAddress *remote);
+    void BgCommit(int32_t to, const proto::ReplicateCommit &m);
+    void BgTsAgree(uint32_t to, const proto::TsAgree &m);
+    void FlushBgTo(uint32_t to);
+    void SendBgBatch(uint32_t to, proto::BgBatch &b, size_t entries);
+    void BgFlushTick();   // timer: flush every non-empty batch, re-arm
+    void HandleBgBatch(const proto::BgBatch &m);
 
     // Fired by the orderer when an entry releases (SPECULATIVE): send SpecReply (and
     // cache it for WRITEs; read retries carry a fresh request_id, so reads aren't cached).
@@ -152,13 +190,13 @@ private:
     std::unique_ptr<ServerOrderer> orderer_;
 
     // Per-client OWD estimator (§2); sampled on the transport thread, read on release.
-    std::mutex owd_mu_;
+    HybridMutex owd_mu_;
     ReplicaOwdEstimator owd_;
 
     // At-most-once reply cache (spec §1.4 CachedReply) + in-flight set, so a retried
     // WRITE ClientRequest is answered from cache and never double-submitted. READs bypass
     // both: every read attempt carries a fresh request_id and a new t.
-    std::mutex dedup_mu_;
+    HybridMutex dedup_mu_;
     TxnMap<proto::SpecReply>        reply_cache_;
     TxnSet                           inflight_;
 
@@ -168,8 +206,35 @@ private:
         bool     slow = false;
         std::shared_ptr<TransportAddress> client_addr;
     };
-    std::mutex pending_mu_;
+    HybridMutex pending_mu_;
     TxnMap<PendingCommit> pending_commits_;
+
+    // Shared: hot-message handlers; exclusive: VR / recovery / join + heartbeat tick.
+    RwLock state_lock_;
+
+    std::unique_ptr<BgOutbox> bg_;   // null = batching off (DYNA_REPL_BATCH <= 1)
+    uint64_t bg_flush_us_ = 500;
+
+    // --- DYNA_STATS=1: per-second counters, printed from HeartbeatTick (observation only)
+    enum RxType { kRxRequest, kRxFast, kRxSlow, kRxPrep, kRxPrepReply, kRxCommit,
+                  kRxTsAgree, kRxFetch, kRxBg, kRxHeartbeat, kRxOther, kRxN };
+    static RxType ClassifyRx(std::string_view type);
+    void MaybeDumpStats(uint64_t now_us);
+    bool         stats_on_ = false;
+    OrdererStats ostats_;
+    StatCounter  rx_[kRxN];
+    StatCounter  busy_us_;          // transport thread time inside ReceiveMessage
+    StatMax      handler_max_us_;   // longest single ReceiveMessage
+    StatCounter  spec_tx_;          // SpecReplies sent (release thread)
+    StatMax      hb_gap_us_;        // longest gap between heartbeats from any one peer
+    StatMax      tick_gap_us_;      // longest gap between our own heartbeat ticks
+    StatDist     scan_us_;          // TsAgreementTick's locked scans
+    StatDist     bg_tx_entries_;    // entries per BgBatch sent
+    StatDist     bg_rx_entries_;    // entries per BgBatch received
+    StatDist     dedup_wait_us_, pending_wait_us_, owd_wait_us_;   // contended waits
+    std::vector<uint64_t> last_hb_rx_us_;
+    uint64_t     last_hb_tick_us_ = 0;
+    uint64_t     last_stats_us_ = 0;
 };
 
 } // namespace dyna

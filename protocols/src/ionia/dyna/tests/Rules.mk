@@ -110,6 +110,7 @@ $(d)dyna-recovery-test: $(o)recovery_test.o \
 	.obj/dyna/recovery.o \
 	.obj/dyna/view_coordinator.o \
 	.obj/dyna/dyna-proto.o \
+	$(LIB-message) \
 	$(GTEST_MAIN)
 
 TEST_BINS += $(d)dyna-recovery-test

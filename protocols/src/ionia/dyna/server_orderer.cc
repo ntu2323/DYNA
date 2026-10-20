@@ -4,6 +4,8 @@
 
 #include "dyna/server_orderer.h"
 
+#include <string_view>
+#include <unordered_set>
 #include <algorithm>
 #include <set>
 #include <string>
@@ -31,6 +33,30 @@ ServerOrderer::~ServerOrderer()
     Stop();
 }
 
+namespace {
+// What the SpecReply callback needs from a released WRITE: ids, type, t, leadership,
+// OWD and the client address — not the body / leader bookkeeping. Copying only these
+// (and moving the full entry into specLog) keeps a deep TxnEntry copy out of the
+// ordering lock on every release.
+TxnEntry ReplyCopy(const TxnEntry &e)
+{
+    TxnEntry r;
+    r.txn.set_client_id(e.txn.client_id());
+    r.txn.set_request_id(e.txn.request_id());
+    r.txn.set_type(e.txn.type());
+    r.txn.set_t(e.txn.t());
+    r.txn.set_view_id(e.txn.view_id());
+    r.t = e.t;
+    r.status = e.status;
+    r.is_leader_for_this = e.is_leader_for_this;
+    r.owd_estimate_us = e.owd_estimate_us;
+    r.arrival_us = e.arrival_us;
+    r.released_us = e.released_us;
+    r.client_addr = e.client_addr;
+    return r;
+}
+} // namespace
+
 void ServerOrderer::ComputeLeadership(TxnEntry &e) const
 {
     e.led_keys.clear();
@@ -53,7 +79,9 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
     std::vector<TxnEntry> released;   // late-leader WRITE immediate replies
     bool kick = false;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        const uint64_t wait_t0 = stats_ ? WallClockMicros() : 0;
+        std::lock_guard<HybridMutex> lk(mu_);
+        if (stats_) stats_->submit_wait_us.Observe(WallClockMicros() - wait_t0);
         // A delayed / retried request for a txn we already executed and GC'd must not
         // be re-admitted (it would be re-applied on top of newer writes) — but a WRITE
         // resend is answered with its final t: its client may still be collecting a
@@ -90,6 +118,17 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
         }
 
         const uint64_t now = clock_->Now();
+        if (stats_) {
+            if (duplicate) {
+                stats_->duplicate.Add();
+            } else if (now <= entry.t) {
+                stats_->on_time.Add();
+                stats_->slack_us.Observe(entry.t - now);
+            } else {
+                (entry.is_leader_for_this ? stats_->late_leader : stats_->late_follower).Add();
+                stats_->lateness_us.Observe(now - entry.t);
+            }
+        }
         if (duplicate) {
             // handled above
         } else if (now <= entry.t) {
@@ -105,9 +144,13 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
             entry.status = Status::SPECULATIVE;
             entry.released_us = now;
             highest_released_t_ = std::max(highest_released_t_, entry.Order());
-            spec_log_.push(key, entry);
-            if (is_read) kick = true;
-            else released.push_back(std::move(entry));
+            if (is_read) {
+                spec_log_.push(key, std::move(entry));
+                kick = true;
+            } else {
+                released.push_back(ReplyCopy(entry));
+                spec_log_.push(key, std::move(entry));
+            }
         } else if (!is_read) {
             // WRITE late at a pure follower: silently buffer.
             late_buffer_[key] = std::move(entry);
@@ -123,7 +166,7 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
 ServerOrderer::CommitResult
 ServerOrderer::ApplyCommit(const TxnId &id, uint64_t agreedT, TxnEntry *out)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     const uint64_t now = clock_->Now();
 
     // Already executed and GC'd: report its final t (so a SlowCommit can still be
@@ -189,7 +232,7 @@ void ServerOrderer::InstallFetched(const proto::Txn &body)
     e.status = Status::SPECULATIVE;
     ComputeLeadership(e);
     const TxnId id = e.Key();
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     if (executed_.find(id) != executed_.end() || spec_log_.contains(id) ||
         early_buffer_.contains(id) || late_buffer_.find(id) != late_buffer_.end()) {
         return;   // already have it (or already executed it)
@@ -199,7 +242,7 @@ void ServerOrderer::InstallFetched(const proto::Txn &body)
 
 bool ServerOrderer::TryGetBody(const TxnId &id, proto::Txn *out)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     if (const TxnEntry *e = spec_log_.find(id)) { if (out) *out = e->txn; return true; }
     if (const TxnEntry *e = early_buffer_.find(id)) { if (out) *out = e->txn; return true; }
     auto it = late_buffer_.find(id);
@@ -230,7 +273,7 @@ void ServerOrderer::DriveTsAgreement(uint64_t timeout_us,
                                      std::vector<TsAgreeAction> *actions,
                                      std::vector<TxnEntry> *committed)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     const uint64_t now = clock_->Now();
 
     std::vector<TxnId> stuck;
@@ -270,7 +313,7 @@ ServerOrderer::RecordTsProposal(const TxnId &id, uint32_t from, uint64_t propose
                                 bool is_reply)
 {
     TsRecordResult r;
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
 
     uint64_t our_t = 0;
     bool     have_t = false;
@@ -353,7 +396,7 @@ void ServerOrderer::InstallCommittingLocked(const TxnId &id, uint64_t agreedT,
 void ServerOrderer::DriveReplication(std::vector<ReplicateAction> *prepares,
                                      uint64_t resend_interval_us)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     const uint64_t now = clock_->Now();
     std::vector<TxnId> ids;
     spec_log_.for_each([&](const TxnId &id, const TxnEntry &e) {
@@ -375,7 +418,7 @@ void ServerOrderer::DriveReplication(std::vector<ReplicateAction> *prepares,
 
 bool ServerOrderer::TakeReplicateNow(const TxnId &id, ReplicateAction *out)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     TxnEntry *e = spec_log_.find(id);
     if (!e || e->status != Status::COMMITTING || e->last_replicate_us != 0 ||
         !IsPrimaryLeaderLocked(e->txn)) {
@@ -393,7 +436,7 @@ ServerOrderer::RecordPrepareReply(const TxnId &id, uint32_t from)
 {
     PrepareReplyResult res = PrepareReplyResult::kNone;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
         if (from == server_id_) return PrepareReplyResult::kNone;
         if (executed_.find(id) != executed_.end()) {
             // We only execute COMMITTED txns: `from` missed the ReplicateCommit.
@@ -415,7 +458,7 @@ ServerOrderer::RecordPrepareReply(const TxnId &id, uint32_t from)
 bool ServerOrderer::HandleReplicatePrepare(const TxnId &id, uint64_t agreedT,
                                            const proto::Txn &body)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     if (executed_.find(id) != executed_.end()) return true;   // ack; never re-install
     InstallCommittingLocked(id, agreedT, body);
     return spec_log_.contains(id);
@@ -425,7 +468,7 @@ void ServerOrderer::MarkCommitted(const TxnId &id)
 {
     bool kick = false;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
         if (TxnEntry *e = spec_log_.find(id)) {
             if (e->status != Status::COMMITTED) {
                 e->status = Status::COMMITTED;
@@ -438,7 +481,7 @@ void ServerOrderer::MarkCommitted(const TxnId &id)
 
 void ServerOrderer::CollectStaleCommitting(uint64_t timeout_us, std::vector<ReackAction> *out)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     const uint64_t now = clock_->Now();
     std::vector<TxnId> ids;
     spec_log_.for_each([&](const TxnId &id, const TxnEntry &e) {
@@ -468,48 +511,84 @@ std::vector<TxnId> ServerOrderer::ExecuteReady()
     // Kept as one ordered list so a read observes smaller writes but not larger ones.
     std::vector<TxnEntry> to_run;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
+        const uint64_t lock_t0 = stats_ ? WallClockMicros() : 0;
 
-        // Snapshot specLog pointers (stable while we hold mu_) and sort by OrderKey.
-        std::vector<const TxnEntry *> snap;
-        snap.reserve(spec_log_.size());
-        spec_log_.for_each([&](const TxnId &, const TxnEntry &e) { snap.push_back(&e); });
-        std::sort(snap.begin(), snap.end(),
-                  [](const TxnEntry *a, const TxnEntry *b) { return a->Order() < b->Order(); });
+        // Only COMMITTED writes and reads can run in a pass. Most kicks find the log
+        // with nothing executable (e.g. a commit at a follower waiting for its smaller
+        // conflicting writes), so check that before paying for the snapshot + sort —
+        // this pass holds mu_, which the transport and release threads also need.
+        auto executable = [](const TxnEntry &e) {
+            return e.txn.type() != proto::WRITE || e.status == Status::COMMITTED;
+        };
+        size_t candidates = 0;
+        spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
+            if (executable(e)) ++candidates;
+        });
 
-        // Single ascending pass = the transitive conflict-dependency rule. A blocked
-        // smaller txn propagates its block (via blocked_* keys) to larger conflicting txns.
-        std::set<std::string> blocked_w, blocked_r;
-        std::vector<TxnId> to_erase;
-        for (const TxnEntry *e : snap) {
-            bool conflict = false;
-            for (const auto &kv : e->txn.w_set()) {       // w-w or w-r
-                if (blocked_w.count(kv.key()) || blocked_r.count(kv.key())) { conflict = true; break; }
-            }
-            if (!conflict) {
-                for (const auto &k : e->txn.r_set()) {    // r-w
-                    if (blocked_w.count(k)) { conflict = true; break; }
+        std::vector<std::pair<TxnId, bool>> picked;   // (id, run it) in OrderKey order
+        if (candidates > 0) {
+            // Snapshot specLog pointers (stable while we hold mu_) and sort by OrderKey.
+            std::vector<const TxnEntry *> snap;
+            snap.reserve(spec_log_.size());
+            spec_log_.for_each([&](const TxnId &, const TxnEntry &e) { snap.push_back(&e); });
+            std::sort(snap.begin(), snap.end(), [](const TxnEntry *a, const TxnEntry *b) {
+                return a->Order() < b->Order();
+            });
+
+            // Single ascending pass = the transitive conflict-dependency rule. A blocked
+            // smaller txn propagates its block (via blocked_* keys) to larger conflicting
+            // txns. Keys are views into the entries' protos (alive while we hold mu_).
+            std::unordered_set<std::string_view> blocked_w, blocked_r;
+            blocked_w.reserve(snap.size() * 2);
+            blocked_r.reserve(snap.size());
+            for (const TxnEntry *e : snap) {
+                // Past the last executable entry nothing more can run; the blocked sets
+                // only matter for larger entries, so the rest of the scan is moot.
+                if (candidates == 0) break;
+                const bool cand = executable(*e);
+                if (cand) --candidates;
+                bool conflict = false;
+                for (const auto &kv : e->txn.w_set()) {       // w-w or w-r
+                    if (blocked_w.count(kv.key()) || blocked_r.count(kv.key())) {
+                        conflict = true;
+                        break;
+                    }
+                }
+                if (!conflict) {
+                    for (const auto &k : e->txn.r_set()) {    // r-w
+                        if (blocked_w.count(k)) { conflict = true; break; }
+                    }
+                }
+                const bool is_write = (e->txn.type() == proto::WRITE);
+                if (cand && !conflict && is_write) {
+                    picked.emplace_back(e->Key(), true);
+                    executed.push_back(e->Key());
+                    executed_[e->Key()] = ExecutedInfo{e->t, e->is_leader_for_this};
+                } else if (cand && !conflict) {
+                    // A READ whose conflicting smaller writes are all executed is ready: a
+                    // leader read is serviced (disk-read + reply); any read is GC'd so it
+                    // never blocks a later conflicting write.
+                    picked.emplace_back(e->Key(), e->is_leader_for_this);
+                } else {
+                    // Not executable → block larger conflicting txns.
+                    for (const auto &kv : e->txn.w_set()) blocked_w.insert(kv.key());
+                    for (const auto &k : e->txn.r_set()) blocked_r.insert(k);
                 }
             }
-            const bool is_write = (e->txn.type() == proto::WRITE);
-            if (is_write && e->status == Status::COMMITTED && !conflict) {
-                to_run.push_back(*e);
-                to_erase.push_back(e->Key());
-                executed.push_back(e->Key());
-                executed_[e->Key()] = ExecutedInfo{e->t, e->is_leader_for_this};
-            } else if (!is_write && !conflict) {
-                // A READ whose conflicting smaller writes are all executed is ready: a
-                // leader read is serviced (disk-read + reply); any read is GC'd so it
-                // never blocks a later conflicting write.
-                if (e->is_leader_for_this) to_run.push_back(*e);
-                to_erase.push_back(e->Key());
-            } else {
-                // Not executable → block larger conflicting txns.
-                for (const auto &kv : e->txn.w_set()) blocked_w.insert(kv.key());
-                for (const auto &k : e->txn.r_set()) blocked_r.insert(k);
-            }
         }
-        for (const TxnId &id : to_erase) spec_log_.erase(id);
+        // Move the picked entries out (no proto copies) and GC them from specLog.
+        to_run.reserve(picked.size());
+        for (const auto &[id, run] : picked) {
+            if (run) {
+                if (TxnEntry *m = spec_log_.find(id)) to_run.push_back(std::move(*m));
+            }
+            spec_log_.erase(id);
+        }
+        if (stats_) {
+            stats_->exec_locked_us.Observe(WallClockMicros() - lock_t0);
+            stats_->exec_batch.Observe(executed.size());
+        }
     }
 
     // Run outside the ordering lock, in OrderKey order. Each write is applied to the
@@ -586,6 +665,7 @@ size_t ServerOrderer::DrainDueLocked(std::vector<TxnEntry> &out, bool *kick)
         TxnEntry e = early_buffer_.pop_min();
         e.status = Status::SPECULATIVE;
         e.released_us = now;
+        if (stats_) stats_->release_lag_us.Observe(now - ok.t);
         // max, not assign: a protocol-decided insert (commit / prepare / TsAgree) may
         // already have pushed highestReleasedT past this entry.
         highest_released_t_ = std::max(highest_released_t_, ok);
@@ -602,8 +682,8 @@ size_t ServerOrderer::DrainDueLocked(std::vector<TxnEntry> &out, bool *kick)
             *kick = true;
         } else {
             // WRITE (endorse/lead): log it and reply now.
-            spec_log_.push(id, e);
-            out.push_back(std::move(e));
+            out.push_back(ReplyCopy(e));
+            spec_log_.push(id, std::move(e));
         }
         ++n;
     }
@@ -622,7 +702,7 @@ size_t ServerOrderer::ReleaseDue()
     bool kick = false;
     size_t n;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
         n = DrainDueLocked(released, &kick);
     }
     for (const auto &e : released) {
@@ -639,7 +719,7 @@ void ServerOrderer::ReleaseLoop()
         bool kick = false;
         uint64_t next;
         {
-            std::lock_guard<std::mutex> lk(mu_);
+            std::lock_guard<HybridMutex> lk(mu_);
             if (paused_.load()) {
                 next = Clock::kNever;   // parked until SetPaused(false) interrupts us
             } else {
@@ -718,7 +798,7 @@ ServerOrderer::CollectRecovery(const std::function<bool(const std::string &)> &i
     {
         // Txns first: an entry the executor erases from specLog after this snapshot is
         // applied to the store before the store scan below runs (same serialization).
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
         spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
             if (e.txn.type() != proto::WRITE) return;   // reads hold no state
             if (!TxnTouches(e.txn, in_delta)) return;
@@ -790,7 +870,7 @@ ServerOrderer::InstallView(const Topology &topo, uint64_t view_id,
 
     bool kick = false;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
         const uint64_t now = clock_->Now();
 
         // 2. New view: every held entry's leadership follows the new owner map. Primary
@@ -854,7 +934,7 @@ size_t ServerOrderer::ApplyKVsGuardedLocked(const std::vector<RecoveredKV> &kvs)
 void ServerOrderer::Reset()
 {
     std::lock_guard<std::mutex> run_lk(exec_run_mu_);
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     early_buffer_ = decltype(early_buffer_)();
     spec_log_ = decltype(spec_log_)();
     late_buffer_.clear();
@@ -888,7 +968,7 @@ std::vector<RecoveredKV> ServerOrderer::SnapshotRead(const std::vector<std::stri
 std::vector<RecoveredTxn> ServerOrderer::CommittedTxns()
 {
     std::vector<RecoveredTxn> out;
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
         if (e.txn.type() == proto::WRITE && e.status != Status::SPECULATIVE) {
             out.push_back(RecoveredTxn{e.txn, e.t, e.status});
@@ -905,7 +985,7 @@ size_t ServerOrderer::InstallSnapshot(const RecoveryData &d)
     }
     bool kick = false;
     {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::lock_guard<HybridMutex> lk(mu_);
         const uint64_t now = clock_->Now();
         for (const RecoveredTxn &r : d.txns) InstallRecoveredLocked(r, now, &kick);
     }
@@ -915,7 +995,7 @@ size_t ServerOrderer::InstallSnapshot(const RecoveryData &d)
 
 bool ServerOrderer::LiveState(const TxnId &id, uint64_t *t, bool *is_leader)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     auto xit = executed_.find(id);
     if (xit != executed_.end()) {
         *t = xit->second.t;
@@ -932,7 +1012,7 @@ bool ServerOrderer::LiveState(const TxnId &id, uint64_t *t, bool *is_leader)
 
 std::string ServerOrderer::DebugOldestEntry()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     const TxnEntry *best = nullptr;
     spec_log_.for_each([&](const TxnId &, const TxnEntry &e) {
         if (!best || e.Order() < best->Order()) best = &e;
@@ -952,49 +1032,49 @@ std::string ServerOrderer::DebugOldestEntry()
 
 uint64_t ServerOrderer::view_id()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return view_id_;
 }
 
 Topology ServerOrderer::topology()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return topo_;
 }
 
 OrderKey ServerOrderer::highest_released_t()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return highest_released_t_;
 }
 
 size_t ServerOrderer::early_size()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return early_buffer_.size();
 }
 
 size_t ServerOrderer::late_size()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return late_buffer_.size();
 }
 
 size_t ServerOrderer::speclog_size()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return spec_log_.size();
 }
 
 bool ServerOrderer::speclog_contains(const TxnId &id)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return spec_log_.contains(id);
 }
 
 bool ServerOrderer::speclog_entry(const TxnId &id, Status *status, uint64_t *t)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     const TxnEntry *e = spec_log_.find(id);
     if (!e) return false;
     if (status) *status = e->status;
@@ -1004,13 +1084,19 @@ bool ServerOrderer::speclog_entry(const TxnId &id, Status *status, uint64_t *t)
 
 bool ServerOrderer::executed(const TxnId &id)
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return executed_.find(id) != executed_.end();
+}
+
+void ServerOrderer::ReserveExecuted(size_t n)
+{
+    std::lock_guard<HybridMutex> lk(mu_);
+    executed_.reserve(n);
 }
 
 size_t ServerOrderer::executed_count()
 {
-    std::lock_guard<std::mutex> lk(mu_);
+    std::lock_guard<HybridMutex> lk(mu_);
     return executed_.size();
 }
 

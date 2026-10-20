@@ -326,7 +326,12 @@ SharedUDPPort::OnReadable()
     sockaddr_in sender{};
     socklen_t sender_size = sizeof(sender);
 
-    while (true) {
+    // Bounded batch: the event is level-triggered (EV_PERSIST), so leftover datagrams
+    // re-fire on the next loop iteration. Draining until EAGAIN starved libevent's
+    // timers under sustained load (DYNA heartbeats stalled >1 s -> false view changes).
+    constexpr int kMaxBatch = 64;
+    for (int i = 0; i < kMaxBatch; ++i) {
+        sender_size = sizeof(sender);
         const ssize_t sz = recvfrom(fd_, buf, kBufSize, 0,
                                     reinterpret_cast<sockaddr *>(&sender),
                                     &sender_size);
@@ -406,22 +411,25 @@ SharedUDPPort::ProcessPacket(sockaddr_in sender, char *buf, ssize_t sz)
         const size_t frag_len = static_cast<size_t>(buf + sz - ptr);
 
         FragInfo &info = frag_info_[sender_addr];
-        if (info.msgId == 0) {
-            info.msgId = msg_id;
-            info.data.clear();
-            info.data.resize(msg_len);
-        } else if (info.msgId != msg_id) {
+        if (info.msgId != msg_id) {
+            // New message (or a newer one superseding an incomplete reassembly).
             info.msgId = msg_id;
             info.data.assign(msg_len, '\0');
+            info.received = 0;
         }
         if (frag_start + frag_len <= info.data.size()) {
             memcpy(&info.data[frag_start], ptr, frag_len);
+            info.received += frag_len;
         }
-        if (info.data.size() == msg_len) {
+        // data is pre-sized to msg_len, so completion is tracked by bytes received
+        // (checking data.size() fired on the FIRST fragment and decoded a mostly-zero
+        // buffer: every message > MAX_UDP_MESSAGE_SIZE was lost).
+        if (info.received >= msg_len) {
             meta_len = DecodePacket(info.data.data(), info.data.size(),
                                     msg_type, msg, &meta_data);
             info.msgId = 0;
             info.data.clear();
+            info.received = 0;
         } else {
             return;
         }

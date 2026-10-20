@@ -4,8 +4,11 @@
 
 #include "dyna/client.h"
 
+#include "dyna/stats.h"
 #include "dyna/wall_clock.h"
 #include "lib/message.h"
+
+#include <atomic>
 
 #include <string>
 #include <utility>
@@ -15,6 +18,46 @@ namespace specpaxos {
 namespace dyna {
 
 namespace proto = specpaxos::dyna::proto;
+
+namespace {
+// DYNA_STATS=1: process-wide client counters (the bench runs one DynaClient per thread);
+// whichever client's sweep first crosses each 1 s boundary prints the line.
+struct ClientStats {
+    StatCounter fast, slow_disagree, slow_timeout, commit_via_reply;
+    StatCounter resend_write, retry_read;
+    StatDist    lat_fast_us, lat_slow_us;
+    std::atomic<uint64_t> last_dump_us{0};
+};
+ClientStats g_stats;
+const bool g_stats_on = StatsEnabledFromEnv();
+
+void MaybeDumpClientStats(uint64_t now)
+{
+    uint64_t last = g_stats.last_dump_us.load(std::memory_order_relaxed);
+    if (last == 0) {
+        g_stats.last_dump_us.compare_exchange_strong(last, now);
+        return;
+    }
+    if (now < last + 1000000 ||
+        !g_stats.last_dump_us.compare_exchange_strong(last, now)) {
+        return;
+    }
+    auto dist = [](StatDist &d) {
+        const uint64_t n = d.n.Take(), s = d.sum.Take(), m = d.max.Take();
+        return std::make_pair(n ? s / n : 0, m);
+    };
+    const auto lf = dist(g_stats.lat_fast_us);
+    const auto ls = dist(g_stats.lat_slow_us);
+    Notice("client stats: fast=%lu slow[disagree=%lu timeout=%lu] viaCommitReply=%lu "
+           "resendW=%lu retryR=%lu latFast(avg/max)=%lu/%luus latSlow=%lu/%luus",
+           (unsigned long)g_stats.fast.Take(), (unsigned long)g_stats.slow_disagree.Take(),
+           (unsigned long)g_stats.slow_timeout.Take(),
+           (unsigned long)g_stats.commit_via_reply.Take(),
+           (unsigned long)g_stats.resend_write.Take(), (unsigned long)g_stats.retry_read.Take(),
+           (unsigned long)lf.first, (unsigned long)lf.second, (unsigned long)ls.first,
+           (unsigned long)ls.second);
+}
+} // namespace
 
 DynaClient::DynaClient(const specpaxos::Configuration &config,
                                  Transport *transport,
@@ -77,6 +120,7 @@ void DynaClient::Invoke(const string &request, continuation_t continuation)
     p.value = value;
     p.phase = Phase::COLLECTING;
     p.owd = bound_tracker_.bound_us();   // READ deadline seed (grows on retry)
+    p.invoke_us = NowMicros();
     p.quorum = TxnQuorum(LeadersFor(p), write_quorum_, viewId_);
     p.continuation = std::move(continuation);
     pending_.emplace(request_id, std::move(p));
@@ -174,6 +218,10 @@ void DynaClient::SendSlowCommit(PendingRequest &p)
     sc.set_view_id(viewId_);
     sc.set_agreed_t(p.quorum.slow_agreed_t());
     transport->SendMessageToAll(this, sc);
+    if (g_stats_on && p.slow_cause == 0) {
+        p.slow_cause = p.quorum.leaders_disagree() ? 1 : 2;
+        (p.slow_cause == 1 ? g_stats.slow_disagree : g_stats.slow_timeout).Add();
+    }
     p.phase = Phase::SLOW_WAIT;
     p.send_us = NowMicros();
 }
@@ -205,6 +253,9 @@ void DynaClient::ResendSweep()
     for (uint64_t id : resend) {
         auto it = pending_.find(id);
         if (it == pending_.end()) continue;
+        if (g_stats_on) {
+            (it->second.type == proto::READ ? g_stats.retry_read : g_stats.resend_write).Add();
+        }
         if (it->second.phase == Phase::SLOW_WAIT) {
             SendSlowCommit(it->second);   // re-drive the slow path
         } else if (it->second.type == proto::READ) {
@@ -213,6 +264,7 @@ void DynaClient::ResendSweep()
             SendRequestProto(id);         // write: same t (leader reply missing)
         }
     }
+    if (g_stats_on) MaybeDumpClientStats(now);
     if (resend_sweep_timer_) resend_sweep_timer_->Reset();
 }
 
@@ -236,6 +288,16 @@ uint64_t DynaClient::RetryRead(uint64_t request_id)
 void DynaClient::Commit(std::unordered_map<uint64_t, PendingRequest>::iterator it,
                             const std::string &result)
 {
+    if (g_stats_on) {
+        const PendingRequest &p = it->second;
+        const uint64_t lat = NowMicros() - p.invoke_us;
+        if (p.slow_cause == 0) {
+            g_stats.fast.Add();
+            g_stats.lat_fast_us.Observe(lat);
+        } else {
+            g_stats.lat_slow_us.Observe(lat);
+        }
+    }
     continuation_t cont = std::move(it->second.continuation);
     pending_.erase(it);
     cont(std::string(), result);
@@ -332,7 +394,10 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
         if (it == pending_.end()) return;
         PendingRequest &p = it->second;
         if (!p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader())) return;
-        if (p.quorum.fast_ready()) Commit(it, std::string());   // write quorum re-formed
+        if (p.quorum.fast_ready()) {   // write quorum re-formed
+            if (g_stats_on) g_stats.commit_via_reply.Add();
+            Commit(it, std::string());
+        }
         return;
     }
 

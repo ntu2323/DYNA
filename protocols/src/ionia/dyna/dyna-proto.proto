@@ -131,6 +131,19 @@ message ReplicateCommit {
     required uint32 leader_id  = 4;
 }
 
+// 12b. BgBatch — server → server: a batch of BACKGROUND messages (replication prepare /
+// ack / commit, ts-agreement) for one destination, flushed on a timer (DYNA_REPL_FLUSH_US)
+// or when full (DYNA_REPL_BATCH). Each entry is the unchanged per-txn message (with its
+// own view_id) and is handled exactly as if it had arrived alone; only the framing
+// differs. The client-facing commit path never uses this.
+message BgBatch {
+    required uint32 sender_id                     = 1;
+    repeated ReplicatePrepare      prepares        = 2;
+    repeated ReplicatePrepareReply prepare_replies = 3;
+    repeated ReplicateCommit       commits         = 4;
+    repeated TsAgree               ts_agrees       = 5;
+}
+
 // ---------------------------------------------------------------------------------------
 // Views + recovery (design doc § Recovery). A view is (view_id, alive set); `alive` is a
 // bitmask over server ids (bit i ⇔ server i alive). The VR layer is silent in normal

@@ -261,6 +261,9 @@ def _build_client_cmd(
         # Slow-path trigger (all leaders replied, quorum short): forward if set locally.
         if "DYNA_SLOW_TIMEOUT_US" in os.environ:
             dyna_env += f"export DYNA_SLOW_TIMEOUT_US={shlex.quote(os.environ['DYNA_SLOW_TIMEOUT_US'])}; "
+        # Per-second client counters (fast/slow commits, resends, latency split).
+        if "DYNA_STATS" in os.environ:
+            dyna_env += f"export DYNA_STATS={shlex.quote(os.environ['DYNA_STATS'])}; "
     ionia_env = ""
     if protocol == "ionia" and ionia_fast_quorum:
         ionia_env = "export IONIA_FAST_QUORUM=1; "
@@ -291,6 +294,14 @@ _DYNA_REPLICA_ENV_KNOBS = (
     "DYNA_TS_SCAN_MS",
     "DYNA_TS_TIMEOUT_MS",
     "DYNA_DEBUG",
+    "DYNA_STATS",
+    "DYNA_RX_THREADS",
+    "DYNA_REPL_BATCH",
+    "DYNA_REPL_FLUSH_US",
+    "DYNA_REPL_MAX_BYTES",
+    "DYNA_LOCK_SPIN",
+    "DYNA_PRERESERVE",
+    "LD_PRELOAD",   # e.g. /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 for the replicas
     "DYNA_FAIL_TIMEOUT_MS",
     "DYNA_FAIL_GRACE_MS",
     "DYNA_HB_MS",

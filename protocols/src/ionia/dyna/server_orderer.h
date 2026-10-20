@@ -14,8 +14,10 @@
 #ifndef _DYNA_SERVER_ORDERER_H_
 #define _DYNA_SERVER_ORDERER_H_
 
+#include "dyna/hybrid_mutex.h"
 #include "dyna/indexed_min_pq.h"
 #include "dyna/recovery.h"
+#include "dyna/stats.h"
 #include "dyna/storage_backend.h"
 #include "dyna/topology.h"
 #include "dyna/txn_types.h"
@@ -170,6 +172,12 @@ public:
     void Start();
     void Stop();
 
+    // DYNA_STATS: attach a counter sink (observation only). Call before Start().
+    void SetStats(OrdererStats *s) {
+        stats_ = s;
+        mu_.SetWaitStats(s ? &s->mu_wait_us : nullptr);
+    }
+
     // --- views + recovery (design doc § Recovery) ---
     // Pause/resume the release loop (normal processing is paused during a view change;
     // entries due meanwhile release on resume).
@@ -232,6 +240,10 @@ public:
     bool     speclog_entry(const TxnId &id, Status *status, uint64_t *t);
     bool     executed(const TxnId &id);
     size_t   executed_count();
+    // Pre-size the executed-txn map (DYNA_PRERESERVE) so it never rehashes mid-run under
+    // the ordering lock. It is never GC'd yet (Tthresh is out of scope), so it grows by
+    // one entry per executed txn.
+    void     ReserveExecuted(size_t n);
     uint64_t view_id();
     Topology topology();
     // Debug: the smallest-OrderKey specLog entry (what blocks execution), or "".
@@ -265,11 +277,12 @@ private:
     uint64_t        view_id_;
     uint32_t        quorum_f_;   // f = (n-1)/2; prepare-replies needed for COMMITTED
     Clock          *clock_;
+    OrdererStats   *stats_ = nullptr;   // optional (DYNA_STATS)
     Topology        topo_;
     OnSpecReply     on_spec_reply_;
     StorageBackend *backend_;    // KV store for executed writes (nullptr in unit tests)
 
-    std::mutex mu_;
+    HybridMutex mu_;   // the ordering lock (spin-then-block; see hybrid_mutex.h)
     IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> early_buffer_;
     TxnMap<TxnEntry>                             late_buffer_;   // late follower arrivals
     IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> spec_log_;

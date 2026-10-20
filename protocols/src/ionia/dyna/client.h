@@ -61,6 +61,9 @@ private:
         uint64_t    currentT = 0;   // fixed for a write across resends (spec: same t)
         uint64_t    owd = 0;        // READ only: grows each retry (spec: larger t)
         uint64_t    send_us = 0;
+        uint64_t    invoke_us = 0;    // DYNA_STATS: end-to-end latency
+        uint8_t     slow_cause = 0;   // DYNA_STATS: 0 fast, 1 leaders disagreed, 2 timeout
+        uint32_t    resends = 0;      // DYNA_STATS
         Phase       phase = Phase::COLLECTING;
         TxnQuorum   quorum;
         std::map<std::string, std::string> results;   // READ: merged from involved leaders

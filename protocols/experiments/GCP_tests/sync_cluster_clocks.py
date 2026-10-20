@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Deploy clock_sync.sh to every host in cluster_hosts.json and configure PTP.
+Deploy clock_sync.sh to every host in cluster_hosts.json and configure clock sync:
+hardware PTP when the experiment NIC has a PTP clock, else chrony (--mode forces one).
 
-receiver1 (default) runs as PTP grandmaster; all other hosts run as followers.
+receiver1 (default) is the time source (PTP grandmaster / chrony server); all other
+hosts follow it. Verify the result with check_clock_sync.py (measured offsets).
 
 Example:
   SSH_USER=nathantu SSH_KEY_FILE=~/.ssh/corfu_remote \\
@@ -71,9 +73,12 @@ def _run_clock_sync(
     ssh_key: Optional[str],
     ptp_role: str,
     exp_prefix: str,
+    mode: str = "auto",
+    master_ip: str = "",
 ) -> Tuple[str, bool, str]:
     cmd = (
-        f"sudo EXP_PREFIX={exp_prefix} bash {_REMOTE_SCRIPT} {ptp_role}"
+        f"sudo EXP_PREFIX={exp_prefix} CLOCK_MODE={mode} MASTER_IP={master_ip} "
+        f"bash {_REMOTE_SCRIPT} {ptp_role}"
     )
     r = ssh_run(host, ssh_user, ssh_key, cmd)
     if r.returncode != 0:
@@ -98,6 +103,13 @@ def main() -> None:
         "--exp-prefix",
         default=os.environ.get("EXP_PREFIX", "10.10."),
         help="Experiment subnet prefix for NIC selection (clock_sync.sh EXP_PREFIX).",
+    )
+    ap.add_argument(
+        "--mode",
+        choices=["auto", "ptp", "chrony"],
+        default=os.environ.get("CLOCK_MODE", "chrony"),
+        help="chrony (default; measured 1.6 us worst pairwise on CloudLab c6320, same as "
+        "PTP) | ptp (needs a NIC PTP hardware clock) | auto (PTP if available).",
     )
     ap.add_argument(
         "--master-settle-sec",
@@ -186,9 +198,17 @@ def main() -> None:
                 print(f"  [{role}] deployed")
 
     master_host = hosts[args.master_role]
+    r = ssh_run(
+        master_host, args.ssh_user, ssh_key,
+        "ip -4 -o addr show | awk '{print $4}' | cut -d/ -f1 "
+        f"| grep '^{args.exp_prefix}' | head -1",
+    )
+    master_ip = (r.stdout or "").strip()
+    if not master_ip:
+        sys.exit(f"{args.master_role}: no address on {args.exp_prefix}*")
     print(
-        f"Starting PTP master on {args.master_role} ({master_host}) "
-        f"EXP_PREFIX={args.exp_prefix!r}..."
+        f"Starting clock master (mode={args.mode}) on {args.master_role} ({master_host}, "
+        f"{master_ip}) EXP_PREFIX={args.exp_prefix!r}..."
     )
     role, ok, out = _run_clock_sync(
         args.master_role,
@@ -197,6 +217,8 @@ def main() -> None:
         ssh_key,
         "master",
         args.exp_prefix,
+        args.mode,
+        master_ip,
     )
     if not ok:
         sys.exit(f"Master failed on {args.master_role}: {out}")
@@ -207,7 +229,7 @@ def main() -> None:
         print(f"Waiting {args.master_settle_sec}s for master to settle...")
         time.sleep(args.master_settle_sec)
 
-    print(f"Starting PTP followers on {len(followers)} hosts...")
+    print(f"Starting clock followers on {len(followers)} hosts...")
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(followers)) as ex:
         futs = [
             ex.submit(
@@ -218,6 +240,8 @@ def main() -> None:
                 ssh_key,
                 "follower",
                 args.exp_prefix,
+                args.mode,
+                master_ip,
             )
             for role in followers
         ]

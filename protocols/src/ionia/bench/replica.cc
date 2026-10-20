@@ -45,6 +45,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <vector>
+#include <memory>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 
@@ -287,10 +289,42 @@ main(int argc, char **argv)
     if (proto == PROTO_DYNA) {
         const char *bp = std::getenv("DYNA_BUSY_POLL");
         const bool busyPoll = (bp == nullptr) || (*bp != '0');
-        FastTransport transport(internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size, recv_buffer_size, busyPoll);
+        // DYNA_RX_THREADS > 1: that many receive threads, each with its own
+        // SO_REUSEPORT socket on the replica's host:port (the kernel spreads inbound
+        // flows across them) and its own busy-polled event loop. Needs busy-poll mode
+        // (the shared-port transport); timers stay on the first transport (main thread).
+        int rxThreads = 1;
+        if (const char *rt = std::getenv("DYNA_RX_THREADS"); rt != nullptr && *rt != '\0') {
+            rxThreads = std::max(1, atoi(rt));
+        }
+        if (rxThreads > 1 && !busyPoll) {
+            Warning("DYNA_RX_THREADS=%d needs DYNA_BUSY_POLL=1; using 1 receive thread",
+                    rxThreads);
+            rxThreads = 1;
+        }
+        if (rxThreads > 1) {
+            setenv("IONIA_PER_THREAD_SOCKET", "1", 1);   // before any transport binds
+        }
+        std::vector<std::unique_ptr<FastTransport>> transports;
+        for (int i = 0; i < rxThreads; ++i) {
+            transports.push_back(std::make_unique<FastTransport>(
+                internalConfig, 1, 1, physical_port, numa_node, 0, send_buffer_size,
+                recv_buffer_size, busyPoll));
+        }
         // DYNA executes into the harness store (same SplinterDB config as IONIA).
-        specpaxos::dyna::DynaReplica replica(internalConfig, index, &transport, nullApp->GetDB());
-        transport.Run();
+        specpaxos::dyna::DynaReplica replica(internalConfig, index, transports[0].get(),
+                                             nullApp->GetDB());
+        for (int i = 1; i < rxThreads; ++i) {
+            FastTransport *t = transports[i].get();
+            replica.AddReceiveTransport(t);
+            // Runs for the life of the process (like the main loop below).
+            std::thread([t]() {
+                specpaxos::dyna::DynaReplica::BindThreadTransport(t);
+                t->Run();
+            }).detach();
+        }
+        if (rxThreads > 1) Notice("DYNA replica: %d receive threads", rxThreads);
+        transports[0]->Run();
         return 0;
     }
 

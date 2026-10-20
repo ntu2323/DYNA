@@ -169,6 +169,7 @@ private:
     std::vector<bool>     ever_heard_;
     uint64_t start_us_ = 0;
     uint64_t last_resend_us_ = 0;
+    uint64_t last_tick_us_ = 0;   // diagnostics: our own tick gap when suspecting
     uint64_t phase_since_us_ = 0;
 
     // VIEW_CHANGE round.

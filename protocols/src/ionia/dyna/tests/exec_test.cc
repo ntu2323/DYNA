@@ -133,3 +133,44 @@ TEST(Exec, AppliedWithCommitTimestamp)
     EXPECT_EQ(v->t, 100u);
     EXPECT_EQ(backend.apply_count(), 1u);
 }
+
+// ExecuteReady skips the scan when nothing is executable and stops it after the last
+// executable entry; the dependency rule must be unchanged by either shortcut.
+TEST(Exec, ShortcutsPreserveDependencyRule)
+{
+    InMemoryBackend backend;
+    MockClock clk(50);
+    ServerOrderer o(0, 0, &clk, Topology(1), Noop(), &backend);
+    const TxnId a = MakeTxnId(1, 1), b = MakeTxnId(1, 2), c = MakeTxnId(1, 3),
+                d = MakeTxnId(1, 4);
+
+    // a (K, smallest) stays SPECULATIVE; b (K) and c (J) commit; d (K, largest) stays
+    // SPECULATIVE.
+    ReleaseAndCommit(o, clk, MakeWrite(1, 1, 100, "K", "a"), 100);
+    ReleaseAndCommit(o, clk, MakeWrite(1, 2, 110, "K", "b"), 110);
+    ReleaseAndCommit(o, clk, MakeWrite(1, 3, 120, "J", "c"), 120);
+    ReleaseAndCommit(o, clk, MakeWrite(1, 4, 130, "K", "d"), 130);
+
+    // Nothing committed yet: an empty pass that leaves everything in place.
+    EXPECT_TRUE(o.ExecuteReady().empty());
+    EXPECT_EQ(o.speclog_size(), 4u);
+
+    o.MarkCommitted(b);
+    o.MarkCommitted(c);
+    // b is blocked behind the un-committed smaller a (same key); c is independent.
+    std::vector<TxnId> done = o.ExecuteReady();
+    ASSERT_EQ(done.size(), 1u);
+    EXPECT_EQ(done[0], c);
+    EXPECT_EQ(backend.value_or_empty("J"), "c");
+    EXPECT_EQ(backend.value_or_empty("K"), "");
+
+    // a commits: a then b run in OrderKey order; d (un-committed) stays.
+    o.MarkCommitted(a);
+    done = o.ExecuteReady();
+    ASSERT_EQ(done.size(), 2u);
+    EXPECT_EQ(done[0], a);
+    EXPECT_EQ(done[1], b);
+    EXPECT_EQ(backend.value_or_empty("K"), "b");
+    EXPECT_TRUE(o.speclog_contains(d));
+    EXPECT_EQ(o.speclog_size(), 1u);
+}

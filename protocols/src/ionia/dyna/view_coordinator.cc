@@ -4,6 +4,8 @@
 
 #include "dyna/view_coordinator.h"
 
+#include "lib/message.h"
+
 #include "dyna/topology.h"
 
 #include <algorithm>
@@ -96,6 +98,8 @@ ViewCoordinator::ResetRound()
 void
 ViewCoordinator::Tick(uint64_t now_us, Effects *fx)
 {
+    const uint64_t prev_tick_us = last_tick_us_;
+    last_tick_us_ = now_us;
     if (phase_ == Phase::JOINING) {
         if (now_us < last_resend_us_ + cfg_.resend_us) return;
         last_resend_us_ = now_us;
@@ -127,6 +131,15 @@ ViewCoordinator::Tick(uint64_t now_us, Effects *fx)
         if (suspects != 0) {
             const uint64_t next = base & ~suspects;
             if (Count(next) >= cfg_.f + 1) {
+                // Diagnostics: who went silent, for how long, and how long since OUR
+                // previous tick (a large own gap means this server stalled, not the peer).
+                for (uint32_t s = 0; s < cfg_.n; ++s) {
+                    if (suspects & (1ULL << s)) {
+                        Notice("r%u suspects r%u: silent %lu us (own tick gap %lu us)",
+                               cfg_.self, s, (unsigned long)(now_us - last_heard_[s]),
+                               (unsigned long)(prev_tick_us ? now_us - prev_tick_us : 0));
+                    }
+                }
                 const uint64_t v = std::max(view_, pv_) + 1;
                 StartViewChange(v, next, now_us, fx);
                 return;
