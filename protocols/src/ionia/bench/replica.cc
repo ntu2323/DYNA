@@ -38,6 +38,7 @@
 #include "lib/udptransport.h"
 #include "lib/fasttransport.h"
 #include "lib/cpu_affinity.h"
+#include "dyna/cpu_pin.h"
 #include "dyna/replica.h"
 #include "vr/replica.h"
 #include "vr/durabilityreplica.h"
@@ -318,12 +319,15 @@ main(int argc, char **argv)
             FastTransport *t = transports[i].get();
             replica.AddReceiveTransport(t);
             // Runs for the life of the process (like the main loop below).
-            std::thread([t]() {
+            std::thread([t, i]() {
+                pthread_setname_np(pthread_self(), "dyna-rx");
+                specpaxos::dyna::PinSelfFromEnv("DYNA_PIN_RX", static_cast<size_t>(i));
                 specpaxos::dyna::DynaReplica::BindThreadTransport(t);
                 t->Run();
             }).detach();
         }
         if (rxThreads > 1) Notice("DYNA replica: %d receive threads", rxThreads);
+        specpaxos::dyna::PinSelfFromEnv("DYNA_PIN_RX", 0);   // main receive loop
         transports[0]->Run();
         return 0;
     }

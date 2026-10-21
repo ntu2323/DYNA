@@ -58,6 +58,23 @@ public:
     const Id    &peek_min_id() const { return heap_.front().first; }
     const Value &peek_min()    const { return *heap_.front().second; }
 
+    // Pointer-transfer variants: move a value between queues without reallocating it.
+    bool push_ptr(const Id &id, std::unique_ptr<Value> v) {
+        if (pos_.find(id) != pos_.end()) return false;
+        heap_.emplace_back(id, std::move(v));
+        size_t i = heap_.size() - 1;
+        pos_[id] = i;
+        sift_up(i);
+        return true;
+    }
+    std::unique_ptr<Value> pop_min_ptr() {   // Precondition: !empty().
+        Id id = heap_.front().first;
+        std::unique_ptr<Value> out = std::move(heap_.front().second);
+        remove_at(0);
+        pos_.erase(id);
+        return out;
+    }
+
     // Remove and return the minimum. Precondition: !empty().
     Value pop_min() {
         Id id = heap_.front().first;

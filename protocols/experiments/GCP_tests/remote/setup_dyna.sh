@@ -66,15 +66,33 @@ export IONIA_SPLINTER_CACHE_MB="${IONIA_SPLINTER_CACHE_MB:-256}"
 export IONIA_SPLINTER_DISK_GB="${IONIA_SPLINTER_DISK_GB:-2}"
 # Deadline / OWD (dyna/deadline.h). Steady-state bound is OWD-driven; INITIAL_BOUND
 # only matters for the first few ops; MAX_OWD caps OWD spikes.
-export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
-export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
-export DYNA_OWD_PERCENTILE="${DYNA_OWD_PERCENTILE:-50}"
+export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-100}"
+export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-1000}"
+export DYNA_OWD_PERCENTILE="${DYNA_OWD_PERCENTILE:-95}"
 export DYNA_OWD_WINDOW_LEN="${DYNA_OWD_WINDOW_LEN:-100}"
 # Busy-poll transport + release loop (default on; 0 = epoll/cv park).
 export DYNA_BUSY_POLL="${DYNA_BUSY_POLL:-1}"
 # Background ts-agreement / replication / execution tick, and SPECULATIVE timeout.
 export DYNA_TS_SCAN_MS="${DYNA_TS_SCAN_MS:-50}"
 export DYNA_TS_TIMEOUT_MS="${DYNA_TS_TIMEOUT_MS:-100}"
+# CPU pinning (dyna/cpu_pin.h): give each busy replica thread its own PHYSICAL core on
+# the NIC's NUMA node (hyperthread siblings of spinning threads run at ~half speed).
+# DYNA_PIN=0 disables; explicit DYNA_PIN_* values win.
+if [[ "${DYNA_PIN:-1}" != "0" ]] && command -v lscpu >/dev/null; then
+  IFACE=$(ip -4 -o addr show | awk '$4 ~ /^10[.]10[.]/ {print $2; exit}')
+  NODE=$(cat "/sys/class/net/${IFACE}/device/numa_node" 2>/dev/null || echo 0)
+  [[ "${NODE}" -lt 0 ]] && NODE=0
+  mapfile -t CORES < <(lscpu -p=CPU,CORE,NODE | grep -v '^#' \
+                         | awk -F, -v n="${NODE}" '$3==n && !seen[$2]++ {print $1}' | tail -n +2)
+  RX="${DYNA_RX_THREADS:-1}"
+  if (( ${#CORES[@]} >= RX + 3 )); then
+    RXLIST=$(IFS=,; echo "${CORES[*]:0:RX}")
+    export DYNA_PIN_RX="${DYNA_PIN_RX:-${RXLIST}}"
+    export DYNA_PIN_ORDER="${DYNA_PIN_ORDER:-${CORES[RX]}}"
+    export DYNA_PIN_SEND="${DYNA_PIN_SEND:-${CORES[RX+1]}}"
+    export DYNA_PIN_EXEC="${DYNA_PIN_EXEC:-${CORES[RX+2]}}"
+  fi
+fi
 RUN_DIR="${HOME}/Ionia/protocols/src/ionia"
 if [[ -d /mydata/dyna ]]; then RUN_DIR=/mydata/dyna; fi
 cd "${RUN_DIR}"
@@ -82,7 +100,7 @@ pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
 nohup "${HOME}/Ionia/protocols/src/ionia/bench/replica" -i "${IDX}" -j 1 -b 1 -c ~/bench/dynaconfig -m dyna \
   > ~/bench/replica-"${IDX}".log 2>&1 &
-echo "Started DYNA replica index=${IDX} pid=$!"
+echo "Started DYNA replica index=${IDX} pid=$! pin rx=${DYNA_PIN_RX:-} order=${DYNA_PIN_ORDER:-} send=${DYNA_PIN_SEND:-} exec=${DYNA_PIN_EXEC:-}"
 EOF
   chmod +x ~/bench/start_dyna_replica.sh
 
@@ -97,8 +115,8 @@ THREADS="${2:-1}"
 POISSON_RATE="${3:-30}"
 EXPERIMENT_SECS="${4:-60}"
 WARMUP_SECS="${5:-5}"
-export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-50}"
-export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-2000}"
+export DYNA_INITIAL_BOUND_US="${DYNA_INITIAL_BOUND_US:-100}"
+export DYNA_MAX_OWD_US="${DYNA_MAX_OWD_US:-1000}"
 export DYNA_BUSY_POLL="${DYNA_BUSY_POLL:-1}"
 export DYNA_RESEND_TIMEOUT_MS="${DYNA_RESEND_TIMEOUT_MS:-30}"
 export BENCH_INFLIGHT_LOG="${BENCH_INFLIGHT_LOG:-1}"

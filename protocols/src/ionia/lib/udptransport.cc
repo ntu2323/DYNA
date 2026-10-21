@@ -41,6 +41,10 @@
 #include "lib/shared_udp_port.h"
 #include "lib/udptransport.h"
 
+#include <atomic>
+#include <ctime>
+#include <unistd.h>
+
 #include <google/protobuf/message.h>
 #include <event2/event.h>
 #include <event2/thread.h>
@@ -545,7 +549,15 @@ UDPTransport::_SendMessageInternal(TransportReceiver *src,
         int numFrags = ((msgLen - 1) / MAX_UDP_MESSAGE_SIZE) + 1;
         Notice("Sending large %s message in %d fragments",
                type.c_str(), numFrags);
-        uint64_t msgId = ++lastFragMsgId;
+        // Process-wide unique: several UDPTransports in one process (e.g. per-thread
+        // SO_REUSEPORT sockets sharing one host:port) would otherwise reuse the same ids
+        // from the same source address, and the receiver would splice their fragments.
+        // Seeded per process so a restarted sender doesn't collide with stale state.
+        static std::atomic<uint64_t> s_frag_msg_id{
+            (static_cast<uint64_t>(getpid()) << 40) ^
+            (static_cast<uint64_t>(time(nullptr)) << 20)};
+        uint64_t msgId = s_frag_msg_id.fetch_add(1, std::memory_order_relaxed) + 1;
+        lastFragMsgId = msgId;
         for (size_t fragStart = 0; fragStart < msgLen;
                 fragStart += MAX_UDP_MESSAGE_SIZE) {
             size_t fragLen = std::min(msgLen - fragStart,

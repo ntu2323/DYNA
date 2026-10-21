@@ -8,6 +8,7 @@
 #include "dyna/wall_clock.h"
 #include "lib/message.h"
 
+#include <algorithm>
 #include <atomic>
 
 #include <string>
@@ -18,6 +19,11 @@ namespace specpaxos {
 namespace dyna {
 
 namespace proto = specpaxos::dyna::proto;
+
+namespace {
+// Resend backoff cap: resend_ms_ * 2^5 (30 ms -> ~1 s).
+constexpr uint32_t kMaxResendShift = 5;
+} // namespace
 
 namespace {
 // DYNA_STATS=1: process-wide client counters (the bench runs one DynaClient per thread);
@@ -193,6 +199,7 @@ void DynaClient::HandleViewInfo(const proto::ViewInfo &m)
         if (it == pending_.end()) continue;
         PendingRequest &p = it->second;
         p.phase = Phase::COLLECTING;
+        p.resends = 0;   // new view: resend promptly again
         p.quorum = TxnQuorum(LeadersFor(p), write_quorum_, viewId_);
         if (p.type == proto::READ) {
             RetryRead(id);
@@ -242,7 +249,10 @@ void DynaClient::ResendSweep()
             // replica responses"). Late followers adopt from their lateBuffer and
             // answer with CommitReply.
             slow.push_back(kv.first);
-        } else if (age >= resend_us) {
+        } else if (age >= (resend_us << std::min<uint32_t>(p.resends, kMaxResendShift))) {
+            // Exponential backoff per request: a stalled cluster (view change, overload)
+            // otherwise gets every pending request re-sent every resend_ms_, a flood
+            // that grows with the backlog and starved recovery of its own messages.
             resend.push_back(kv.first);
         }
     }
@@ -256,6 +266,7 @@ void DynaClient::ResendSweep()
         if (g_stats_on) {
             (it->second.type == proto::READ ? g_stats.retry_read : g_stats.resend_write).Add();
         }
+        it->second.resends++;
         if (it->second.phase == Phase::SLOW_WAIT) {
             SendSlowCommit(it->second);   // re-drive the slow path
         } else if (it->second.type == proto::READ) {

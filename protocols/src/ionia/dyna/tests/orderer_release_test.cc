@@ -165,3 +165,32 @@ TEST(ServerOrderer, BackgroundLoopReleasesAndStops)
     o.Stop();   // must not hang
     EXPECT_EQ(o.speclog_size(), 1u);
 }
+
+// External release driver (the replica's ordering thread): Start(false) starts no release
+// thread; next_due_hint() tracks the earliest on-time deadline so the driver can poll
+// without the lock, and ReleaseDue() releases + refreshes it.
+TEST(OrdererRelease, ExternalDriverHintTracksEarliestDeadline)
+{
+    MockClock clk(50);
+    Collector c;
+    ServerOrderer o(0, 0, &clk, Topology(1), c.cb());
+    o.Start(/*own_release_thread=*/false);
+
+    EXPECT_EQ(o.next_due_hint(), Clock::kNever);
+    o.SubmitTxn(MakeWrite(1, 1, 300), /*poke=*/false);
+    EXPECT_EQ(o.next_due_hint(), 300u);
+    o.SubmitTxn(MakeWrite(1, 2, 200), /*poke=*/false);   // earlier deadline lowers the hint
+    EXPECT_EQ(o.next_due_hint(), 200u);
+
+    // No release thread: advancing the clock alone releases nothing.
+    clk.Set(250);
+    EXPECT_FALSE(c.wait_for(1, std::chrono::milliseconds(50)));
+
+    EXPECT_EQ(o.ReleaseDue(), 1u);                        // the driver releases t=200
+    EXPECT_EQ(c.count(), 1u);
+    EXPECT_EQ(o.next_due_hint(), 300u);                   // refreshed to the next one
+    clk.Set(300);
+    EXPECT_EQ(o.ReleaseDue(), 1u);
+    EXPECT_EQ(o.next_due_hint(), Clock::kNever);
+    o.Stop();
+}

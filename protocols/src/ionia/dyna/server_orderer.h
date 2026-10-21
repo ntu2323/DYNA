@@ -59,6 +59,12 @@ public:
     // Synchronous drain of all due earlyBuffer entries (testable with MockClock).
     // Fires OnSpecReply outside the lock. Returns the number released.
     size_t ReleaseDue();
+    // Earliest earlyBuffer deadline as of the last change (Clock::kNever if none). A
+    // lock-free hint for an external release driver: it may be EARLY (an entry left the
+    // buffer) but never late for entries submitted through SubmitTxn; drivers should
+    // still call ReleaseDue() periodically as a backstop (e.g. after recovery installs).
+    uint64_t next_due_hint() const { return next_due_.load(std::memory_order_acquire); }
+    bool     paused() const { return paused_.load(); }
 
     // --- commit-message handling (protocol-decided deadlines; NOT vetoed) ---
     enum class CommitResult { kApplied, kAlreadyExecuted, kNeedFetch };
@@ -70,6 +76,14 @@ public:
     // absent, kNeedFetch (the replica should FetchRequest the body, InstallFetched, then
     // re-apply).
     CommitResult ApplyCommit(const TxnId &id, uint64_t agreedT, TxnEntry *out);
+    // Same as ApplyCommit but reports only what the commit-reply path needs, instead of
+    // deep-copying the whole entry (body, sets, maps) under the ordering lock.
+    struct CommitBrief {
+        uint64_t t = 0;
+        Status   status = Status::SPECULATIVE;
+        bool     is_leader = false;
+    };
+    CommitResult ApplyCommitBrief(const TxnId &id, uint64_t agreedT, CommitBrief *out);
 
     // Materialize a fetched body into lateBuffer (as if it arrived late) so a
     // subsequent ApplyCommit can adopt it. No-op if already present anywhere.
@@ -168,11 +182,14 @@ public:
     // Copy out the txn body if this server holds it (for servicing FetchRequest).
     bool TryGetBody(const TxnId &id, proto::Txn *out);
 
-    // Background release loop + executor thread lifecycle.
-    void Start();
+    // Background release loop + executor thread lifecycle. With own_release_thread=false
+    // only the executor starts: the caller drives ReleaseDue() itself (the replica's
+    // ordering thread does, so releases and message handling share one thread).
+    void Start(bool own_release_thread = true);
     void Stop();
 
     // DYNA_STATS: attach a counter sink (observation only). Call before Start().
+    void SetExecMinInterval(uint64_t us) { exec_min_interval_us_ = us; }   // before Start()
     void SetStats(OrdererStats *s) {
         stats_ = s;
         mu_.SetWaitStats(s ? &s->mu_wait_us : nullptr);
@@ -265,6 +282,10 @@ private:
     // Requires mu_. True iff this server is the min-id involved leader for the txn.
     bool IsPrimaryLeaderLocked(const proto::Txn &txn) const;
     // Requires mu_. Move/materialize the txn into specLog at agreedT as COMMITTING.
+    // ApplyCommit body; `emit(const TxnEntry &)` reports the resulting entry (called
+    // under mu_, before any re-heapify invalidates it).
+    template <class Emit>
+    CommitResult ApplyCommitLocked(const TxnId &id, uint64_t agreedT, Emit &&emit);
     void InstallCommittingLocked(const TxnId &id, uint64_t agreedT, const proto::Txn &body);
     // Requires mu_. Adopt one M txn (status precedence, never downgrade). Returns true if
     // it changed local state; sets *kick if it became COMMITTED here.
@@ -297,12 +318,21 @@ private:
     std::thread       release_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};
+    std::atomic<uint64_t> next_due_{Clock::kNever};   // see next_due_hint()
 
     // Executor thread (event-driven ExecuteReady) + serialization of ExecuteReady.
     std::mutex              exec_run_mu_;
     std::mutex              exec_mu_;
     std::condition_variable exec_cv_;
     bool                    exec_pending_ = false;
+    // Lock-free kick coalescing: set by the first KickExecutor since the executor last
+    // started a pass; later kicks skip exec_mu_ + notify (a futex wake per commit
+    // otherwise, on the ordering thread's hot path).
+    std::atomic<bool>       exec_kicked_{false};
+    // Minimum spacing between executor passes (DYNA_EXEC_MIN_INTERVAL_US). Each pass
+    // holds the ordering lock for its snapshot + conflict scan, so fewer, larger passes
+    // cut that lock time (execution is background: it never gates commit).
+    uint64_t                exec_min_interval_us_ = 0;
     std::thread             exec_thread_;
     std::vector<std::function<void()>> exec_jobs_;   // RunOnStoreThread (under exec_mu_)
 

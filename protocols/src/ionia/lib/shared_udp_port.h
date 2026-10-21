@@ -95,7 +95,11 @@ private:
         std::string data;
         size_t received = 0;   // bytes copied so far (data is pre-sized to msg_len)
     };
-    std::map<UDPTransportAddress, FragInfo> frag_info_;
+    // Keyed by (sender, msgId): a sender with several sockets / threads can have more
+    // than one fragmented message in flight. At most kMaxFragPerSender incomplete
+    // reassemblies are kept per sender (the oldest is dropped).
+    std::map<std::pair<UDPTransportAddress, uint64_t>, FragInfo> frag_info_;
+    std::map<UDPTransportAddress, std::vector<uint64_t>> frag_order_;
 
     static std::mutex registry_mutex_;
     static std::map<PortKey, SharedUDPPort *> registry_;

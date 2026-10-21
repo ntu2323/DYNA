@@ -234,13 +234,11 @@ def _build_client_cmd(
         # Bound knobs pass through from the LOCAL environment (they're evaluated in
         # the remote shell otherwise, which never sees the local export). Lets you
         # A/B the deadline hold: e.g. DYNA_MAX_OWD_US=40 python3 run_cluster_bench.py …
-        # The deadline-hold bound is the dominant client-visible latency term. It is
-        # sized to the real one-way delay: measured OWD on the CloudLab cluster is
-        # ~40µs, so DYNA_MAX_OWD_US=40 caps the (noisy, sometimes-inflated) OWD
-        # estimate at the true wire delay. These are cluster-calibrated defaults; on a
-        # slower network raise them (bound ≈ p50 one-way delay). Override via local env.
-        _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "30")
-        _max_owd = os.environ.get("DYNA_MAX_OWD_US", "40")
+        # Deadline bound defaults measured on CloudLab c6320 (2026-10-20): start at
+        # 100 µs and cap the learned (p95) OWD at 1 ms. A 40 µs cap made most requests
+        # late under load (slow path); override via local env.
+        _init_bound = os.environ.get("DYNA_INITIAL_BOUND_US", "100")
+        _max_owd = os.environ.get("DYNA_MAX_OWD_US", "1000")
         # Client transport mode, baked from the LOCAL env (a remote ${VAR:-1} would not
         # see the local export). Default 1 = busy-poll (lowest single-thread latency).
         # Set DYNA_BUSY_POLL=0 to make the CLIENT epoll-block: many client threads
@@ -261,6 +259,9 @@ def _build_client_cmd(
         # Slow-path trigger (all leaders replied, quorum short): forward if set locally.
         if "DYNA_SLOW_TIMEOUT_US" in os.environ:
             dyna_env += f"export DYNA_SLOW_TIMEOUT_US={shlex.quote(os.environ['DYNA_SLOW_TIMEOUT_US'])}; "
+        # Spread each open-loop tick's requests over the tick (no synchronized bursts).
+        if "BENCH_SMOOTH_OPEN_LOOP" in os.environ:
+            dyna_env += f"export BENCH_SMOOTH_OPEN_LOOP={shlex.quote(os.environ['BENCH_SMOOTH_OPEN_LOOP'])}; "
         # Per-second client counters (fast/slow commits, resends, latency split).
         if "DYNA_STATS" in os.environ:
             dyna_env += f"export DYNA_STATS={shlex.quote(os.environ['DYNA_STATS'])}; "
@@ -279,7 +280,10 @@ def _build_client_cmd(
     return (
         f"mkdir -p {run_dir} && rm -f {run_dir}/done {run_dir}/exit_code && "
         f"cd {cfg['client_cwd']} && "
-        f"nohup bash -c {shlex.quote(client_run)} >/dev/null 2>&1 &"
+        # Braces: a bare trailing `&` backgrounds the WHOLE `a && b && nohup ...` chain as a
+        # subshell that keeps the ssh channel's stdout open, so ssh (and "client launched")
+        # only returned when the client EXITED — and --kill-at-sec fired after the load.
+        f"{{ nohup bash -c {shlex.quote(client_run)} </dev/null >/dev/null 2>&1 & }}"
     )
 
 
@@ -301,6 +305,9 @@ _DYNA_REPLICA_ENV_KNOBS = (
     "DYNA_REPL_MAX_BYTES",
     "DYNA_LOCK_SPIN",
     "DYNA_PRERESERVE",
+    "DYNA_ORDER_THREAD",
+    "DYNA_PIN",
+    "DYNA_EXEC_MIN_INTERVAL_US",
     "LD_PRELOAD",   # e.g. /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 for the replicas
     "DYNA_FAIL_TIMEOUT_MS",
     "DYNA_FAIL_GRACE_MS",

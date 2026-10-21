@@ -391,6 +391,7 @@ SharedUDPPort::ProcessPacket(sockaddr_in sender, char *buf, ssize_t sz)
     std::string msg;
     void *meta_data = nullptr;
     size_t meta_len = 0;
+    std::string assembled;   // a completed fragmented message (outlives meta_data use)
 
     ASSERT(sz >= static_cast<ssize_t>(sizeof(uint32_t)));
     const uint32_t magic = *reinterpret_cast<uint32_t *>(buf);
@@ -410,13 +411,22 @@ SharedUDPPort::ProcessPacket(sockaddr_in sender, char *buf, ssize_t sz)
         ptr += sizeof(size_t);
         const size_t frag_len = static_cast<size_t>(buf + sz - ptr);
 
-        FragInfo &info = frag_info_[sender_addr];
-        if (info.msgId != msg_id) {
-            // New message (or a newer one superseding an incomplete reassembly).
-            info.msgId = msg_id;
-            info.data.assign(msg_len, '\0');
-            info.received = 0;
+        const auto key = std::make_pair(sender_addr, msg_id);
+        auto fit = frag_info_.find(key);
+        if (fit == frag_info_.end()) {
+            constexpr size_t kMaxFragPerSender = 8;
+            auto &order = frag_order_[sender_addr];
+            if (order.size() >= kMaxFragPerSender) {   // drop the oldest incomplete one
+                frag_info_.erase(std::make_pair(sender_addr, order.front()));
+                order.erase(order.begin());
+            }
+            order.push_back(msg_id);
+            fit = frag_info_.emplace(key, FragInfo{}).first;
+            fit->second.msgId = msg_id;
+            fit->second.data.assign(msg_len, '\0');
+            fit->second.received = 0;
         }
+        FragInfo &info = fit->second;
         if (frag_start + frag_len <= info.data.size()) {
             memcpy(&info.data[frag_start], ptr, frag_len);
             info.received += frag_len;
@@ -425,11 +435,16 @@ SharedUDPPort::ProcessPacket(sockaddr_in sender, char *buf, ssize_t sz)
         // (checking data.size() fired on the FIRST fragment and decoded a mostly-zero
         // buffer: every message > MAX_UDP_MESSAGE_SIZE was lost).
         if (info.received >= msg_len) {
-            meta_len = DecodePacket(info.data.data(), info.data.size(),
+            // Move the payload out before erasing: meta_data points into it and is read
+            // below (endpoint meta / multistamp).
+            assembled = std::move(info.data);
+            frag_info_.erase(fit);
+            meta_len = DecodePacket(assembled.data(), assembled.size(),
                                     msg_type, msg, &meta_data);
-            info.msgId = 0;
-            info.data.clear();
-            info.received = 0;
+            auto &order = frag_order_[sender_addr];
+            for (auto it = order.begin(); it != order.end(); ++it) {
+                if (*it == msg_id) { order.erase(it); break; }
+            }
         } else {
             return;
         }

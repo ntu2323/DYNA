@@ -58,6 +58,11 @@ struct OrdererStats {
     StatDist    scan_locked_us;   // background scans (ts-agree / replicate / re-ack)
     StatDist    submit_wait_us;   // SubmitTxn: time waiting to acquire the ordering lock
     StatDist    mu_wait_us;       // every contended ordering-lock acquisition (any thread)
+    // Ordering-lock hold time per call site class.
+    StatDist    hold_submit_us;   // SubmitTxn
+    StatDist    hold_commit_us;   // ApplyCommit (Fast/SlowCommit)
+    StatDist    hold_repl_us;     // replication: prepare / ack / commit / take-prepare
+    StatDist    hold_release_us;  // release loop drain
 };
 
 } // namespace dyna

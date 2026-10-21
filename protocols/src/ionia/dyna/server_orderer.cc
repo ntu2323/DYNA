@@ -4,9 +4,14 @@
 
 #include "dyna/server_orderer.h"
 
+#include "dyna/cpu_pin.h"
+
 #include <string_view>
 #include <unordered_set>
+#include <pthread.h>
+
 #include <algorithm>
+#include <chrono>
 #include <set>
 #include <string>
 #include <utility>
@@ -34,6 +39,15 @@ ServerOrderer::~ServerOrderer()
 }
 
 namespace {
+// DYNA_STATS: time the ordering lock is held by a call site (declare right after the
+// lock_guard so it is destroyed — and stops — just before the unlock).
+struct HoldTimer {
+    StatDist *d;
+    uint64_t  t0;
+    explicit HoldTimer(StatDist *dist) : d(dist), t0(dist ? WallClockMicros() : 0) {}
+    ~HoldTimer() { if (d) d->Observe(WallClockMicros() - t0); }
+};
+
 // What the SpecReply callback needs from a released WRITE: ids, type, t, leadership,
 // OWD and the client address — not the body / leader bookkeeping. Copying only these
 // (and moving the full entry into specLog) keeps a deep TxnEntry copy out of the
@@ -81,6 +95,7 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
     {
         const uint64_t wait_t0 = stats_ ? WallClockMicros() : 0;
         std::lock_guard<HybridMutex> lk(mu_);
+        HoldTimer ht(stats_ ? &stats_->hold_submit_us : nullptr);
         if (stats_) stats_->submit_wait_us.Observe(WallClockMicros() - wait_t0);
         // A delayed / retried request for a txn we already executed and GC'd must not
         // be re-admitted (it would be re-applied on top of newer writes) — but a WRITE
@@ -133,6 +148,9 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
             // handled above
         } else if (now <= entry.t) {
             // On-time (design doc: arrives before T.t) → earlyBuffer.
+            if (entry.t < next_due_.load(std::memory_order_relaxed)) {
+                next_due_.store(entry.t, std::memory_order_release);
+            }
             early_buffer_.push(key, std::move(entry));
         } else if (entry.is_leader_for_this) {
             // Late-leader re-timestamp: bump t := clock(), kept above everything already
@@ -163,23 +181,23 @@ void ServerOrderer::SubmitTxn(TxnEntry entry, bool poke)
     if (poke) clock_->Interrupt();
 }
 
+template <class Emit>
 ServerOrderer::CommitResult
-ServerOrderer::ApplyCommit(const TxnId &id, uint64_t agreedT, TxnEntry *out)
+ServerOrderer::ApplyCommitLocked(const TxnId &id, uint64_t agreedT, Emit &&emit)
 {
-    std::lock_guard<HybridMutex> lk(mu_);
     const uint64_t now = clock_->Now();
 
     // Already executed and GC'd: report its final t (so a SlowCommit can still be
     // answered) instead of fetching + re-applying it.
     auto xit = executed_.find(id);
     if (xit != executed_.end()) {
-        if (out) {
-            out->txn.set_client_id(id.clientid);
-            out->txn.set_request_id(id.clientreqid);
-            out->t = xit->second.t;
-            out->status = Status::COMMITTED;
-            out->is_leader_for_this = xit->second.is_leader;
-        }
+        TxnEntry done;
+        done.txn.set_client_id(id.clientid);
+        done.txn.set_request_id(id.clientreqid);
+        done.t = xit->second.t;
+        done.status = Status::COMMITTED;
+        done.is_leader_for_this = xit->second.is_leader;
+        emit(done);
         return CommitResult::kAlreadyExecuted;
     }
 
@@ -192,19 +210,19 @@ ServerOrderer::ApplyCommit(const TxnId &id, uint64_t agreedT, TxnEntry *out)
             e->status = Status::COMMITTING;
             highest_released_t_ = std::max(highest_released_t_, e->Order());
         }
-        if (out) *out = *e;          // copy BEFORE update_key: `e` is invalid after it
-        spec_log_.update_key(id);
+        emit(*e);                    // report BEFORE update_key (pointer stays valid, but
+        spec_log_.update_key(id);    // keep the order explicit)
         return CommitResult::kApplied;
     }
     // Admitted but not yet released: move earlyBuffer → specLog at agreedT.
-    if (early_buffer_.contains(id)) {
-        TxnEntry e = *early_buffer_.find(id);
+    if (TxnEntry *pending = early_buffer_.find(id)) {
+        TxnEntry e = std::move(*pending);   // values live out of line: moving is safe
         early_buffer_.erase(id);
         e.t = agreedT;
         e.status = Status::COMMITTING;
         e.committing_us = now;
         highest_released_t_ = std::max(highest_released_t_, e.Order());
-        if (out) *out = e;
+        emit(e);
         spec_log_.push(id, std::move(e));
         return CommitResult::kApplied;
     }
@@ -217,11 +235,32 @@ ServerOrderer::ApplyCommit(const TxnId &id, uint64_t agreedT, TxnEntry *out)
         e.status = Status::COMMITTING;
         e.committing_us = now;
         highest_released_t_ = std::max(highest_released_t_, e.Order());
-        if (out) *out = e;
+        emit(e);
         spec_log_.push(id, std::move(e));
         return CommitResult::kApplied;
     }
     return CommitResult::kNeedFetch;
+}
+
+ServerOrderer::CommitResult
+ServerOrderer::ApplyCommit(const TxnId &id, uint64_t agreedT, TxnEntry *out)
+{
+    std::lock_guard<HybridMutex> lk(mu_);
+    HoldTimer ht(stats_ ? &stats_->hold_commit_us : nullptr);
+    return ApplyCommitLocked(id, agreedT, [out](const TxnEntry &e) { if (out) *out = e; });
+}
+
+ServerOrderer::CommitResult
+ServerOrderer::ApplyCommitBrief(const TxnId &id, uint64_t agreedT, CommitBrief *out)
+{
+    std::lock_guard<HybridMutex> lk(mu_);
+    HoldTimer ht(stats_ ? &stats_->hold_commit_us : nullptr);
+    return ApplyCommitLocked(id, agreedT, [out](const TxnEntry &e) {
+        if (!out) return;
+        out->t = e.t;
+        out->status = e.status;
+        out->is_leader = e.is_leader_for_this;
+    });
 }
 
 void ServerOrderer::InstallFetched(const proto::Txn &body)
@@ -419,6 +458,7 @@ void ServerOrderer::DriveReplication(std::vector<ReplicateAction> *prepares,
 bool ServerOrderer::TakeReplicateNow(const TxnId &id, ReplicateAction *out)
 {
     std::lock_guard<HybridMutex> lk(mu_);
+    HoldTimer ht(stats_ ? &stats_->hold_repl_us : nullptr);
     TxnEntry *e = spec_log_.find(id);
     if (!e || e->status != Status::COMMITTING || e->last_replicate_us != 0 ||
         !IsPrimaryLeaderLocked(e->txn)) {
@@ -437,6 +477,7 @@ ServerOrderer::RecordPrepareReply(const TxnId &id, uint32_t from)
     PrepareReplyResult res = PrepareReplyResult::kNone;
     {
         std::lock_guard<HybridMutex> lk(mu_);
+        HoldTimer ht(stats_ ? &stats_->hold_repl_us : nullptr);
         if (from == server_id_) return PrepareReplyResult::kNone;
         if (executed_.find(id) != executed_.end()) {
             // We only execute COMMITTED txns: `from` missed the ReplicateCommit.
@@ -459,6 +500,7 @@ bool ServerOrderer::HandleReplicatePrepare(const TxnId &id, uint64_t agreedT,
                                            const proto::Txn &body)
 {
     std::lock_guard<HybridMutex> lk(mu_);
+    HoldTimer ht(stats_ ? &stats_->hold_repl_us : nullptr);
     if (executed_.find(id) != executed_.end()) return true;   // ack; never re-install
     InstallCommittingLocked(id, agreedT, body);
     return spec_log_.contains(id);
@@ -469,6 +511,7 @@ void ServerOrderer::MarkCommitted(const TxnId &id)
     bool kick = false;
     {
         std::lock_guard<HybridMutex> lk(mu_);
+        HoldTimer ht(stats_ ? &stats_->hold_repl_us : nullptr);
         if (TxnEntry *e = spec_log_.find(id)) {
             if (e->status != Status::COMMITTED) {
                 e->status = Status::COMMITTED;
@@ -624,6 +667,7 @@ std::vector<TxnId> ServerOrderer::ExecuteReady()
 
 void ServerOrderer::KickExecutor()
 {
+    if (exec_kicked_.exchange(true, std::memory_order_acq_rel)) return;   // already pending
     {
         std::lock_guard<std::mutex> lk(exec_mu_);
         exec_pending_ = true;
@@ -636,6 +680,9 @@ void ServerOrderer::ExecutorLoop()
     // The executor is the only thread that touches the store in a running replica
     // (stores like SplinterDB require per-thread registration).
     if (backend_) backend_->RegisterThread();
+    pthread_setname_np(pthread_self(), "dyna-exec");
+    PinSelfFromEnv("DYNA_PIN_EXEC");
+    uint64_t last_pass_us = 0;
     while (true) {
         std::vector<std::function<void()>> jobs;
         {
@@ -646,9 +693,22 @@ void ServerOrderer::ExecutorLoop()
             jobs.swap(exec_jobs_);
             if (!running_.load() && jobs.empty()) break;
             exec_pending_ = false;   // coalesce: kicks during the pass trigger one more
+            // Re-arm the lock-free kick BEFORE the pass, so a commit that lands during it
+            // takes the slow path above and schedules one more pass.
+            exec_kicked_.store(false, std::memory_order_release);
         }
         for (auto &job : jobs) job();   // RunOnStoreThread (each wrapper serializes)
         if (!running_.load()) break;
+        if (exec_min_interval_us_ > 0 && jobs.empty()) {
+            // Let commits accumulate: one pass per interval at most. (Store jobs from
+            // recovery / rejoin run immediately above and are not delayed.)
+            const uint64_t now = WallClockMicros();
+            if (now < last_pass_us + exec_min_interval_us_) {
+                std::this_thread::sleep_for(
+                    std::chrono::microseconds(last_pass_us + exec_min_interval_us_ - now));
+            }
+            last_pass_us = WallClockMicros();
+        }
         ExecuteReady();
     }
     if (backend_) backend_->UnregisterThread();
@@ -662,7 +722,9 @@ size_t ServerOrderer::DrainDueLocked(std::vector<TxnEntry> &out, bool *kick)
         const OrderKey ok = early_buffer_.peek_min().Order();
         if (ok.t > now) break;                       // earliest not yet due
         const TxnId id = early_buffer_.peek_min_id();
-        TxnEntry e = early_buffer_.pop_min();
+        // Transfer the entry's allocation from earlyBuffer to specLog (no realloc).
+        std::unique_ptr<TxnEntry> ep = early_buffer_.pop_min_ptr();
+        TxnEntry &e = *ep;
         e.status = Status::SPECULATIVE;
         e.released_us = now;
         if (stats_) stats_->release_lag_us.Observe(now - ok.t);
@@ -678,15 +740,16 @@ size_t ServerOrderer::DrainDueLocked(std::vector<TxnEntry> &out, bool *kick)
         } else if (is_read) {
             // Leader READ: log it; the executor services it (disk-read) once its
             // dependent writes have executed.
-            spec_log_.push(id, std::move(e));
+            spec_log_.push_ptr(id, std::move(ep));
             *kick = true;
         } else {
             // WRITE (endorse/lead): log it and reply now.
             out.push_back(ReplyCopy(e));
-            spec_log_.push(id, std::move(e));
+            spec_log_.push_ptr(id, std::move(ep));
         }
         ++n;
     }
+    next_due_.store(NextDeadlineLocked(), std::memory_order_release);
     return n;
 }
 
@@ -714,12 +777,14 @@ size_t ServerOrderer::ReleaseDue()
 
 void ServerOrderer::ReleaseLoop()
 {
+    pthread_setname_np(pthread_self(), "dyna-rel");
     while (running_.load()) {
         std::vector<TxnEntry> released;
         bool kick = false;
         uint64_t next;
         {
             std::lock_guard<HybridMutex> lk(mu_);
+            HoldTimer ht(stats_ ? &stats_->hold_release_us : nullptr);
             if (paused_.load()) {
                 next = Clock::kNever;   // parked until SetPaused(false) interrupts us
             } else {
@@ -736,11 +801,11 @@ void ServerOrderer::ReleaseLoop()
     }
 }
 
-void ServerOrderer::Start()
+void ServerOrderer::Start(bool own_release_thread)
 {
     bool expected = false;
     if (!running_.compare_exchange_strong(expected, true)) return;  // already running
-    release_thread_ = std::thread(&ServerOrderer::ReleaseLoop, this);
+    if (own_release_thread) release_thread_ = std::thread(&ServerOrderer::ReleaseLoop, this);
     exec_thread_ = std::thread(&ServerOrderer::ExecutorLoop, this);
 }
 
@@ -940,6 +1005,7 @@ void ServerOrderer::Reset()
     late_buffer_.clear();
     executed_.clear();
     highest_released_t_ = OrderKey{};
+    next_due_.store(Clock::kNever, std::memory_order_release);
     // written_keys_ / recovered_t_ describe the store, which is kept.
 }
 

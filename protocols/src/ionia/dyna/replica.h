@@ -25,6 +25,8 @@
 #include "dyna/wall_clock.h"
 
 #include <atomic>
+#include <functional>
+#include <thread>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -77,6 +79,12 @@ private:
 
     // Message handlers.
     void HandleClientRequest(const TransportAddress &remote, const proto::ClientRequest &m);
+    // HandleClientRequest in two halves so the ordering thread does only the ordered
+    // part: Build (any thread: entry construction, txn moved in) and Process (ordering:
+    // view check, OWD sample, at-most-once dedup, SubmitTxn).
+    TxnEntry BuildRequestEntry(std::shared_ptr<TransportAddress> addr, proto::Txn &&txn);
+    void ProcessRequestEntry(TxnEntry &&e);
+    void SubmitRequestEntry(TxnEntry &&e);
     void HandleCommit(const TransportAddress &remote, const TxnId &id,
                       uint64_t agreedT, bool slow);
     void HandleFetchRequest(const TransportAddress &remote, const proto::FetchRequest &m);
@@ -117,11 +125,13 @@ private:
     // ReplicatePrepare now rather than on the next background scan.
     void ReplicateNowIfPrimary(const TxnId &id);
     // Outcome of a commit message once the body is present (applied / already executed).
-    void FinishCommit(const TxnId &id, const TxnEntry &out, ServerOrderer::CommitResult r,
+    void FinishCommit(const TxnId &id, const ServerOrderer::CommitBrief &out,
+                      ServerOrderer::CommitResult r,
                       bool slow, const TransportAddress *client);
     // Build the SpecReply proto for a released entry (writes carry no results).
     proto::SpecReply BuildSpecReply(const TxnEntry &e) const;
-    void SendCommitReply(const TransportAddress &client, const TxnEntry &e);
+    void SendCommitReply(const TransportAddress &client, const TxnId &id,
+                         const ServerOrderer::CommitBrief &c);
 
     // --- views + recovery (design doc § Recovery) ---
     // Normal processing runs only while the VR layer is NORMAL.
@@ -164,7 +174,9 @@ private:
                                       // the prepare re-broadcast and stale-commit re-ack throttle
     Topology topo_;              // current view's topology (transport thread)
     uint64_t hb_ms_ = 20;        // heartbeat / VR tick cadence
-    bool     paused_ = false;    // orderer release loop paused (not NORMAL)
+    // Orderer release loop paused (not NORMAL). Atomic: receive threads read it to drop
+    // client traffic early during a view change (see ReceiveMessage).
+    std::atomic<bool> paused_{false};
     std::unique_ptr<ViewCoordinator> vc_;
     std::string vr_state_dir_ = ".";
 
@@ -197,7 +209,14 @@ private:
     // WRITE ClientRequest is answered from cache and never double-submitted. READs bypass
     // both: every read attempt carries a fresh request_id and a new t.
     HybridMutex dedup_mu_;
-    TxnMap<proto::SpecReply>        reply_cache_;
+    // Compact cache value: a resend is answered with a reply rebuilt from these (its t
+    // and leadership are re-derived from live state anyway), so the hot release path
+    // doesn't store a protobuf per txn in a multi-million-entry map.
+    struct CachedSpec {
+        uint64_t t = 0;
+        uint64_t owd = 0;
+    };
+    TxnMap<CachedSpec>               reply_cache_;
     TxnSet                           inflight_;
 
     // A commit that arrived before the body: remember it until the fetch completes.
@@ -217,12 +236,44 @@ private:
 
     // --- DYNA_STATS=1: per-second counters, printed from HeartbeatTick (observation only)
     enum RxType { kRxRequest, kRxFast, kRxSlow, kRxPrep, kRxPrepReply, kRxCommit,
-                  kRxTsAgree, kRxFetch, kRxBg, kRxHeartbeat, kRxOther, kRxN };
+                  kRxTsAgree, kRxFetch, kRxFetchRep, kRxBg, kRxHeartbeat, kRxOther, kRxN };
+    static bool IsHot(RxType k) { return k != kRxHeartbeat && k != kRxOther; }
+    // Hot-message pipeline: parse (receive thread) and process (receive thread, or the
+    // ordering thread when DYNA_ORDER_THREAD is on).
+    static std::unique_ptr<google::protobuf::Message> ParseHot(RxType kind,
+                                                               std::string_view data);
+    void ProcessHot(RxType kind, const TransportAddress &remote,
+                    const google::protobuf::Message &msg);
+    // DYNA_ORDER_THREAD: one thread runs every hot handler (posted by the receive
+    // threads through a lock-free MPSC queue) and drives the orderer's releases, so the
+    // ordering lock is almost never contended. Busy-poll mode only.
+    void OrderingLoop();
+    bool order_thread_on_ = false;
+    std::atomic<bool> order_running_{false};
+    MultiProducerSingleConsumerQueue<std::function<void()>> order_q_;
+    std::thread order_thread_;
+    // Sender thread (with the ordering thread): release-path SpecReplies and full
+    // background batches are sent from here, keeping sendto off the ordering thread.
+    void SendLoop();
+    std::atomic<bool> send_running_{false};
+    MultiProducerSingleConsumerQueue<std::function<void()>> send_q_;
+    // Release-path SpecReplies as plain structs (no closure allocation; the sender
+    // thread builds the protobuf).
+    struct ReplyJob {
+        std::shared_ptr<TransportAddress> addr;
+        uint64_t client_id = 0, request_id = 0, view_id = 0, t = 0, owd = 0;
+        bool     is_leader = false;
+    };
+    MultiProducerSingleConsumerQueue<ReplyJob> reply_q_;
+    std::thread send_thread_;
+    StatCounter order_busy_us_;     // ordering thread time spent running handlers
+    StatMax     order_qmax_;        // max queue depth seen
     static RxType ClassifyRx(std::string_view type);
     void MaybeDumpStats(uint64_t now_us);
     bool         stats_on_ = false;
     OrdererStats ostats_;
     StatCounter  rx_[kRxN];
+    StatCounter  rx_us_[kRxN];      // handler time per message type
     StatCounter  busy_us_;          // transport thread time inside ReceiveMessage
     StatMax      handler_max_us_;   // longest single ReceiveMessage
     StatCounter  spec_tx_;          // SpecReplies sent (release thread)

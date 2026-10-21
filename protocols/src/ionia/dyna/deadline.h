@@ -24,7 +24,9 @@ struct DeadlineConfig {
     uint64_t initial_bound_us = 500;
     uint64_t max_owd_us = 10000;
     uint32_t owd_window_len = 100;
-    uint32_t owd_percentile_percent = 50;
+    // p95: with p50 the deadline sits at the median one-way delay, so under load a large
+    // share of arrivals miss it (~30% late at 25k ops/s on CloudLab vs ~3% at p95).
+    uint32_t owd_percentile_percent = 95;
 
     static uint64_t EnvU64(const char *name, uint64_t fallback) {
         const char *v = std::getenv(name);

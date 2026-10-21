@@ -10,6 +10,7 @@
 #include "lib/timeval.h"
 
 #include <fcntl.h>
+#include <cstdlib>
 #include <mutex>
 #include <random>
 #include <sys/mman.h>
@@ -257,10 +258,31 @@ BenchmarkClient::Start()
     expStartTime = std::chrono::high_resolution_clock::now();
 
     if (openLoop_) {
-        OpenLoopTick();
+        if (SmoothOpenLoop()) {
+            // Random start phase so client threads' 10 ms ticks don't line up.
+            const uint64_t phase_us = keyRng_() % (kOpenLoopIntervalMs * 1000ULL);
+            transport.TimerUS(phase_us, std::bind(&BenchmarkClient::OpenLoopTick, this));
+        } else {
+            OpenLoopTick();
+        }
     } else {
         SendNext();
     }
+}
+
+bool
+BenchmarkClient::SmoothOpenLoop()
+{
+    // Default on: spread each tick's Poisson draw evenly over the tick (and randomize
+    // each thread's phase) instead of submitting it back to back. Burst mode
+    // (BENCH_SMOOTH_OPEN_LOOP=0) lines every thread's tick up, so replicas see
+    // ~(rate x 10 ms) requests at once every 10 ms: a queueing artifact of the
+    // generator, not of the protocol under test.
+    static const bool on = []() {
+        const char *v = std::getenv("BENCH_SMOOTH_OPEN_LOOP");
+        return v == nullptr || *v == '\0' || *v != '0';
+    }();
+    return on;
 }
 
 void
@@ -298,6 +320,7 @@ BenchmarkClient::WarmupDone()
            static_cast<unsigned long>(totalSubmitted_));
     gettimeofday(&startTime, NULL);
     n = 0;
+    totalSubmitted_ = 0;   // warmup (ramp) submissions don't count toward the window
     opLastInterval = 0;
     expStartTime = std::chrono::high_resolution_clock::now();
 
@@ -396,16 +419,61 @@ BenchmarkClient::OpenLoopTick()
         return;
     }
 
-    // Do not offer load during warmup: avoids building an unbounded WAN backlog
-    // before the measured experiment window (WarmupDone sets started=true).
+    const uint32_t drawn = poissonTrace_[poissonIdx_ % poissonTrace_.size()];
+    poissonIdx_++;
+
+    // Warmup: by default ramp the offered rate linearly from 0 to 100% over the warmup
+    // period, so the system under test reaches steady state (e.g. DYNA's learned
+    // deadlines) before the measured window instead of facing the full rate cold.
+    // BENCH_WARMUP_RAMP=0 restores the old behavior: no load at all during warmup
+    // (avoids an unbounded WAN backlog before the window).
     if (!started) {
+        if (WarmupRamp() && warmupSec > 0) {
+            const double elapsed = std::chrono::duration<double>(
+                std::chrono::high_resolution_clock::now() - expStartTime).count();
+            const double frac = std::min(1.0, elapsed / warmupSec);
+            const double want = drawn * frac;
+            uint32_t k = static_cast<uint32_t>(want);
+            if (std::uniform_real_distribution<double>(0.0, 1.0)(keyRng_) < want - k) ++k;
+            SubmitTickBatch(k);
+        }
         transport.Timer(kOpenLoopIntervalMs,
                         std::bind(&BenchmarkClient::OpenLoopTick, this));
         return;
     }
 
-    const uint32_t reqNum = poissonTrace_[poissonIdx_ % poissonTrace_.size()];
-    poissonIdx_++;
+    SubmitTickBatch(drawn);
+    MaybeFinishExperiment();
+    if (!done) {
+        transport.Timer(kOpenLoopIntervalMs,
+                        std::bind(&BenchmarkClient::OpenLoopTick, this));
+    }
+}
+
+bool
+BenchmarkClient::WarmupRamp()
+{
+    static const bool on = []() {
+        const char *v = std::getenv("BENCH_WARMUP_RAMP");
+        return v == nullptr || *v == '\0' || *v != '0';
+    }();
+    return on;
+}
+
+void
+BenchmarkClient::SubmitTickBatch(uint32_t reqNum)
+{
+    if (SmoothOpenLoop() && reqNum > 1) {
+        const uint64_t gap_us = (kOpenLoopIntervalMs * 1000ULL) / reqNum;
+        if (MaySubmitMore() && !InflightCapReached()) SubmitOne();
+        for (uint32_t j = 1; j < reqNum; ++j) {
+            transport.TimerUS(j * gap_us, [this]() {
+                if (done || cooldownDone) return;
+                if (MaySubmitMore() && !InflightCapReached()) SubmitOne();
+            });
+        }
+        return;
+    }
 
     for (uint32_t j = 0; j < reqNum; ++j) {
         if (!MaySubmitMore()) {
@@ -415,12 +483,6 @@ BenchmarkClient::OpenLoopTick()
         if (InflightCapReached()) {
             break;
         }
-    }
-
-    MaybeFinishExperiment();
-    if (!done) {
-        transport.Timer(kOpenLoopIntervalMs,
-                        std::bind(&BenchmarkClient::OpenLoopTick, this));
     }
 }
 

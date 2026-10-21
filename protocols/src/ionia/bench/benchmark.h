@@ -49,6 +49,9 @@ private:
     void SendNext();
     void SubmitOne();
     void OpenLoopTick();
+    static bool SmoothOpenLoop();
+    static bool WarmupRamp();
+    void SubmitTickBatch(uint32_t reqNum);
     void OnReplyOpen(uint64_t submitId, const string &request, const string &reply);
     void MaybeFinishExperiment();
     void Finish();

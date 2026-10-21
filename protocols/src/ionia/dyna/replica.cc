@@ -4,12 +4,14 @@
 
 #include "dyna/replica.h"
 
+#include "dyna/cpu_pin.h"
 #include "dyna/db_backend.h"
 #include "dyna/in_memory_backend.h"
 
 #include "lib/message.h"
 
 #include <fcntl.h>
+#include <pthread.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -76,13 +78,19 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
     }
     stats_on_ = StatsEnabledFromEnv();
     last_hb_rx_us_.assign(static_cast<size_t>(config.n), 0);
+    // Ordering thread: on by default in busy-poll mode (DYNA_ORDER_THREAD=0 = handlers
+    // run on the receive threads under the ordering lock, as before).
+    order_thread_on_ = busyPoll && DeadlineConfig::EnvU64("DYNA_ORDER_THREAD", 1) != 0;
     if (stats_on_) {
         orderer_->SetStats(&ostats_);
         dedup_mu_.SetWaitStats(&dedup_wait_us_);
         pending_mu_.SetWaitStats(&pending_wait_us_);
         owd_mu_.SetWaitStats(&owd_wait_us_);
     }
-    orderer_->Start();
+    // Executor passes at most every DYNA_EXEC_MIN_INTERVAL_US (default 2000): each pass
+    // takes the ordering lock; at 55k ops/s per-commit passes held it ~14% of the time.
+    orderer_->SetExecMinInterval(DeadlineConfig::EnvU64("DYNA_EXEC_MIN_INTERVAL_US", 2000));
+    orderer_->Start(/*own_release_thread=*/!order_thread_on_);
 
     ts_scan_ms_ = DeadlineConfig::EnvU64("DYNA_TS_SCAN_MS", 50);
     if (ts_scan_ms_ == 0) ts_scan_ms_ = 1;
@@ -132,8 +140,21 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
                                          DeadlineConfig::EnvU64("DYNA_REPL_MAX_BYTES", 8000));
         transport->TimerUS(bg_flush_us_, [this]() { BgFlushTick(); });
     }
-    Notice("DYNA r%d up: n=%d f=%d busyPoll=%d store=%s failTimeoutMs=%lu replBatch=%lu "
-           "replFlushUs=%lu", replicaIdx, config.n, config.f, busyPoll ? 1 : 0,
+    if (order_thread_on_) {
+        // Initialize the primary transport's lazy address maps from this thread before
+        // the ordering thread can send through it concurrently.
+        proto::Heartbeat hb;
+        hb.set_view_id(viewId_);
+        hb.set_sender_id(static_cast<uint32_t>(replicaIdx));
+        transport->SendMessageToAll(this, hb);
+        send_running_.store(true);
+        send_thread_ = std::thread(&DynaReplica::SendLoop, this);
+        order_running_.store(true);
+        order_thread_ = std::thread(&DynaReplica::OrderingLoop, this);
+    }
+    Notice("DYNA r%d up: n=%d f=%d busyPoll=%d orderThread=%d store=%s failTimeoutMs=%lu "
+           "replBatch=%lu replFlushUs=%lu", replicaIdx, config.n, config.f, busyPoll ? 1 : 0,
+           order_thread_on_ ? 1 : 0,
            db != nullptr ? "harness-db" : "in-memory",
            (unsigned long)(vcfg.fail_timeout_us / 1000), (unsigned long)(bg_ ? bg_batch : 1),
            (unsigned long)bg_flush_us_);
@@ -141,6 +162,10 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
 
 DynaReplica::~DynaReplica()
 {
+    order_running_.store(false);
+    if (order_thread_.joinable()) order_thread_.join();
+    send_running_.store(false);
+    if (send_thread_.joinable()) send_thread_.join();
     if (orderer_) orderer_->Stop();
 }
 
@@ -162,6 +187,7 @@ DynaReplica::ClassifyRx(std::string_view type)
     const static auto fetchRep =
         proto::FetchReply::default_instance().GetDescriptor()->full_name();
     const static auto hb = proto::Heartbeat::default_instance().GetDescriptor()->full_name();
+    if (type == fetchRep) return kRxFetchRep;
     const static auto bg = proto::BgBatch::default_instance().GetDescriptor()->full_name();
     if (type == req) return kRxRequest;
     if (type == bg) return kRxBg;
@@ -171,7 +197,7 @@ DynaReplica::ClassifyRx(std::string_view type)
     if (type == prepR) return kRxPrepReply;
     if (type == commit) return kRxCommit;
     if (type == ts) return kRxTsAgree;
-    if (type == fetchReq || type == fetchRep) return kRxFetch;
+    if (type == fetchReq) return kRxFetch;
     if (type == hb) return kRxHeartbeat;
     return kRxOther;
 }
@@ -183,8 +209,49 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote,
                                  void *meta_data)
 {
     const RxType kind = ClassifyRx(type);
-    const bool hot = kind != kRxHeartbeat && kind != kRxOther;
+    const bool hot = IsHot(kind);
     const uint64_t t0 = stats_on_ ? WallClockMicros() : 0;
+    // Paused (view change / joining): client-originated messages would be dropped by
+    // ProcessHot anyway; drop them here before parsing so a resend flood can't crowd
+    // out the recovery traffic. Replication batches still flow (a JOINING server
+    // applies them).
+    if (paused_.load(std::memory_order_relaxed) &&
+        (kind == kRxRequest || kind == kRxFast || kind == kRxSlow)) {
+        if (stats_on_) rx_[kind].Add();
+        return;
+    }
+    if (hot && order_thread_on_) {
+        // Parse here (receive thread), process on the ordering thread.
+        std::unique_ptr<google::protobuf::Message> parsed = ParseHot(kind, data);
+        if (parsed && kind == kRxRequest) {
+            // Build the entry here (OWD sample, txn moved out of the parsed message);
+            // the ordering thread only dedups and submits it.
+            auto *req = static_cast<proto::ClientRequest *>(parsed.get());
+            auto entry = std::make_shared<TxnEntry>(BuildRequestEntry(
+                std::shared_ptr<TransportAddress>(remote.clone()),
+                std::move(*req->mutable_txn())));
+            const bool timed = stats_on_;
+            order_q_.enqueue([this, entry, timed]() {
+                const uint64_t h0 = timed ? WallClockMicros() : 0;
+                ProcessRequestEntry(std::move(*entry));
+                if (timed) rx_us_[kRxRequest].Add(WallClockMicros() - h0);
+            });
+        } else if (parsed) {
+            std::shared_ptr<google::protobuf::Message> msg(std::move(parsed));
+            std::shared_ptr<TransportAddress> addr(remote.clone());
+            const bool timed = stats_on_;
+            order_q_.enqueue([this, kind, msg, addr, timed]() {
+                const uint64_t h0 = timed ? WallClockMicros() : 0;
+                ProcessHot(kind, *addr, *msg);
+                if (timed) rx_us_[kind].Add(WallClockMicros() - h0);
+            });
+        }
+        if (stats_on_) {
+            busy_us_.Add(WallClockMicros() - t0);
+            rx_[kind].Add();
+        }
+        return;
+    }
     if (hot) {
         std::shared_lock<RwLock> g(state_lock_);
         ReceiveMessageImpl(remote, type, data, meta_data);
@@ -197,6 +264,7 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote,
     busy_us_.Add(d);
     handler_max_us_.Observe(d);
     rx_[kind].Add();
+    rx_us_[kind].Add(d);
 }
 
 void
@@ -370,9 +438,42 @@ DynaReplica::ReceiveMessageImpl(const TransportAddress &remote,
         return;
     }
 
-    if (ClassifyRx(type) == kRxBg) {
-        proto::BgBatch m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleBgBatch(m);
+    // Hot messages: parse, then process. With the ordering thread on (DYNA_ORDER_THREAD)
+    // ReceiveMessage never gets here for hot types: it parses on the receive thread and
+    // posts ProcessHot to the ordering thread instead.
+    const RxType kind = ClassifyRx(type);
+    if (IsHot(kind)) {
+        if (auto m = ParseHot(kind, data)) ProcessHot(kind, remote, *m);
+    }
+}
+
+std::unique_ptr<google::protobuf::Message>
+DynaReplica::ParseHot(RxType kind, std::string_view data)
+{
+    std::unique_ptr<google::protobuf::Message> m;
+    switch (kind) {
+    case kRxRequest:   m = std::make_unique<proto::ClientRequest>(); break;
+    case kRxFast:      m = std::make_unique<proto::FastCommit>(); break;
+    case kRxSlow:      m = std::make_unique<proto::SlowCommit>(); break;
+    case kRxPrep:      m = std::make_unique<proto::ReplicatePrepare>(); break;
+    case kRxPrepReply: m = std::make_unique<proto::ReplicatePrepareReply>(); break;
+    case kRxCommit:    m = std::make_unique<proto::ReplicateCommit>(); break;
+    case kRxTsAgree:   m = std::make_unique<proto::TsAgree>(); break;
+    case kRxFetch:     m = std::make_unique<proto::FetchRequest>(); break;
+    case kRxFetchRep:  m = std::make_unique<proto::FetchReply>(); break;
+    case kRxBg:        m = std::make_unique<proto::BgBatch>(); break;
+    default:           return nullptr;
+    }
+    if (!m->ParseFromArray(data.data(), static_cast<int>(data.size()))) return nullptr;
+    return m;
+}
+
+void
+DynaReplica::ProcessHot(RxType kind, const TransportAddress &remote,
+                        const google::protobuf::Message &msg)
+{
+    if (kind == kRxBg) {
+        HandleBgBatch(static_cast<const proto::BgBatch &>(msg));
         return;
     }
 
@@ -381,17 +482,15 @@ DynaReplica::ReceiveMessageImpl(const TransportAddress &remote,
     // falls between the snapshot and the view change that re-adds it.
     if (vc_->phase() == ViewCoordinator::Phase::JOINING && vc_->has_view()) {
         const uint64_t jv = viewId_.load();
-        if (type == repPrepName) {
-            proto::ReplicatePrepare m;
-            if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == jv && m.has_txn()) {
+        if (kind == kRxPrep) {
+            const auto &m = static_cast<const proto::ReplicatePrepare &>(msg);
+            if (m.view_id() == jv && m.has_txn()) {
                 orderer_->HandleReplicatePrepare(TxnId{m.client_id(), m.request_id()},
                                                  m.agreed_t(), m.txn());
             }
-        } else if (type == repCommitName) {
-            proto::ReplicateCommit m;
-            if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == jv) {
-                orderer_->MarkCommitted(TxnId{m.client_id(), m.request_id()});
-            }
+        } else if (kind == kRxCommit) {
+            const auto &m = static_cast<const proto::ReplicateCommit &>(msg);
+            if (m.view_id() == jv) orderer_->MarkCommitted(TxnId{m.client_id(), m.request_id()});
         }
         return;
     }
@@ -401,9 +500,9 @@ DynaReplica::ReceiveMessageImpl(const TransportAddress &remote,
     if (!Normal()) return;
     const uint64_t view = viewId_.load();
 
-    if (type == requestName) {
-        proto::ClientRequest m;
-        if (!m.ParseFromArray(data.data(), data.size())) return;
+    switch (kind) {
+    case kRxRequest: {
+        const auto &m = static_cast<const proto::ClientRequest &>(msg);
         if (m.txn().view_id() != view) {
             if (m.txn().view_id() < view) SendViewInfo(remote);
             return;
@@ -411,9 +510,8 @@ DynaReplica::ReceiveMessageImpl(const TransportAddress &remote,
         HandleClientRequest(remote, m);
         return;
     }
-    if (type == fastName) {
-        proto::FastCommit m;
-        if (!m.ParseFromArray(data.data(), data.size())) return;
+    case kRxFast: {
+        const auto &m = static_cast<const proto::FastCommit &>(msg);
         if (m.view_id() != view) {
             // An old-view decision is not adopted: the new view re-derives the txn's t
             // (recovery + leader sync), so a stale agreedT could diverge from it.
@@ -424,9 +522,8 @@ DynaReplica::ReceiveMessageImpl(const TransportAddress &remote,
                      /*slow=*/false);
         return;
     }
-    if (type == slowName) {
-        proto::SlowCommit m;
-        if (!m.ParseFromArray(data.data(), data.size())) return;
+    case kRxSlow: {
+        const auto &m = static_cast<const proto::SlowCommit &>(msg);
         if (m.view_id() != view) {
             if (m.view_id() < view) SendViewInfo(remote);
             return;
@@ -435,37 +532,116 @@ DynaReplica::ReceiveMessageImpl(const TransportAddress &remote,
                      /*slow=*/true);
         return;
     }
-    if (type == fetchReqName) {
-        proto::FetchRequest m;
-        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) {
-            HandleFetchRequest(remote, m);
+    case kRxFetch: {
+        const auto &m = static_cast<const proto::FetchRequest &>(msg);
+        if (m.view_id() == view) HandleFetchRequest(remote, m);
+        return;
+    }
+    case kRxFetchRep:
+        HandleFetchReply(static_cast<const proto::FetchReply &>(msg));
+        return;
+    case kRxTsAgree: {
+        const auto &m = static_cast<const proto::TsAgree &>(msg);
+        if (m.view_id() == view) HandleTsAgree(m);
+        return;
+    }
+    case kRxPrep: {
+        const auto &m = static_cast<const proto::ReplicatePrepare &>(msg);
+        if (m.view_id() == view) HandleReplicatePrepare(&remote, m);
+        return;
+    }
+    case kRxPrepReply: {
+        const auto &m = static_cast<const proto::ReplicatePrepareReply &>(msg);
+        if (m.view_id() == view) HandleReplicatePrepareReply(m);
+        return;
+    }
+    case kRxCommit: {
+        const auto &m = static_cast<const proto::ReplicateCommit &>(msg);
+        if (m.view_id() == view) HandleReplicateCommit(m);
+        return;
+    }
+    default:
+        return;
+    }
+}
+
+// --- ordering thread (DYNA_ORDER_THREAD) ---------------------------------------------
+
+void
+DynaReplica::SendLoop()
+{
+    pthread_setname_np(pthread_self(), "dyna-send");
+    PinSelfFromEnv("DYNA_PIN_SEND");
+    constexpr size_t kBulk = 64;
+    std::function<void()> batch[kBulk];
+    ReplyJob jobs[kBulk];
+    proto::SpecReply r;
+    r.set_server_id(static_cast<uint32_t>(replicaIdx));
+    while (send_running_.load(std::memory_order_relaxed)) {
+        const size_t nr = reply_q_.try_dequeue_bulk(jobs, kBulk);
+        for (size_t i = 0; i < nr; ++i) {
+            ReplyJob &j = jobs[i];
+            r.set_client_id(j.client_id);
+            r.set_request_id(j.request_id);
+            r.set_view_id(j.view_id);
+            r.set_t(j.t);
+            r.set_is_leader(j.is_leader);
+            r.set_owd_estimate(j.owd);
+            transport->SendMessage(this, *j.addr, r);
+            j.addr.reset();
         }
-        return;
+        const size_t n = send_q_.try_dequeue_bulk(batch, kBulk);
+        for (size_t i = 0; i < n; ++i) {
+            batch[i]();
+            batch[i] = nullptr;
+        }
+        if (n == 0 && nr == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+#endif
+        }
     }
-    if (type == fetchRepName) {
-        proto::FetchReply m;
-        if (m.ParseFromArray(data.data(), data.size())) HandleFetchReply(m);
-        return;
-    }
-    if (type == tsAgreeName) {
-        proto::TsAgree m;
-        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleTsAgree(m);
-        return;
-    }
-    if (type == repPrepName) {
-        proto::ReplicatePrepare m;
-        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleReplicatePrepare(&remote, m);
-        return;
-    }
-    if (type == repPrepReplyName) {
-        proto::ReplicatePrepareReply m;
-        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleReplicatePrepareReply(m);
-        return;
-    }
-    if (type == repCommitName) {
-        proto::ReplicateCommit m;
-        if (m.ParseFromArray(data.data(), data.size()) && m.view_id() == view) HandleReplicateCommit(m);
-        return;
+}
+
+void
+DynaReplica::OrderingLoop()
+{
+    pthread_setname_np(pthread_self(), "dyna-order");
+    PinSelfFromEnv("DYNA_PIN_ORDER");
+    constexpr size_t kBulk = 64;
+    std::function<void()> batch[kBulk];
+    uint64_t last_release_us = 0;
+    while (order_running_.load(std::memory_order_relaxed)) {
+        const size_t n = order_q_.try_dequeue_bulk(batch, kBulk);
+        const uint64_t t0 = (stats_on_ && n) ? WallClockMicros() : 0;
+        if (n > 0) {
+            // Same exclusion as the receive threads' hot path: VR / recovery work takes
+            // state_lock_ exclusively, so it never interleaves with a hot handler.
+            std::shared_lock<RwLock> g(state_lock_);
+            for (size_t i = 0; i < n; ++i) {
+                batch[i]();
+                batch[i] = nullptr;
+            }
+        }
+        // Releases run here too (the orderer has no release thread in this mode). The
+        // hint makes an idle iteration lock-free; the 100 µs backstop covers deadlines
+        // that entered without SubmitTxn (none today) and resumes after a pause.
+        const uint64_t now = WallClockMicros();
+        if (!orderer_->paused() &&
+            (now >= orderer_->next_due_hint() || now >= last_release_us + 100)) {
+            last_release_us = now;
+            const size_t released = orderer_->ReleaseDue();
+            if (stats_on_ && released) order_busy_us_.Add(WallClockMicros() - now);
+        }
+        if (stats_on_) {
+            if (n) order_busy_us_.Add(WallClockMicros() - t0);
+            order_qmax_.Observe(order_q_.size_approx());
+        }
+        if (n == 0) {
+#if defined(__x86_64__) || defined(__i386__)
+            _mm_pause();
+#endif
+        }
     }
 }
 
@@ -643,9 +819,14 @@ DynaReplica::BgTsAgree(uint32_t to, const proto::TsAgree &m)
 void
 DynaReplica::FlushBgTo(uint32_t to)
 {
-    proto::BgBatch b;
+    auto b = std::make_shared<proto::BgBatch>();
     size_t entries = 0;
-    if (bg_ && bg_->Take(to, &b, &entries)) SendBgBatch(to, b, entries);
+    if (!bg_ || !bg_->Take(to, b.get(), &entries)) return;
+    if (send_running_.load(std::memory_order_relaxed)) {
+        send_q_.enqueue([this, to, b, entries]() { SendBgBatch(to, *b, entries); });
+    } else {
+        SendBgBatch(to, *b, entries);
+    }
 }
 
 void
@@ -727,18 +908,70 @@ void
 DynaReplica::HandleClientRequest(const TransportAddress &remote,
                                       const proto::ClientRequest &m)
 {
-    const proto::Txn &txn = m.txn();
-    const TxnId id{txn.client_id(), txn.request_id()};
+    SubmitRequestEntry(BuildRequestEntry(std::shared_ptr<TransportAddress>(remote.clone()),
+                                         proto::Txn(m.txn())));
+}
 
+TxnEntry
+DynaReplica::BuildRequestEntry(std::shared_ptr<TransportAddress> addr, proto::Txn &&txn)
+{
+    TxnEntry e;
+    e.txn = std::move(txn);
+    e.t = e.txn.t();
+    e.client_addr = std::move(addr);
+    return e;
+}
+
+void
+DynaReplica::ProcessRequestEntry(TxnEntry &&e)
+{
+    // Same gating as ProcessHot's kRxRequest case (a JOINING server ignores requests).
+    if (vc_->phase() == ViewCoordinator::Phase::JOINING && vc_->has_view()) return;
+    if (!Normal()) return;
+    const uint64_t view = viewId_.load();
+    if (e.txn.view_id() != view) {
+        if (e.txn.view_id() < view && e.client_addr) SendViewInfo(*e.client_addr);
+        return;
+    }
+    SubmitRequestEntry(std::move(e));
+}
+
+void
+DynaReplica::SubmitRequestEntry(TxnEntry &&e)
+{
+    const TxnId id = e.Key();
+    // OWD sample (§2): one-way delay = arrival − send_time (client stamp), taken HERE —
+    // where the orderer judges lateness — so the learned bound includes any queueing on
+    // the way to the ordering thread. (Sampling on the receive thread instead left ~36%
+    // of arrivals late at 35k ops/s.)
+    const uint64_t arrival = WallClockMicros();
+    if (e.txn.has_send_time()) {
+        std::lock_guard<HybridMutex> lk(owd_mu_);
+        if (arrival > e.txn.send_time()) {
+            owd_.sample(e.txn.client_id(), arrival - e.txn.send_time());
+        }
+        e.owd_estimate_us = owd_.estimate_us(e.txn.client_id());
+    }
+    e.arrival_us = arrival;
+    if (debug_) {
+        Notice("r%d RECV req c=%lu r=%lu t=%lu now=%lu wset=%d", replicaIdx,
+               (unsigned long)id.clientid, (unsigned long)id.clientreqid,
+               (unsigned long)e.t, (unsigned long)arrival, e.txn.w_set_size());
+    }
     // At-most-once for WRITEs (spec §1.4/§5): answer a retry from cache; drop one still
     // in flight so the orderer never holds two entries for the same txnId. READs skip
     // this: a read retry is a new attempt (fresh request_id, larger t), and a cached
     // reply would carry the old attempt's t.
-    if (txn.type() != proto::READ) {
+    if (e.txn.type() != proto::READ) {
         std::lock_guard<HybridMutex> lk(dedup_mu_);
         auto cit = reply_cache_.find(id);
         if (cit != reply_cache_.end()) {
-            proto::SpecReply cached = cit->second;
+            proto::SpecReply cached;
+            cached.set_client_id(id.clientid);
+            cached.set_request_id(id.clientreqid);
+            cached.set_server_id(static_cast<uint32_t>(replicaIdx));
+            cached.set_t(cit->second.t);
+            cached.set_owd_estimate(cit->second.owd);
             // Answer with the txn's CURRENT state: after a commit or a view change its t
             // and our leadership may differ from the cached release.
             uint64_t live_t = 0;
@@ -747,40 +980,20 @@ DynaReplica::HandleClientRequest(const TransportAddress &remote,
             // Leadership in the CURRENT view (the cached / executed flag may predate a
             // view change).
             bool leads = false;
-            for (const auto &kv : txn.w_set()) {
+            for (const auto &kv : e.txn.w_set()) {
                 if (topo_.ownerOf(kv.key()) == static_cast<uint32_t>(replicaIdx)) leads = true;
             }
             cached.set_is_leader(leads);
             cached.set_view_id(viewId_);
             // (unlock happens at scope exit; send after is fine — retry window is ms)
-            Tx()->SendMessage(this, remote, cached);
+            if (e.client_addr) Tx()->SendMessage(this, *e.client_addr, cached);
             return;
         }
         if (inflight_.find(id) != inflight_.end()) return;   // in flight -> drop retry
         inflight_.insert(id);
     }
-
-    // OWD sample (§2): one-way delay = arrival − send_time (client stamp).
-    const uint64_t arrival = WallClockMicros();
-    uint64_t owd_est = 0;
-    if (txn.has_send_time()) {
-        std::lock_guard<HybridMutex> lk(owd_mu_);
-        if (arrival > txn.send_time()) owd_.sample(txn.client_id(), arrival - txn.send_time());
-        owd_est = owd_.estimate_us(txn.client_id());
-    }
-
-    TxnEntry e;
-    e.txn = txn;
-    e.t = txn.t();
-    e.owd_estimate_us = owd_est;
-    e.arrival_us = arrival;
-    e.client_addr = std::shared_ptr<TransportAddress>(remote.clone());
-    if (debug_) {
-        Notice("r%d RECV req c=%lu r=%lu t=%lu now=%lu wset=%d", replicaIdx,
-               (unsigned long)id.clientid, (unsigned long)id.clientreqid,
-               (unsigned long)txn.t(), (unsigned long)arrival, txn.w_set_size());
-    }
-    orderer_->SubmitTxn(std::move(e));
+    // Poke the orderer's release thread only if it has one (the ordering thread polls).
+    orderer_->SubmitTxn(std::move(e), /*poke=*/!order_thread_on_);
 }
 
 proto::SpecReply
@@ -806,18 +1019,33 @@ DynaReplica::BuildSpecReply(const TxnEntry &e) const
 void
 DynaReplica::OnSpecReply(const TxnEntry &e)
 {
-    proto::SpecReply reply = BuildSpecReply(e);
     if (debug_) {
         Notice("r%d SEND SpecReply c=%lu r=%lu t=%lu leader=%d addr=%d", replicaIdx,
                (unsigned long)e.txn.client_id(), (unsigned long)e.txn.request_id(),
                (unsigned long)e.t, e.is_leader_for_this ? 1 : 0, e.client_addr ? 1 : 0);
     }
-    if (e.client_addr) Tx()->SendMessage(this, *e.client_addr, reply);
+    const bool is_read = (e.txn.type() == proto::READ);
+    if (e.client_addr) {
+        if (!is_read && send_running_.load(std::memory_order_relaxed)) {
+            // Writes carry no results: hand the sender a plain struct to build + send.
+            ReplyJob j;
+            j.addr = e.client_addr;
+            j.client_id = e.txn.client_id();
+            j.request_id = e.txn.request_id();
+            j.view_id = viewId_;
+            j.t = e.t;
+            j.owd = e.owd_estimate_us;
+            j.is_leader = e.is_leader_for_this;
+            reply_q_.enqueue(std::move(j));
+        } else {
+            Tx()->SendMessage(this, *e.client_addr, BuildSpecReply(e));
+        }
+    }
     if (stats_on_) spec_tx_.Add();
-    if (e.txn.type() == proto::READ) return;   // reads aren't deduped (see HandleClientRequest)
+    if (is_read) return;   // reads aren't deduped (see SubmitRequestEntry)
     // Cache for at-most-once AFTER the send (off the release critical path).
     std::lock_guard<HybridMutex> lk(dedup_mu_);
-    reply_cache_[e.Key()] = std::move(reply);
+    reply_cache_[e.Key()] = CachedSpec{e.t, e.owd_estimate_us};
     inflight_.erase(e.Key());
 }
 
@@ -829,7 +1057,7 @@ DynaReplica::ReplicateNowIfPrimary(const TxnId &id)
 }
 
 void
-DynaReplica::FinishCommit(const TxnId &id, const TxnEntry &out,
+DynaReplica::FinishCommit(const TxnId &id, const ServerOrderer::CommitBrief &out,
                           ServerOrderer::CommitResult r, bool slow,
                           const TransportAddress *client)
 {
@@ -839,7 +1067,7 @@ DynaReplica::FinishCommit(const TxnId &id, const TxnEntry &out,
     }
     // SlowCommit: the client is re-checking the quorum at agreedT (or, if we already
     // executed the txn, at its final t).
-    if (slow && client) SendCommitReply(*client, out);
+    if (slow && client) SendCommitReply(*client, id, out);
     if (r == ServerOrderer::CommitResult::kApplied) ReplicateNowIfPrimary(id);
 }
 
@@ -847,8 +1075,8 @@ void
 DynaReplica::HandleCommit(const TransportAddress &remote, const TxnId &id,
                                uint64_t agreedT, bool slow)
 {
-    TxnEntry out;
-    ServerOrderer::CommitResult r = orderer_->ApplyCommit(id, agreedT, &out);
+    ServerOrderer::CommitBrief out;
+    ServerOrderer::CommitResult r = orderer_->ApplyCommitBrief(id, agreedT, &out);
     if (r != ServerOrderer::CommitResult::kNeedFetch) {
         FinishCommit(id, out, r, slow, &remote);
         return;
@@ -903,23 +1131,24 @@ DynaReplica::HandleFetchReply(const proto::FetchReply &m)
     }
     if (!have) return;
 
-    TxnEntry out;
-    ServerOrderer::CommitResult r = orderer_->ApplyCommit(id, pc.agreedT, &out);
+    ServerOrderer::CommitBrief out;
+    ServerOrderer::CommitResult r = orderer_->ApplyCommitBrief(id, pc.agreedT, &out);
     if (r != ServerOrderer::CommitResult::kNeedFetch) {
         FinishCommit(id, out, r, pc.slow, pc.client_addr.get());
     }
 }
 
 void
-DynaReplica::SendCommitReply(const TransportAddress &client, const TxnEntry &e)
+DynaReplica::SendCommitReply(const TransportAddress &client, const TxnId &id,
+                             const ServerOrderer::CommitBrief &c)
 {
     proto::CommitReply r;
-    r.set_client_id(e.txn.client_id());
-    r.set_request_id(e.txn.request_id());
+    r.set_client_id(id.clientid);
+    r.set_request_id(id.clientreqid);
     r.set_view_id(viewId_);
     r.set_server_id(static_cast<uint32_t>(replicaIdx));
-    r.set_t(e.t);
-    r.set_is_leader(e.is_leader_for_this);
+    r.set_t(c.t);
+    r.set_is_leader(c.is_leader);
     Tx()->SendMessage(this, client, r);
 }
 
@@ -945,8 +1174,21 @@ DynaReplica::MaybeDumpStats(uint64_t now_us)
     const uint64_t elapsed = now_us - last_stats_us_;
     if (elapsed < 1000000) return;
     last_stats_us_ = now_us;
-    uint64_t rx[kRxN];
-    for (int i = 0; i < kRxN; ++i) rx[i] = rx_[i].Take();
+    uint64_t rx[kRxN], rxus[kRxN];
+    for (int i = 0; i < kRxN; ++i) {
+        rx[i] = rx_[i].Take();
+        rxus[i] = rx_us_[i].Take();
+    }
+    // Average handler µs per message (x10 for one decimal) for the hot types.
+    auto per = [&](int k) { return (unsigned long)(rx[k] ? rxus[k] * 10 / rx[k] : 0); };
+    Notice("r%d cost: handlerUs/msg x10 [req=%lu fast=%lu slow=%lu bg=%lu fetch=%lu] "
+           "orderBusy=%lu%% orderQmax=%lu "
+           "muHoldUs [submit=%s commit=%s repl=%s release=%s]",
+           replicaIdx, per(kRxRequest), per(kRxFast), per(kRxSlow), per(kRxBg),
+           per(kRxFetch), (unsigned long)(order_busy_us_.Take() * 100 / elapsed),
+           (unsigned long)order_qmax_.Take(), FmtDist(ostats_.hold_submit_us).c_str(),
+           FmtDist(ostats_.hold_commit_us).c_str(), FmtDist(ostats_.hold_repl_us).c_str(),
+           FmtDist(ostats_.hold_release_us).c_str());
     const uint64_t busy = busy_us_.Take();
     // Format: avg/max/nCOUNT for distributions (µs unless noted); counts are per interval.
     // busy% sums all receive threads (can exceed 100 with DYNA_RX_THREADS > 1).
@@ -961,7 +1203,7 @@ DynaReplica::MaybeDumpStats(uint64_t now_us)
            (unsigned long)handler_max_us_.Take(), (unsigned long)rx[kRxRequest],
            (unsigned long)rx[kRxFast], (unsigned long)rx[kRxSlow], (unsigned long)rx[kRxPrep],
            (unsigned long)rx[kRxPrepReply], (unsigned long)rx[kRxCommit],
-           (unsigned long)rx[kRxTsAgree], (unsigned long)rx[kRxFetch],
+           (unsigned long)rx[kRxTsAgree], (unsigned long)(rx[kRxFetch] + rx[kRxFetchRep]),
            (unsigned long)rx[kRxHeartbeat],
            (unsigned long)rx[kRxOther], (unsigned long)spec_tx_.Take(),
            (unsigned long)ostats_.on_time.Take(), (unsigned long)ostats_.late_leader.Take(),
