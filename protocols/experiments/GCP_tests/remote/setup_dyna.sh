@@ -82,15 +82,24 @@ if [[ "${DYNA_PIN:-1}" != "0" ]] && command -v lscpu >/dev/null; then
   IFACE=$(ip -4 -o addr show | awk '$4 ~ /^10[.]10[.]/ {print $2; exit}')
   NODE=$(cat "/sys/class/net/${IFACE}/device/numa_node" 2>/dev/null || echo 0)
   [[ "${NODE}" -lt 0 ]] && NODE=0
-  mapfile -t CORES < <(lscpu -p=CPU,CORE,NODE | grep -v '^#' \
+  # One logical CPU per physical core on the node (skipping the first core), then — if
+  # the busy threads outnumber the cores — the remaining hyperthread siblings.
+  mapfile -t PHYS < <(lscpu -p=CPU,CORE,NODE | grep -v '^#' \
                          | awk -F, -v n="${NODE}" '$3==n && !seen[$2]++ {print $1}' | tail -n +2)
+  mapfile -t SIBS < <(lscpu -p=CPU,CORE,NODE | grep -v '^#' \
+                         | awk -F, -v n="${NODE}" '$3==n && seen[$2]++ {print $1}')
+  CORES=("${PHYS[@]}" "${SIBS[@]}")
   RX="${DYNA_RX_THREADS:-1}"
-  if (( ${#CORES[@]} >= RX + 3 )); then
-    RXLIST=$(IFS=,; echo "${CORES[*]:0:RX}")
-    export DYNA_PIN_RX="${DYNA_PIN_RX:-${RXLIST}}"
-    export DYNA_PIN_ORDER="${DYNA_PIN_ORDER:-${CORES[RX]}}"
-    export DYNA_PIN_SEND="${DYNA_PIN_SEND:-${CORES[RX+1]}}"
-    export DYNA_PIN_EXEC="${DYNA_PIN_EXEC:-${CORES[RX+2]}}"
+  LANES="${DYNA_LANES:-1}"
+  SENDERS="${DYNA_SEND_THREADS:-1}"
+  NEED=$(( RX + LANES + SENDERS + 1 ))
+  if (( ${#CORES[@]} >= NEED )); then
+    (( NEED > ${#PHYS[@]} )) && echo "pin: ${NEED} busy threads > ${#PHYS[@]} free physical cores; using hyperthread siblings" >&2
+    list() { local IFS=,; echo "${CORES[*]:$1:$2}"; }
+    export DYNA_PIN_RX="${DYNA_PIN_RX:-$(list 0 "${RX}")}"
+    export DYNA_PIN_ORDER="${DYNA_PIN_ORDER:-$(list "${RX}" "${LANES}")}"
+    (( SENDERS > 0 )) && export DYNA_PIN_SEND="${DYNA_PIN_SEND:-$(list $(( RX + LANES )) "${SENDERS}")}"
+    export DYNA_PIN_EXEC="${DYNA_PIN_EXEC:-${CORES[RX+LANES+SENDERS]}}"
   fi
 fi
 RUN_DIR="${HOME}/Ionia/protocols/src/ionia"

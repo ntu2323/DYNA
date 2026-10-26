@@ -10,6 +10,7 @@
 #define _DYNA_STATS_H_
 
 #include <atomic>
+#include <string>
 #include <cstdint>
 #include <cstdlib>
 
@@ -44,6 +45,36 @@ struct StatDist {
     void Observe(uint64_t x) { sum.Add(x); n.Add(); max.Observe(x); }
 };
 
+// Latency histogram (µs) for percentiles: 25 µs buckets up to 3.2 ms, then overflow.
+struct StatHist {
+    static constexpr uint64_t kBucketUs = 25;
+    static constexpr size_t   kBuckets = 128;
+    std::atomic<uint64_t> b[kBuckets + 1] = {};
+    void Observe(uint64_t us) {
+        const size_t i = static_cast<size_t>(us / kBucketUs);
+        b[i < kBuckets ? i : kBuckets].fetch_add(1, std::memory_order_relaxed);
+    }
+    // "p50/p95/p99" (bucket upper bounds, µs; ">3200" past the last bucket), resets.
+    std::string Take() {
+        uint64_t c[kBuckets + 1], n = 0;
+        for (size_t i = 0; i <= kBuckets; ++i) n += (c[i] = b[i].exchange(0, std::memory_order_relaxed));
+        if (n == 0) return "-";
+        auto pct = [&](double q) -> std::string {
+            const uint64_t want = static_cast<uint64_t>(q * n);
+            uint64_t acc = 0;
+            for (size_t i = 0; i <= kBuckets; ++i) {
+                acc += c[i];
+                if (acc > want) {
+                    return i == kBuckets ? std::string(">3200")
+                                         : std::to_string((i + 1) * kBucketUs);
+                }
+            }
+            return std::string(">3200");
+        };
+        return pct(0.50) + "/" + pct(0.95) + "/" + pct(0.99);
+    }
+};
+
 // Orderer-side counters (filled by ServerOrderer when a stats sink is attached).
 struct OrdererStats {
     StatCounter on_time;          // arrivals before their deadline -> earlyBuffer
@@ -55,6 +86,9 @@ struct OrdererStats {
     StatDist    release_lag_us;   // release time - deadline (release-loop timeliness)
     StatDist    exec_locked_us;   // ExecuteReady: time holding the ordering lock
     StatDist    exec_batch;       // ExecuteReady: txns executed per pass
+    StatDist    exec_pass_us;       // executor pass wall time (snapshot..apply), µs
+    StatDist    exec_apply_us;      // of which: applying writes / serving reads, µs
+    StatDist    exec_sort_us;       // of which: sort + conflict scan (unlocked), µs
     StatDist    scan_locked_us;   // background scans (ts-agree / replicate / re-ack)
     StatDist    submit_wait_us;   // SubmitTxn: time waiting to acquire the ordering lock
     StatDist    mu_wait_us;       // every contended ordering-lock acquisition (any thread)

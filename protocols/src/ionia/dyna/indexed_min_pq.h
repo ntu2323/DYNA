@@ -112,6 +112,18 @@ public:
         return true;
     }
 
+    // Remove `id` and hand over ownership of its value (null if absent): the caller can
+    // keep using / free it outside any lock guarding the heap.
+    std::unique_ptr<Value> erase_ptr(const Id &id) {
+        auto it = pos_.find(id);
+        if (it == pos_.end()) return nullptr;
+        const size_t i = it->second;
+        std::unique_ptr<Value> out = std::move(heap_[i].second);
+        remove_at(i);   // compares only the remaining (non-null) elements
+        pos_.erase(id);
+        return out;
+    }
+
     // Read-only iteration over all (id, value) pairs, in heap (not sorted) order.
     // The callback must NOT mutate the heap; collect ids first, then mutate.
     template <class F>

@@ -10,7 +10,7 @@
 # its working directory when present.
 #
 # Idempotent. If /mydata is already a mountpoint it is reused (whatever its fs, as long
-# as it is not ext3). Otherwise it formats the FIRST disk that is completely blank: no
+# as it is not ext3). Otherwise it formats the first (SSDs before HDDs) disk that is completely blank: no
 # partitions, no filesystem signature, not mounted. It never touches a disk that has
 # anything on it, and exits non-zero if no blank disk exists. The mount is not added to
 # fstab (CloudLab experiments are ephemeral): re-run after a reboot.
@@ -26,7 +26,8 @@ if mountpoint -q "$MNT"; then
     echo "$MNT already mounted ($fstype)"
 else
     disk=""
-    for d in $(lsblk -d -n -o NAME,TYPE | awk '$2=="disk"{print $1}'); do
+    # Non-rotational (SSD) disks first: c220g2 nodes have a blank HDD and a blank SSD.
+    for d in $(lsblk -d -n -o NAME,TYPE,ROTA | awk '$2=="disk"{print $3, $1}' | sort -n -k1,1 -s | awk '{print $2}'); do
         dev="/dev/$d"
         [[ $(lsblk -n -o NAME "$dev" | wc -l) -eq 1 ]] || continue        # has partitions
         [[ -z "$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)" ]] || continue

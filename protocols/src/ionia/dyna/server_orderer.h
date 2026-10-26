@@ -4,7 +4,14 @@
 //   The per-server ordering engine. DYNA has ONE ServerOrderer per server (not one
 //   per partition): a transaction has a single OrderKey and lives in exactly one of
 //   earlyBuffer / lateBuffer / specLog even when it spans partitions (spec §1.3-1.4).
-//   One lock, one release loop.
+//
+//   Lanes: the per-transaction state (earlyBuffer, lateBuffer, specLog, executed_) is
+//   sharded by TxnId into K lanes (LaneOf), each with its own lock, so K replica threads
+//   can order disjoint transactions in parallel. Every protocol step of one transaction
+//   touches only its lane. Cross-lane: the executor pass locks every lane (per-key
+//   OrderKey execution order spans transactions), the late-leader re-timestamp floor is
+//   a global atomic max, and view install / reset lock every lane. K = 1 is the
+//   original single-lock orderer.
 //
 //   Owns earlyBuffer admission + the condition-variable release loop, the late paths
 //   (leader re-timestamp, follower lateBuffer), commit adoption, background timestamp
@@ -23,10 +30,12 @@
 #include "dyna/txn_types.h"
 #include "dyna/wall_clock.h"
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -43,10 +52,23 @@ public:
     // for a leader READ once the executor has disk-read its values (entry.results set).
     using OnSpecReply = std::function<void(const TxnEntry &)>;
 
+    // lanes = 0: take DYNA_LANES from the environment (default 1), so the unit tests
+    // can run whole suites sharded.
     ServerOrderer(uint32_t server_id, uint64_t view_id, Clock *clock,
                   Topology topo, OnSpecReply on_spec_reply,
-                  StorageBackend *backend = nullptr);
+                  StorageBackend *backend = nullptr, size_t lanes = 0);
     ~ServerOrderer();
+
+    size_t lanes() const { return shards_.size(); }
+    // The lane owning a transaction (stable for its lifetime; every message about it
+    // carries its TxnId, so the replica routes all of them to the same lane).
+    size_t LaneOf(const TxnId &id) const {
+        if (shards_.size() == 1) return 0;
+        // Re-mixed so lanes don't correlate with the hash maps' bucket / fingerprint bits.
+        uint64_t g = TxnIdHash()(id) * 0xD6E8FEB86659FD93ULL;
+        g ^= g >> 32;
+        return static_cast<size_t>(((g & 0xFFFFFFFFULL) * shards_.size()) >> 32);
+    }
 
     // Classify a freshly-arrived client transaction (design doc § arrival).
     // On-time (clock() <= t) => earlyBuffer. Late => if this server leads a key in the
@@ -57,13 +79,22 @@ public:
     void SubmitTxn(TxnEntry entry, bool poke = true);
 
     // Synchronous drain of all due earlyBuffer entries (testable with MockClock).
-    // Fires OnSpecReply outside the lock. Returns the number released.
+    // Fires OnSpecReply outside the lock. Returns the number released. ReleaseDue()
+    // drains every lane; ReleaseDue(lane) only that lane (its owning thread).
     size_t ReleaseDue();
+    size_t ReleaseDue(size_t lane);
     // Earliest earlyBuffer deadline as of the last change (Clock::kNever if none). A
     // lock-free hint for an external release driver: it may be EARLY (an entry left the
     // buffer) but never late for entries submitted through SubmitTxn; drivers should
     // still call ReleaseDue() periodically as a backstop (e.g. after recovery installs).
-    uint64_t next_due_hint() const { return next_due_.load(std::memory_order_acquire); }
+    uint64_t next_due_hint(size_t lane) const {
+        return shards_[lane]->next_due.load(std::memory_order_acquire);
+    }
+    uint64_t next_due_hint() const {
+        uint64_t m = Clock::kNever;
+        for (const auto &sh : shards_) m = std::min(m, sh->next_due.load(std::memory_order_acquire));
+        return m;
+    }
     bool     paused() const { return paused_.load(); }
 
     // --- commit-message handling (protocol-decided deadlines; NOT vetoed) ---
@@ -192,7 +223,7 @@ public:
     void SetExecMinInterval(uint64_t us) { exec_min_interval_us_ = us; }   // before Start()
     void SetStats(OrdererStats *s) {
         stats_ = s;
-        mu_.SetWaitStats(s ? &s->mu_wait_us : nullptr);
+        for (auto &sh : shards_) sh->mu.SetWaitStats(s ? &s->mu_wait_us : nullptr);
     }
 
     // --- views + recovery (design doc § Recovery) ---
@@ -219,6 +250,7 @@ public:
         size_t txns_installed = 0;
         size_t kvs_applied = 0;
         size_t leftovers = 0;
+        size_t spec_to_sync = 0;   // SPECULATIVE writes we lead, marked for leader sync
     };
     InstallStats InstallView(const Topology &topo, uint64_t view_id,
                              const std::vector<RecoveryData> &ms,
@@ -267,58 +299,87 @@ public:
     std::string DebugOldestEntry();
 
 private:
+    // Written-once-per-executed-write record (see executed_).
+    struct ExecutedInfo { uint64_t t = 0; bool is_leader = false; };
+
+    // One lane's per-transaction state, guarded by its own lock.
+    struct Shard {
+        HybridMutex mu;   // this lane's ordering lock (spin-then-block; hybrid_mutex.h)
+        IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> early_buffer;
+        TxnMap<TxnEntry>                                       late_buffer;   // late follower arrivals
+        IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> spec_log;
+        OrderKey highest_released{};   // max OrderKey ever appended to this lane's specLog
+        // Writes this server executed and GC'd from specLog: id -> (final t, led by us).
+        // Guards against re-inserting (and re-applying) a txn after GC via a late commit,
+        // prepare, fetch, or client retry. GC deferred (grows with history).
+        TxnMap<ExecutedInfo> executed;
+        std::atomic<uint64_t> next_due{Clock::kNever};   // see next_due_hint()
+    };
+    Shard &ShardOf(const TxnId &id) { return *shards_[LaneOf(id)]; }
+    // Lock every lane at once (executor pass, view install, reset, snapshots): announces
+    // priority on every lane first, then takes them in index order, so lane threads hold
+    // off instead of starving the multi-lock (see hybrid_mutex.h).
+    class AllLanesLock {
+    public:
+        explicit AllLanesLock(std::vector<std::unique_ptr<Shard>> &shards) : shards_(shards) {
+            for (auto &sh : shards_) sh->mu.Announce();
+            for (auto &sh : shards_) sh->mu.LockAnnounced();
+        }
+        ~AllLanesLock() { for (auto &sh : shards_) sh->mu.UnlockPriority(); }
+        AllLanesLock(const AllLanesLock &) = delete;
+        AllLanesLock &operator=(const AllLanesLock &) = delete;
+    private:
+        std::vector<std::unique_ptr<Shard>> &shards_;
+    };
+
     void ReleaseLoop();
     void ExecutorLoop();
-    // Requires mu_ held. Moves due entries out of earlyBuffer into specLog and `out`;
+    // Requires s.mu held. Moves due entries out of earlyBuffer into specLog and `out`;
     // bumps highestReleasedT. Sets *kick if a leader READ entered specLog. Returns count.
-    size_t DrainDueLocked(std::vector<TxnEntry> &out, bool *kick);
-    // Requires mu_ held. Earliest earlyBuffer deadline, or Clock::kNever if empty.
-    uint64_t NextDeadlineLocked();
-    // Fill entry.is_leader_for_this / entry.led_keys from the topology.
+    size_t DrainDueLocked(Shard &s, std::vector<TxnEntry> &out, bool *kick);
+    // Requires s.mu held. Earliest earlyBuffer deadline, or Clock::kNever if empty.
+    uint64_t NextDeadlineLocked(Shard &s);
+    // Requires s.mu: highestReleasedT := max(.., ok) for the lane and the global floor.
+    void BumpHighestLocked(Shard &s, const OrderKey &ok);
+    // Fill entry.is_leader_for_this / led_keys / primary from the topology.
     void ComputeLeadership(TxnEntry &e) const;
-    // Requires mu_. Transitions a SPECULATIVE specLog entry to COMMITTING at the max
+    // Requires s.mu. Transitions a SPECULATIVE specLog entry to COMMITTING at the max
     // proposal once every involved leader has proposed. Outputs a copy on transition.
-    bool TryCompleteTsLocked(const TxnId &id, TxnEntry *committed_out);
-    // Requires mu_. True iff this server is the min-id involved leader for the txn.
-    bool IsPrimaryLeaderLocked(const proto::Txn &txn) const;
-    // Requires mu_. Move/materialize the txn into specLog at agreedT as COMMITTING.
+    bool TryCompleteTsLocked(Shard &s, const TxnId &id, TxnEntry *committed_out);
+    // (A txn's primary — the min-id involved leader — is TxnEntry::primary, set here.)
+    // Requires s.mu. Move/materialize the txn into specLog at agreedT as COMMITTING.
     // ApplyCommit body; `emit(const TxnEntry &)` reports the resulting entry (called
-    // under mu_, before any re-heapify invalidates it).
+    // under s.mu, before any re-heapify invalidates it).
     template <class Emit>
-    CommitResult ApplyCommitLocked(const TxnId &id, uint64_t agreedT, Emit &&emit);
-    void InstallCommittingLocked(const TxnId &id, uint64_t agreedT, const proto::Txn &body);
-    // Requires mu_. Adopt one M txn (status precedence, never downgrade). Returns true if
-    // it changed local state; sets *kick if it became COMMITTED here.
-    bool InstallRecoveredLocked(const RecoveredTxn &r, uint64_t now, bool *kick);
+    CommitResult ApplyCommitLocked(Shard &s, const TxnId &id, uint64_t agreedT, Emit &&emit);
+    void InstallCommittingLocked(Shard &s, const TxnId &id, uint64_t agreedT,
+                                 const proto::Txn &body);
+    // Requires the txn's lane lock. Adopt one M txn (status precedence, never
+    // downgrade). Returns true if it changed local state; sets *kick if it became
+    // COMMITTED here.
+    bool InstallRecoveredLocked(Shard &s, const RecoveredTxn &r, uint64_t now, bool *kick);
     // Requires exec_run_mu_ (store thread). Apply key-values iff newer than the store's
     // (t-guard) and remember their t in recovered_t_. Returns the number applied.
     size_t ApplyKVsGuardedLocked(const std::vector<RecoveredKV> &kvs);
 
     uint32_t        server_id_;
-    uint64_t        view_id_;
+    uint64_t        view_id_;    // written with every lane locked; read under any lane lock
     uint32_t        quorum_f_;   // f = (n-1)/2; prepare-replies needed for COMMITTED
     Clock          *clock_;
     OrdererStats   *stats_ = nullptr;   // optional (DYNA_STATS)
-    Topology        topo_;
+    Topology        topo_;       // written with every lane locked; read under any lane lock
     OnSpecReply     on_spec_reply_;
     StorageBackend *backend_;    // KV store for executed writes (nullptr in unit tests)
 
-    HybridMutex mu_;   // the ordering lock (spin-then-block; see hybrid_mutex.h)
-    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> early_buffer_;
-    TxnMap<TxnEntry>                             late_buffer_;   // late follower arrivals
-    IndexedMinPQ<TxnId, TxnEntry, OrderKeyLess, TxnIdHash> spec_log_;
-    OrderKey highest_released_t_{};   // max OrderKey ever appended to specLog
-
-    // Writes this server executed and GC'd from specLog: id -> (final t, led by us).
-    // Guards against re-inserting (and re-applying) a txn after GC via a late commit,
-    // prepare, fetch, or client retry. GC deferred (grows with history).
-    struct ExecutedInfo { uint64_t t = 0; bool is_leader = false; };
-    TxnMap<ExecutedInfo> executed_;
+    std::vector<std::unique_ptr<Shard>> shards_;
+    // Server-wide floor for the late-leader re-timestamp (t component of the max OrderKey
+    // released in any lane): a re-timestamped txn lands above everything already
+    // released here, whichever lane released it.
+    std::atomic<uint64_t> highest_released_tmax_{0};
 
     std::thread       release_thread_;
     std::atomic<bool> running_{false};
     std::atomic<bool> paused_{false};
-    std::atomic<uint64_t> next_due_{Clock::kNever};   // see next_due_hint()
 
     // Executor thread (event-driven ExecuteReady) + serialization of ExecuteReady.
     std::mutex              exec_run_mu_;
@@ -330,7 +391,7 @@ private:
     // otherwise, on the ordering thread's hot path).
     std::atomic<bool>       exec_kicked_{false};
     // Minimum spacing between executor passes (DYNA_EXEC_MIN_INTERVAL_US). Each pass
-    // holds the ordering lock for its snapshot + conflict scan, so fewer, larger passes
+    // holds every lane lock for its snapshot + conflict scan, so fewer, larger passes
     // cut that lock time (execution is background: it never gates commit).
     uint64_t                exec_min_interval_us_ = 0;
     std::thread             exec_thread_;

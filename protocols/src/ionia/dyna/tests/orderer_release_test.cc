@@ -194,3 +194,32 @@ TEST(OrdererRelease, ExternalDriverHintTracksEarliestDeadline)
     EXPECT_EQ(o.next_due_hint(), Clock::kNever);
     o.Stop();
 }
+
+// Lanes: the late-leader re-timestamp floor is server-wide. A commit in one lane pushes
+// highestReleasedT to 5000; a late txn this server leads, arriving in ANOTHER lane, is
+// re-timestamped above it (not just above its own lane's releases).
+TEST(OrdererLanes, LateLeaderRetimestampAboveOtherLanes)
+{
+    MockClock clk(100);
+    Collector c;
+    ServerOrderer o(0, 0, &clk, Topology(1), c.cb(), nullptr, /*lanes=*/4);
+    const TxnId a = MakeTxnId(1, 1);
+    uint64_t rb = 1;
+    while (o.LaneOf(MakeTxnId(2, rb)) == o.LaneOf(a)) ++rb;
+    const TxnId b = MakeTxnId(2, rb);
+
+    o.SubmitTxn(MakeWrite(1, 1, 200), false);
+    clk.Set(200);
+    o.ReleaseDue();
+    TxnEntry out;
+    ASSERT_EQ(o.ApplyCommit(a, 5000, &out), ServerOrderer::CommitResult::kApplied);
+    EXPECT_EQ(o.highest_released_t().t, 5000u);
+
+    clk.Set(1000);
+    o.SubmitTxn(MakeWrite(2, rb, /*t=*/300), false);   // late; server 0 leads every key
+    Status st;
+    uint64_t t = 0;
+    ASSERT_TRUE(o.speclog_entry(b, &st, &t));
+    EXPECT_EQ(st, Status::SPECULATIVE);
+    EXPECT_EQ(t, 5001u);
+}

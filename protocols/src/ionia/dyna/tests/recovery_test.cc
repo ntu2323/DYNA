@@ -7,7 +7,8 @@
 //     - end-to-end over orderers: a fast-committed write whose leader died survives at
 //       its t and is leader-synced to COMMITTING by the new PL; a slow-committed write
 //       survives at agreedT; executed key-values reach a server that lacked them;
-//     - install: t-guarded store apply, leftovers kept + counted, a recovered value is
+//     - install: inherited SPEC writes the PL now leads are leader-synced immediately;
+//       t-guarded store apply, leftovers kept + counted, a recovered value is
 //       not overwritten by an older execution, a resend after install isn't duplicated;
 //     - the VR layer over a fake (lossy) network: survivors converge on the new view with
 //       every PL's M, whether a follower or the VR leader died; a fenced node is excluded.
@@ -226,6 +227,75 @@ TEST_P(FastCommittedLeaderDead, SurvivesAtT)
 }
 
 INSTANTIATE_TEST_SUITE_P(RecoveryOrderer, FastCommittedLeaderDead, ::testing::Bool());
+
+// Inherited SPECULATIVE writes are leader-synced right after install, not after the SPEC
+// age timeout: the client of a fast-committed txn won't send another commit (design doc
+// § Recovery cases 2/3). Single involved leader → completes locally at its t. Only the
+// new PL marks it; a write released after install still waits out the timeout.
+TEST(RecoveryOrderer, InheritedSpecSyncedImmediately)
+{
+    Cluster c;
+    const uint32_t pl = 2;
+    const std::string k = FailedKeyOwnedBy(pl);
+    const TxnEntry w = MakeWrite(7, 1, 1000, k);
+    c.Release(w, {0u, 1u, 2u});
+
+    auto st = c.Recover();
+    EXPECT_EQ(st[1].spec_to_sync, 1u);   // server 2 (the PL)
+    EXPECT_EQ(st[0].spec_to_sync, 0u);   // server 0 is a follower for k
+
+    // No time passes: still well inside the 100 ms SPEC age timeout.
+    std::vector<ServerOrderer::TsAgreeAction> actions;
+    std::vector<TxnEntry> committed;
+    c.o[pl]->DriveTsAgreement(100000, &actions, &committed);
+    ASSERT_EQ(committed.size(), 1u);
+    EXPECT_EQ(committed[0].Key(), w.Key());
+    EXPECT_EQ(committed[0].t, 1000u);
+    EXPECT_EQ(committed[0].status, Status::COMMITTING);
+    EXPECT_TRUE(actions.empty());
+
+    committed.clear();
+    c.o[0]->DriveTsAgreement(100000, &actions, &committed);   // not a leader of it
+    EXPECT_TRUE(committed.empty());
+
+    // A fresh write in view 1, led by the PL: normal timeout applies.
+    TxnEntry w2 = MakeWrite(7, 2, 5000, FailedKeyOwnedBy(pl));
+    w2.txn.set_view_id(1);
+    c.Release(w2, {0u, 2u});
+    committed.clear();
+    c.o[pl]->DriveTsAgreement(100000, &actions, &committed);
+    EXPECT_TRUE(committed.empty());
+}
+
+// Multi-leader inherited SPEC txn (failed key now led by 2, plus a key of partition 0):
+// both leaders emit TsAgree right after install and converge on the max.
+TEST(RecoveryOrderer, InheritedMultiLeaderSpecSyncsImmediately)
+{
+    Cluster c;
+    const std::string kf = FailedKeyOwnedBy(2);
+    const std::string k0 = KeyForPartition(0, kN);
+    TxnEntry w = MakeWrite(7, 3, 1000, kf);
+    proto::KV *kv = w.txn.add_w_set(); kv->set_key(k0); kv->set_value("v0");
+    c.Release(w, {0u, 1u, 2u});
+
+    auto st = c.Recover();
+    EXPECT_EQ(st[0].spec_to_sync, 1u);
+    EXPECT_EQ(st[1].spec_to_sync, 1u);
+
+    std::vector<ServerOrderer::TsAgreeAction> a0, a2;
+    std::vector<TxnEntry> d0, d2;
+    c.o[0]->DriveTsAgreement(100000, &a0, &d0);
+    c.o[2]->DriveTsAgreement(100000, &a2, &d2);
+    ASSERT_EQ(a0.size(), 1u);
+    ASSERT_EQ(a2.size(), 1u);
+    EXPECT_TRUE(d0.empty());
+    auto r2 = c.o[2]->RecordTsProposal(w.Key(), 0, a0[0].proposed_t);
+    auto r0 = c.o[0]->RecordTsProposal(w.Key(), 2, a2[0].proposed_t);
+    EXPECT_TRUE(r2.transitioned);
+    EXPECT_TRUE(r0.transitioned);
+    EXPECT_EQ(r0.entry.t, 1000u);
+    EXPECT_EQ(r2.entry.t, 1000u);
+}
 
 // Install never downgrades: a local COMMITTED copy stays COMMITTED at its t even if an M
 // carries a SPECULATIVE copy (e.g. this server wasn't among the PL's f+1 responders).

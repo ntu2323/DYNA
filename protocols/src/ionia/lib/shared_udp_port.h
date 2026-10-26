@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -83,6 +84,9 @@ private:
     std::string port_str_;
     int dscp_;
     int fd_;
+    // recvmmsg slots (OnReadable): allocated on first use, uninitialized, so only pages a
+    // datagram actually lands in are ever committed.
+    std::unique_ptr<char[]> rx_bufs_;
     event_base *evbase_;
     event *read_event_;
     std::map<uint8_t, EndpointEntry> endpoints_;

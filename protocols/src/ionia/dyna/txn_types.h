@@ -93,6 +93,9 @@ struct TxnEntry {
     // Does this server lead any key in txn.wSet ∪ txn.rSet? And which keys?
     bool                  is_leader_for_this = false;
     std::set<std::string> led_keys;
+    // The min-id involved leader (drives replication), computed with the leadership so
+    // the background scans needn't rebuild the involved-leader set per entry per tick.
+    uint32_t              primary = UINT32_MAX;
 
     // READ + leader only: values produced by the disk-read.
     HashMap<std::string, std::string> results;
@@ -109,6 +112,10 @@ struct TxnEntry {
     uint64_t committing_us   = 0;   // clock() when it became COMMITTING (stale-commit detection)
     uint64_t last_replicate_us = 0; // primary: last ReplicatePrepare broadcast; others: last
                                     // re-ack to the primary (both throttles)
+    // A SPECULATIVE write this server leads after a view change: leader-sync it on the
+    // next ts-agreement pass instead of waiting out the SPEC age timeout (design doc
+    // § Recovery: no client commit is coming for a txn the client already committed).
+    bool sync_now = false;
 
     // Where to send this txn's client reply (null for peer-fetched bodies).
     std::shared_ptr<TransportAddress> client_addr;

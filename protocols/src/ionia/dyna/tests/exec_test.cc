@@ -174,3 +174,55 @@ TEST(Exec, ShortcutsPreserveDependencyRule)
     EXPECT_TRUE(o.speclog_contains(d));
     EXPECT_EQ(o.speclog_size(), 1u);
 }
+
+// Lanes (txns sharded by TxnId): a smaller conflicting write in ANOTHER lane still blocks
+// a larger committed one, and once it commits both execute in OrderKey order. Explicit
+// 4 lanes regardless of DYNA_LANES.
+TEST(ExecLanes, CrossLaneConflictExecutesInOrderKeyOrder)
+{
+    InMemoryBackend backend;
+    MockClock clk(50);
+    ServerOrderer o(0, 0, &clk, Topology(1), Noop(), &backend, /*lanes=*/4);
+    ASSERT_EQ(o.lanes(), 4u);
+    const TxnId small = MakeTxnId(1, 1);
+    uint64_t r2 = 2;
+    while (o.LaneOf(MakeTxnId(2, r2)) == o.LaneOf(small)) ++r2;   // different lane
+    const TxnId large = MakeTxnId(2, r2);
+
+    ReleaseAndCommit(o, clk, MakeWrite(1, 1, 100, "K", "a"), 100);    // smaller OrderKey
+    ReleaseAndCommit(o, clk, MakeWrite(2, r2, 200, "K", "b"), 200);
+    o.MarkCommitted(large);                       // larger commits first
+    EXPECT_TRUE(o.ExecuteReady().empty());        // blocked by the smaller (other lane)
+    EXPECT_EQ(backend.value_or_empty("K"), "");
+
+    o.MarkCommitted(small);
+    std::vector<TxnId> done = o.ExecuteReady();
+    ASSERT_EQ(done.size(), 2u);
+    EXPECT_EQ(done[0], small);
+    EXPECT_EQ(done[1], large);
+    EXPECT_EQ(backend.value_or_empty("K"), "b");
+    EXPECT_TRUE(o.executed(small));
+    EXPECT_TRUE(o.executed(large));
+    EXPECT_EQ(o.speclog_size(), 0u);
+}
+
+// Every entry point routes a txn to the same lane: LaneOf is a pure function of TxnId,
+// and lanes are reasonably balanced.
+TEST(ExecLanes, LaneOfStableAndBalanced)
+{
+    MockClock clk(0);
+    ServerOrderer o(0, 0, &clk, Topology(3), Noop(), nullptr, 4);
+    ServerOrderer o2(1, 0, &clk, Topology(3), Noop(), nullptr, 4);
+    size_t count[4] = {0, 0, 0, 0};
+    for (uint64_t c = 1; c <= 8; ++c) {
+        for (uint64_t r = 1; r <= 1000; ++r) {
+            const TxnId id = MakeTxnId(c * 0x1234567ULL, r);
+            ASSERT_EQ(o.LaneOf(id), o2.LaneOf(id));   // same on every server/instance
+            ++count[o.LaneOf(id)];
+        }
+    }
+    for (size_t n : count) {
+        EXPECT_GT(n, 1700u);   // 8000 / 4 = 2000 each, allow skew
+        EXPECT_LT(n, 2300u);
+    }
+}

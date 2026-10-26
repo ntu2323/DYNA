@@ -72,6 +72,21 @@ message SlowCommit {
     required uint64 agreed_t   = 4;   // max over involved leaders' proposed timestamps
 }
 
+// 5b. FastCommitBatch — client → all servers: several FastCommits from one client in one
+//     datagram. FastCommit is off the client's latency path (it already treats the txn as
+//     committed), so the client accumulates them briefly (DYNA_FAST_BATCH entries or
+//     DYNA_FAST_FLUSH_US). Each entry is handled exactly as a lone FastCommit.
+message FastCommitBatch {
+    repeated FastCommit commits = 1;
+}
+
+// 2b. SpecReplyBatch — server → client: several SpecReplies for the same client in one
+//     datagram, formed only from replies already queued at a sender thread (no added
+//     wait). Each entry is handled exactly as a lone SpecReply.
+message SpecReplyBatch {
+    repeated SpecReply replies = 1;
+}
+
 // 6. CommitReply — server → client in response to a SlowCommit (quorum re-check).
 message CommitReply {
     required uint64 client_id  = 1;

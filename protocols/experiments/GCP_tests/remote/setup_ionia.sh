@@ -71,8 +71,18 @@ DUR_THREADS="${IONIA_DURABILITY_THREADS:-15}"
 # Consensus batch size (bench/replica -b). -b 1 = no batching: every write does an
 # individual Prepare/Commit round on the single ordering thread, which back-pressures
 # the fast path and caps throughput. Raise for higher offered loads.
-BATCH_SIZE="${IONIA_BATCH_SIZE:-1}"
+BATCH_SIZE="${IONIA_BATCH_SIZE:-256}"
+# One SO_REUSEPORT socket per durability thread (a single shared socket overflows near
+# 60k ops/s). IONIA_PER_THREAD_SOCKET=0 restores the shared socket.
+export IONIA_PER_THREAD_SOCKET="${IONIA_PER_THREAD_SOCKET:-1}"
+BIN="${HOME}/Ionia/protocols/src/ionia/bench/replica"
 cd "${HOME}/Ionia/protocols/src/ionia"
+# SplinterDB needs ext4 (fallocate); the image's root fs is ext3. prepare_data_disk.sh
+# provides /mydata/dyna. A killed process's splinterdb.db can't be remounted: start fresh.
+if [[ "${IONIA_DB_MODE}" == "splinter" && -d /mydata/dyna ]]; then
+  cd /mydata/dyna
+  rm -f splinterdb.db
+fi
 mkdir -p ~/bench
 if [[ "${DUR_THREADS}" -gt 1 ]]; then
   ulimit -n 65536 2>/dev/null || true
@@ -81,7 +91,7 @@ pkill -f '[b]ench/replica' 2>/dev/null || true
 sleep 1
 # -c ~/bench/ioniaconfig is the internal consensus config; the replica also reads
 # ~/bench/ioniaconfig.client (client-facing durability) by appending ".client".
-nohup ./bench/replica -i "${IDX}" -j "${DUR_THREADS}" -b "${BATCH_SIZE}" -c ~/bench/ioniaconfig -m vr \
+nohup "${BIN}" -i "${IDX}" -j "${DUR_THREADS}" -b "${BATCH_SIZE}" -c ~/bench/ioniaconfig -m vr \
   > ~/bench/replica-"${IDX}".log 2>&1 &
 echo "Started IONIA replica index=${IDX} durability_threads=${DUR_THREADS} batch_size=${BATCH_SIZE} pid=$!"
 EOF

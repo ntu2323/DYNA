@@ -90,6 +90,13 @@ private:
     uint64_t SlowTimeoutUs() const;
     void Commit(std::unordered_map<uint64_t, PendingRequest>::iterator it,
                 const std::string &result);
+    // One SpecReply (alone or from a SpecReplyBatch).
+    void HandleSpecReply(const proto::SpecReply &r);
+    // FastCommit, batched per client (DYNA_FAST_BATCH > 1): it is off our latency path
+    // (the txn is already committed for us), so a short wait to share a datagram costs
+    // the client nothing; servers only need it to move the txn to COMMITTING.
+    void SendFastCommit(const proto::FastCommit &fc);
+    void FlushFastCommits();
 
     uint64_t last_req_id_ = 0;
     uint64_t viewId_ = 0;
@@ -101,6 +108,10 @@ private:
     ClientBoundTracker bound_tracker_;
     std::unordered_map<uint64_t, PendingRequest> pending_;
     std::unique_ptr<Timeout> resend_sweep_timer_;
+    size_t   fast_batch_max_ = 32;        // DYNA_FAST_BATCH (1 = send each immediately)
+    uint64_t fast_flush_us_ = 200;        // DYNA_FAST_FLUSH_US
+    proto::FastCommitBatch fast_pending_;
+    bool     fast_timer_armed_ = false;
 };
 
 } // namespace dyna

@@ -5,6 +5,13 @@
 //   (single per-server ordering domain; spec §1.4) and drives the write path:
 //   ClientRequest → SubmitTxn → (release) → SpecReply; FastCommit/SlowCommit →
 //   ApplyCommit (with FetchRequest/FetchReply when the body is missing).
+//
+//   Threading (busy-poll): receive threads parse hot messages and route each to the
+//   LANE of its transaction (ServerOrderer::LaneOf(TxnId); every hot message carries
+//   the TxnId). Each lane has its own ordering thread, queue, dedup / reply cache, OWD
+//   estimator and background outbox, and owns one orderer shard — so lanes order
+//   disjoint transactions in parallel and every step of one transaction runs on one
+//   thread. DYNA_LANES=1 is the single ordering thread.
 
 #ifndef _DYNA_REPLICA_H_
 #define _DYNA_REPLICA_H_
@@ -93,6 +100,13 @@ private:
 
     // Background timestamp agreement (spec §3.5): periodic scan + TsAgree fan-out.
     void TsAgreementTick();
+    // One ts-agreement pass (no timer re-arm): send TsAgrees, and for every txn that just
+    // became COMMITTING tell its client (LeaderSyncDone) and start replication.
+    void RunTsAgreement();
+    // Leader sync moved a txn SPECULATIVE → COMMITTING: send the client a CommitReply in
+    // case it is still waiting (design doc § Recovery), preceded by a ViewInfo when the
+    // txn predates the current view so the client counts it in the right view.
+    void LeaderSyncDone(const TxnEntry &e);
     void SendTsAgree(const ServerOrderer::TsAgreeAction &action);
 
     // Replication (spec §3.6-3.7): COMMITTING → COMMITTED.
@@ -113,7 +127,9 @@ private:
                         const TransportAddress *remote);
     void BgCommit(int32_t to, const proto::ReplicateCommit &m);
     void BgTsAgree(uint32_t to, const proto::TsAgree &m);
-    void FlushBgTo(uint32_t to);
+    // Each lane batches its own transactions' entries (so a received batch belongs to a
+    // single lane at the receiver too, which uses the same LaneOf).
+    void FlushBgTo(size_t lane, uint32_t to);
     void SendBgBatch(uint32_t to, proto::BgBatch &b, size_t entries);
     void BgFlushTick();   // timer: flush every non-empty batch, re-arm
     void HandleBgBatch(const proto::BgBatch &m);
@@ -201,23 +217,46 @@ private:
     std::unique_ptr<RealClock>    clock_;
     std::unique_ptr<ServerOrderer> orderer_;
 
-    // Per-client OWD estimator (§2); sampled on the transport thread, read on release.
-    HybridMutex owd_mu_;
-    ReplicaOwdEstimator owd_;
-
-    // At-most-once reply cache (spec §1.4 CachedReply) + in-flight set, so a retried
-    // WRITE ClientRequest is answered from cache and never double-submitted. READs bypass
-    // both: every read attempt carries a fresh request_id and a new t.
-    HybridMutex dedup_mu_;
-    // Compact cache value: a resend is answered with a reply rebuilt from these (its t
-    // and leadership are re-derived from live state anyway), so the hot release path
-    // doesn't store a protobuf per txn in a multi-million-entry map.
+    // Compact reply-cache value: a resend is answered with a reply rebuilt from these
+    // (its t and leadership are re-derived from live state anyway), so the hot release
+    // path doesn't store a protobuf per txn in a multi-million-entry map.
     struct CachedSpec {
         uint64_t t = 0;
         uint64_t owd = 0;
     };
-    TxnMap<CachedSpec>               reply_cache_;
-    TxnSet                           inflight_;
+
+    // One lane: the per-transaction replica state for the txns LaneOf maps here. The
+    // locks are taken almost only by the lane's own thread (the timer thread's scans and
+    // view changes are the exceptions), so they are uncontended.
+    struct Lane {
+        size_t idx = 0;
+        // Hot handlers posted by the receive threads.
+        MultiProducerSingleConsumerQueue<std::function<void()>> q;
+        std::thread th;
+        // Per-client OWD estimator (§2), sampled where lateness is judged. Each lane
+        // samples its share of a client's requests (an equivalent percentile).
+        HybridMutex owd_mu;
+        std::unique_ptr<ReplicaOwdEstimator> owd;
+        // At-most-once reply cache (spec §1.4 CachedReply) + in-flight set, so a retried
+        // WRITE ClientRequest is answered from cache and never double-submitted. READs
+        // bypass both: every read attempt carries a fresh request_id and a new t.
+        HybridMutex dedup_mu;
+        TxnMap<CachedSpec> reply_cache;
+        TxnSet             inflight;
+        // client_id -> address, learned from that client's writes (under dedup_mu).
+        // Recovery M carries txn bodies but not client addresses, so a new partition
+        // leader finishing an inherited txn finds its client here.
+        std::unordered_map<uint64_t, std::shared_ptr<TransportAddress>> client_addrs;
+        std::unique_ptr<BgOutbox> bg;   // null = batching off (DYNA_REPL_BATCH <= 1)
+        size_t sender = 0;              // which sender thread sends for this lane
+        StatCounter busy_us;            // DYNA_STATS: time running handlers + releases
+        StatCounter msgs;               // DYNA_STATS: handler closures run
+        StatCounter released;           // DYNA_STATS: entries released by ReleaseDue
+        StatMax     hmax;               // DYNA_STATS: longest single handler / release, µs
+        StatMax     qmax;
+    };
+    std::vector<std::unique_ptr<Lane>> lanes_;
+    Lane &LaneFor(const TxnId &id) { return *lanes_[orderer_->LaneOf(id)]; }
 
     // A commit that arrived before the body: remember it until the fetch completes.
     struct PendingCommit {
@@ -231,12 +270,13 @@ private:
     // Shared: hot-message handlers; exclusive: VR / recovery / join + heartbeat tick.
     RwLock state_lock_;
 
-    std::unique_ptr<BgOutbox> bg_;   // null = batching off (DYNA_REPL_BATCH <= 1)
+    bool     bg_on_ = false;            // background batching (DYNA_REPL_BATCH > 1)
     uint64_t bg_flush_us_ = 500;
 
     // --- DYNA_STATS=1: per-second counters, printed from HeartbeatTick (observation only)
     enum RxType { kRxRequest, kRxFast, kRxSlow, kRxPrep, kRxPrepReply, kRxCommit,
-                  kRxTsAgree, kRxFetch, kRxFetchRep, kRxBg, kRxHeartbeat, kRxOther, kRxN };
+                  kRxTsAgree, kRxFetch, kRxFetchRep, kRxBg, kRxFastBatch, kRxHeartbeat,
+                  kRxOther, kRxN };
     static bool IsHot(RxType k) { return k != kRxHeartbeat && k != kRxOther; }
     // Hot-message pipeline: parse (receive thread) and process (receive thread, or the
     // ordering thread when DYNA_ORDER_THREAD is on).
@@ -244,30 +284,37 @@ private:
                                                                std::string_view data);
     void ProcessHot(RxType kind, const TransportAddress &remote,
                     const google::protobuf::Message &msg);
-    // DYNA_ORDER_THREAD: one thread runs every hot handler (posted by the receive
-    // threads through a lock-free MPSC queue) and drives the orderer's releases, so the
-    // ordering lock is almost never contended. Busy-poll mode only.
-    void OrderingLoop();
+    // The TxnId a parsed hot message is about (false for a BgBatch: route per entry).
+    static bool HotTxnId(RxType kind, const google::protobuf::Message &msg, TxnId *id);
+    void PostToLane(size_t lane, std::function<void()> fn);
+    // DYNA_ORDER_THREAD: lane threads run every hot handler (posted by the receive
+    // threads through lock-free MPSC queues) and drive their orderer shard's releases,
+    // so the lane locks are almost never contended. Busy-poll mode only.
+    void OrderingLoop(Lane *lane);
     bool order_thread_on_ = false;
     std::atomic<bool> order_running_{false};
-    MultiProducerSingleConsumerQueue<std::function<void()>> order_q_;
-    std::thread order_thread_;
-    // Sender thread (with the ordering thread): release-path SpecReplies and full
-    // background batches are sent from here, keeping sendto off the ordering thread.
-    void SendLoop();
-    std::atomic<bool> send_running_{false};
-    MultiProducerSingleConsumerQueue<std::function<void()>> send_q_;
-    // Release-path SpecReplies as plain structs (no closure allocation; the sender
-    // thread builds the protobuf).
+    // Sender threads (DYNA_SEND_THREADS, default 1; 0 = each lane sends inline):
+    // release-path SpecReplies and full background batches are sent from here, keeping
+    // sendto off the lane threads. Lane i uses sender i % S.
     struct ReplyJob {
         std::shared_ptr<TransportAddress> addr;
         uint64_t client_id = 0, request_id = 0, view_id = 0, t = 0, owd = 0;
         bool     is_leader = false;
     };
-    MultiProducerSingleConsumerQueue<ReplyJob> reply_q_;
-    std::thread send_thread_;
-    StatCounter order_busy_us_;     // ordering thread time spent running handlers
-    StatMax     order_qmax_;        // max queue depth seen
+    struct Sender {
+        MultiProducerSingleConsumerQueue<std::function<void()>> q;
+        // Release-path SpecReplies as plain structs (no closure allocation; the sender
+        // thread builds the protobuf).
+        MultiProducerSingleConsumerQueue<ReplyJob> replies;
+        std::thread th;
+        StatCounter busy_us;   // DYNA_STATS: time spent sending (non-empty iterations)
+    };
+    void SendLoop(Sender *s, size_t idx);
+    std::atomic<bool> send_running_{false};
+    std::vector<std::unique_ptr<Sender>> senders_;
+    Sender *SenderFor(const Lane &l) {
+        return senders_.empty() ? nullptr : senders_[l.sender].get();
+    }
     static RxType ClassifyRx(std::string_view type);
     void MaybeDumpStats(uint64_t now_us);
     bool         stats_on_ = false;
@@ -277,11 +324,17 @@ private:
     StatCounter  busy_us_;          // transport thread time inside ReceiveMessage
     StatMax      handler_max_us_;   // longest single ReceiveMessage
     StatCounter  spec_tx_;          // SpecReplies sent (release thread)
+    StatCounter  reply_pkts_;       // datagrams carrying SpecReplies (batches count once)
+    StatCounter  sync_reply_tx_;    // CommitReplies sent after a leader sync
     StatMax      hb_gap_us_;        // longest gap between heartbeats from any one peer
     StatMax      tick_gap_us_;      // longest gap between our own heartbeat ticks
     StatDist     scan_us_;          // TsAgreementTick's locked scans
     StatDist     bg_tx_entries_;    // entries per BgBatch sent
     StatDist     bg_rx_entries_;    // entries per BgBatch received
+    // One-way delay of client requests, split (DYNA_STATS): owd = lane arrival - client
+    // send stamp; net = receive thread - send stamp; queue = lane - receive thread; and
+    // the OWD estimate piggybacked to clients (what their deadline bound follows).
+    StatHist     owd_hist_, owd_net_hist_, owd_queue_hist_, owd_est_hist_;
     StatDist     dedup_wait_us_, pending_wait_us_, owd_wait_us_;   // contended waits
     std::vector<uint64_t> last_hb_rx_us_;
     uint64_t     last_hb_tick_us_ = 0;

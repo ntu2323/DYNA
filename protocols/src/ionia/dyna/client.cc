@@ -76,6 +76,8 @@ DynaClient::DynaClient(const specpaxos::Configuration &config,
       bound_tracker_(DeadlineConfig::FromEnv(), config.n)
 {
     if (resend_ms_ == 0) resend_ms_ = 1;
+    fast_batch_max_ = std::max<uint64_t>(1, DeadlineConfig::EnvU64("DYNA_FAST_BATCH", 32));
+    fast_flush_us_ = std::max<uint64_t>(1, DeadlineConfig::EnvU64("DYNA_FAST_FLUSH_US", 200));
     const char *dbg = std::getenv("DYNA_DEBUG");
     debug_ = (dbg != nullptr && *dbg != '\0' && *dbg != '0');
     // Sweep often enough to honor both the resend and the slow-path timeouts.
@@ -338,6 +340,15 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
         proto::CommitReply::default_instance().GetDescriptor()->full_name();
     const static auto viewInfoName =
         proto::ViewInfo::default_instance().GetDescriptor()->full_name();
+    const static auto specBatchName =
+        proto::SpecReplyBatch::default_instance().GetDescriptor()->full_name();
+
+    if (type == specBatchName) {
+        proto::SpecReplyBatch b;
+        if (!b.ParseFromArray(data.data(), data.size())) return;
+        for (const auto &r : b.replies()) HandleSpecReply(r);
+        return;
+    }
 
     if (type == viewInfoName) {
         proto::ViewInfo m;
@@ -347,54 +358,7 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
 
     if (type == specName) {
         proto::SpecReply r;
-        if (!r.ParseFromArray(data.data(), data.size())) return;
-        auto it = pending_.find(r.request_id());
-        if (it == pending_.end()) return;
-        PendingRequest &p = it->second;
-
-        bound_tracker_.on_owd_sample(r.server_id(), r.owd_estimate());
-        // Another view's reply doesn't count (see TxnQuorum); a server in a newer view
-        // answers our next resend with ViewInfo, and we restart the request there.
-        if (!p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader())) return;
-        // READ: merge the disk-read values from each involved leader's reply.
-        if (p.type == proto::READ && r.is_leader()) {
-            for (const auto &kv : r.results()) p.results[kv.key()] = kv.value();
-        }
-        if (debug_) {
-            Notice("client RECV SpecReply s=%u r=%lu t=%lu leader=%d replies=%zu "
-                   "leaders_present=%d fast=%d disagree=%d", r.server_id(),
-                   (unsigned long)r.request_id(), (unsigned long)r.t(), r.is_leader() ? 1 : 0,
-                   p.quorum.reply_count(), p.quorum.all_leaders_present() ? 1 : 0,
-                   p.quorum.fast_ready() ? 1 : 0, p.quorum.leaders_disagree() ? 1 : 0);
-        }
-
-        if (p.phase == Phase::COLLECTING) {
-            if (p.quorum.fast_ready()) {
-                if (p.type == proto::WRITE) {
-                    // Writes: durability handshake so servers learn of the commit.
-                    proto::FastCommit fc;
-                    fc.set_client_id(clientid);
-                    fc.set_request_id(p.request_id);
-                    fc.set_view_id(viewId_);
-                    fc.set_agreed_t(p.quorum.agreed_t());
-                    transport->SendMessageToAll(this, fc);
-                    Commit(it, std::string());
-                } else {
-                    // Reads aren't logged/committed on servers: just return the value
-                    // read from the involved leaders (no FastCommit).
-                    auto rit = p.results.find(p.key);
-                    Commit(it, rit != p.results.end() ? rit->second : std::string());
-                }
-            } else if (p.type == proto::WRITE && p.quorum.leaders_disagree()) {
-                SendSlowCommit(p);
-            }
-            // Otherwise wait for more replies; the sweep forces the slow path (writes)
-            // or retries at a larger t (reads) on timeout.
-        } else if (p.quorum.fast_ready()) {
-            // SLOW_WAIT: a straggling SpecReply already at agreedT completes the quorum
-            // just like a CommitReply would.
-            Commit(it, std::string());
-        }
+        if (r.ParseFromArray(data.data(), data.size())) HandleSpecReply(r);
         return;
     }
 
@@ -413,6 +377,86 @@ void DynaClient::ReceiveMessage(const TransportAddress &remote,
     }
 
     Client::ReceiveMessage(remote, type, data, meta_data);
+}
+
+void DynaClient::HandleSpecReply(const proto::SpecReply &r)
+{
+    auto it = pending_.find(r.request_id());
+    if (it == pending_.end()) return;
+    PendingRequest &p = it->second;
+
+    bound_tracker_.on_owd_sample(r.server_id(), r.owd_estimate());
+    // Another view's reply doesn't count (see TxnQuorum); a server in a newer view
+    // answers our next resend with ViewInfo, and we restart the request there.
+    if (!p.quorum.AddReply(r.server_id(), r.view_id(), r.t(), r.is_leader())) return;
+    // READ: merge the disk-read values from each involved leader's reply.
+    if (p.type == proto::READ && r.is_leader()) {
+        for (const auto &kv : r.results()) p.results[kv.key()] = kv.value();
+    }
+    if (debug_) {
+        Notice("client RECV SpecReply s=%u r=%lu t=%lu leader=%d replies=%zu "
+               "leaders_present=%d fast=%d disagree=%d", r.server_id(),
+               (unsigned long)r.request_id(), (unsigned long)r.t(), r.is_leader() ? 1 : 0,
+               p.quorum.reply_count(), p.quorum.all_leaders_present() ? 1 : 0,
+               p.quorum.fast_ready() ? 1 : 0, p.quorum.leaders_disagree() ? 1 : 0);
+    }
+
+    if (p.phase == Phase::COLLECTING) {
+        if (p.quorum.fast_ready()) {
+            if (p.type == proto::WRITE) {
+                // Writes: durability handshake so servers learn of the commit.
+                proto::FastCommit fc;
+                fc.set_client_id(clientid);
+                fc.set_request_id(p.request_id);
+                fc.set_view_id(viewId_);
+                fc.set_agreed_t(p.quorum.agreed_t());
+                SendFastCommit(fc);
+                Commit(it, std::string());
+            } else {
+                // Reads aren't logged/committed on servers: just return the value
+                // read from the involved leaders (no FastCommit).
+                auto rit = p.results.find(p.key);
+                Commit(it, rit != p.results.end() ? rit->second : std::string());
+            }
+        } else if (p.type == proto::WRITE && p.quorum.leaders_disagree()) {
+            SendSlowCommit(p);
+        }
+        // Otherwise wait for more replies; the sweep forces the slow path (writes)
+        // or retries at a larger t (reads) on timeout.
+    } else if (p.quorum.fast_ready()) {
+        // SLOW_WAIT: a straggling SpecReply already at agreedT completes the quorum
+        // just like a CommitReply would.
+        Commit(it, std::string());
+    }
+}
+
+void DynaClient::SendFastCommit(const proto::FastCommit &fc)
+{
+    if (fast_batch_max_ <= 1) {
+        transport->SendMessageToAll(this, fc);
+        return;
+    }
+    *fast_pending_.add_commits() = fc;
+    if (static_cast<size_t>(fast_pending_.commits_size()) >= fast_batch_max_) {
+        FlushFastCommits();
+    } else if (!fast_timer_armed_) {
+        fast_timer_armed_ = true;
+        transport->TimerUS(fast_flush_us_, [this]() {
+            fast_timer_armed_ = false;
+            FlushFastCommits();
+        });
+    }
+}
+
+void DynaClient::FlushFastCommits()
+{
+    if (fast_pending_.commits_size() == 0) return;
+    if (fast_pending_.commits_size() == 1) {
+        transport->SendMessageToAll(this, fast_pending_.commits(0));
+    } else {
+        transport->SendMessageToAll(this, fast_pending_);
+    }
+    fast_pending_.Clear();
 }
 
 } // namespace dyna

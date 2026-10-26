@@ -256,6 +256,10 @@ def _build_client_cmd(
             "export DYNA_RESEND_TIMEOUT_MS=${DYNA_RESEND_TIMEOUT_MS:-30}; "
             "export BENCH_INFLIGHT_LOG=${BENCH_INFLIGHT_LOG:-1}; "
         )
+        # FastCommit batching per client (DYNA_FAST_BATCH entries / DYNA_FAST_FLUSH_US).
+        for _k in ("DYNA_FAST_BATCH", "DYNA_FAST_FLUSH_US"):
+            if _k in os.environ:
+                dyna_env += f"export {_k}={shlex.quote(os.environ[_k])}; "
         # Slow-path trigger (all leaders replied, quorum short): forward if set locally.
         if "DYNA_SLOW_TIMEOUT_US" in os.environ:
             dyna_env += f"export DYNA_SLOW_TIMEOUT_US={shlex.quote(os.environ['DYNA_SLOW_TIMEOUT_US'])}; "
@@ -306,6 +310,12 @@ _DYNA_REPLICA_ENV_KNOBS = (
     "DYNA_LOCK_SPIN",
     "DYNA_PRERESERVE",
     "DYNA_ORDER_THREAD",
+    "DYNA_LANES",          # ordering threads (txns sharded by TxnId)
+    "DYNA_MAX_OWD_US",     # deadline knobs: the replicas' OWD estimator clamps samples too
+    "DYNA_OWD_PERCENTILE",
+    "DYNA_OWD_WINDOW_LEN",
+    "DYNA_SEND_THREADS",   # SpecReply / batch sender threads (0 = lanes send inline)
+    "DYNA_REPLY_COMBINE",  # group queued SpecReplies per client (1 = on)
     "DYNA_PIN",
     "DYNA_EXEC_MIN_INTERVAL_US",
     "LD_PRELOAD",   # e.g. /usr/lib/x86_64-linux-gnu/libjemalloc.so.2 for the replicas
@@ -336,10 +346,12 @@ def _ionia_replica_env_prefix(
 ) -> str:
     parts = [f"export IONIA_DURABILITY_THREADS={durability_threads}"]
     parts.append(f"export IONIA_BATCH_SIZE={int(batch_size)}")
-    if per_thread_socket:
-        parts.append("export IONIA_PER_THREAD_SOCKET=1")
+    parts.append(f"export IONIA_PER_THREAD_SOCKET={1 if per_thread_socket else 0}")
     if leader_stats:
         parts.append("export IONIA_LEADER_STATS=1")
+    # Store backend (start script default: memory). splinter runs from /mydata/dyna (ext4).
+    if os.environ.get("IONIA_DB_MODE"):
+        parts.append(f"export IONIA_DB_MODE={shlex.quote(os.environ['IONIA_DB_MODE'])}")
     if durability_threads > 1:
         parts.append("ulimit -n 65536 2>/dev/null || true")
     return "; ".join(parts) + "; "
@@ -674,10 +686,10 @@ def main() -> None:
     ap.add_argument(
         "--ionia-batch-size",
         type=int,
-        default=1,
-        help="IONIA only: bench/replica -b consensus batch size (default 1 = no "
-        "batching). The single ordering thread commits up to this many ops per "
-        "Prepare round; raise it (e.g. 64/128) to lift the write-throughput ceiling.",
+        default=256,
+        help="IONIA only: bench/replica -b consensus batch size (default 256). The "
+        "single background ordering thread commits up to this many ops per Prepare "
+        "round; 1 = no batching, which caps IONIA near 25-30k ops/s (CloudLab c220g2).",
     )
     ap.add_argument(
         "--ionia-fast-quorum",
@@ -686,10 +698,12 @@ def main() -> None:
     )
     ap.add_argument(
         "--ionia-per-thread-socket",
-        action="store_true",
-        help="IONIA only: IONIA_PER_THREAD_SOCKET=1 on replicas (each durability "
-        "thread gets its own SO_REUSEPORT socket + event loop instead of one "
-        "shared socket pumped by a single thread).",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="IONIA only: IONIA_PER_THREAD_SOCKET=1 on replicas (default on): each "
+        "durability thread gets its own SO_REUSEPORT socket + event loop. With one "
+        "shared socket every client packet funnels through one thread and the "
+        "socket overflows (UDP RcvbufErrors) near 60k ops/s.",
     )
     ap.add_argument(
         "--ionia-leader-stats",
@@ -794,8 +808,6 @@ def main() -> None:
         sys.exit("Set --ssh-user or SSH_USER")
     if args.ionia_fast_quorum and args.protocol != "ionia":
         sys.exit("--ionia-fast-quorum applies only to --protocol ionia")
-    if args.ionia_per_thread_socket and args.protocol != "ionia":
-        sys.exit("--ionia-per-thread-socket applies only to --protocol ionia")
     if args.ionia_leader_stats and args.protocol != "ionia":
         sys.exit("--ionia-leader-stats applies only to --protocol ionia")
     if args.ionia_client_timing and args.protocol != "ionia":

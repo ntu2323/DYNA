@@ -1,0 +1,61 @@
+== threads (top -H, %CPU) ==
+    PID USER      PR  NI    VIRT    RES    SHR S  %CPU  %MEM     TIME+ COMMAND
+  10957 nathantu  20   0 9309132   6.2g   9276 R  99.9   3.9   1:00.97 replica
+  10964 nathantu  20   0 9309132   6.2g   9276 R  99.9   3.9   1:00.97 replica
+  10965 nathantu  20   0 9309132   6.2g   9276 R  99.9   3.9   1:00.97 replica
+  10967 nathantu  20   0 9309132   6.2g   9276 R  99.9   3.9   1:00.97 replica
+  10920 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:05.05 replica
+  10955 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.92 replica
+  10956 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.98 replica
+  10958 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.96 replica
+  10959 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.96 replica
+  10960 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.96 replica
+  10961 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.96 replica
+  10963 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.96 replica
+  10966 nathantu  20   0 9309132   6.2g   9276 R  93.8   3.9   1:00.96 replica
+== hottest symbols (self time) by thread ==
+     2.81%    10920:replica  [k] syscall_return_via_sysret                                                                                                                                              
+     2.13%    10955:replica  [k] syscall_return_via_sysret                                                                                                                                              
+     1.89%    10966:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.69%    10964:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.66%    10963:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.65%    10965:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.64%    10961:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.63%    10960:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.63%    10957:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.63%    10958:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.62%    10956:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.58%    10970:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.58%    10969:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.57%    10959:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.56%    10967:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.55%    10968:replica  [.] specpaxos::vr::VRDurabilityReplica::VRDurabilityReplica(specpaxos::Configuration, int, bool, Transport*, int, specpaxos::AppReplica*, specpaxos::Configuration, Transpo
+     1.46%    10964:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.42%    10966:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.40%    10963:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.40%    10956:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.39%    10961:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.37%    10959:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.36%    10969:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.35%    10960:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.35%    10970:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.34%    10967:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.32%    10965:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.32%    10968:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.31%    10965:replica  [.] UDPTransport::RunOnce                                                                                                                                                  
+     1.30%    10958:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.29%    10957:replica  [.] specpaxos::AppReplica::PullDataFromExecutionQueue                                                                                                                      
+     1.25%    10958:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.24%    10960:replica  [.] UDPTransport::RunOnce                                                                                                                                                  
+     1.23%    10968:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.22%    10970:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.21%    10957:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.20%    10967:replica  [.] UDPTransport::RunOnce                                                                                                                                                  
+     1.19%    10959:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.18%    10960:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.17%    10957:replica  [.] UDPTransport::RunOnce                                                                                                                                                  
+     1.16%    10961:replica  [.] UDPTransport::RunOnce                                                                                                                                                  
+     1.15%    10969:replica  [.] UDPTransport::RunOnce                                                                                                                                                  
+     1.14%    10967:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.14%    10961:replica  [.] FastTransport::Run                                                                                                                                                     
+     1.13%    10963:replica  [.] UDPTransport::RunOnce                                                                                                                                                  

@@ -57,8 +57,7 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
                          Transport *transport,
                          DB *db)
     : config(config), replicaIdx(replicaIdx), transport(transport),
-      topo_(static_cast<uint32_t>(config.n)),
-      owd_(DeadlineConfig::FromEnv())
+      topo_(static_cast<uint32_t>(config.n))
 {
     const char *bp = std::getenv("DYNA_BUSY_POLL");
     const bool busyPoll = (bp == nullptr) || (*bp != '0');
@@ -67,25 +66,48 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
     clock_ = std::make_unique<RealClock>(busyPoll);
     if (db != nullptr) backend_ = std::make_unique<DbBackend>(db);
     else backend_ = std::make_unique<InMemoryBackend>();
+    // Ordering threads: on by default in busy-poll mode (DYNA_ORDER_THREAD=0 = handlers
+    // run on the receive threads under the ordering lock, as before). DYNA_LANES ordering
+    // threads (lanes) split the transactions by TxnId; without ordering threads, 1 lane.
+    order_thread_on_ = busyPoll && DeadlineConfig::EnvU64("DYNA_ORDER_THREAD", 1) != 0;
+    const size_t n_lanes = order_thread_on_
+        ? std::max<size_t>(1, DeadlineConfig::EnvU64("DYNA_LANES", 1)) : 1;
     orderer_ = std::make_unique<ServerOrderer>(
         static_cast<uint32_t>(replicaIdx), viewId_, clock_.get(), topo_,
-        [this](const TxnEntry &e) { OnSpecReply(e); }, backend_.get());
-    // DYNA_PRERESERVE: pre-size the never-GC'd per-txn maps (executed set, reply cache)
-    // so a long benchmark doesn't pay multi-ms rehashes under their locks mid-run.
-    if (const uint64_t rsv = DeadlineConfig::EnvU64("DYNA_PRERESERVE", 0); rsv > 0) {
-        orderer_->ReserveExecuted(rsv);
-        reply_cache_.reserve(rsv);
-    }
+        [this](const TxnEntry &e) { OnSpecReply(e); }, backend_.get(), n_lanes);
     stats_on_ = StatsEnabledFromEnv();
     last_hb_rx_us_.assign(static_cast<size_t>(config.n), 0);
-    // Ordering thread: on by default in busy-poll mode (DYNA_ORDER_THREAD=0 = handlers
-    // run on the receive threads under the ordering lock, as before).
-    order_thread_on_ = busyPoll && DeadlineConfig::EnvU64("DYNA_ORDER_THREAD", 1) != 0;
+
+    // Background batching (replication + ts-agreement): heavy by default — this traffic
+    // is off the client's commit path, so it trades a little execution delay for far
+    // fewer datagrams. DYNA_REPL_BATCH <= 1 = one message per txn, sent immediately.
+    const uint64_t bg_batch = DeadlineConfig::EnvU64("DYNA_REPL_BATCH", 256);
+    bg_flush_us_ = std::max<uint64_t>(1, DeadlineConfig::EnvU64("DYNA_REPL_FLUSH_US", 500));
+    bg_on_ = bg_batch > 1;
+    const size_t n_senders = order_thread_on_ ? DeadlineConfig::EnvU64("DYNA_SEND_THREADS", 1) : 0;
+    // DYNA_PRERESERVE: pre-size the never-GC'd per-txn maps (executed set, reply cache)
+    // so a long benchmark doesn't pay multi-ms rehashes under their locks mid-run.
+    const uint64_t rsv = DeadlineConfig::EnvU64("DYNA_PRERESERVE", 0);
+    if (rsv > 0) orderer_->ReserveExecuted(rsv);
+    for (size_t i = 0; i < orderer_->lanes(); ++i) {
+        auto l = std::make_unique<Lane>();
+        l->idx = i;
+        l->owd = std::make_unique<ReplicaOwdEstimator>(DeadlineConfig::FromEnv());
+        if (bg_on_) {
+            l->bg = std::make_unique<BgOutbox>(static_cast<uint32_t>(config.n), bg_batch,
+                                               DeadlineConfig::EnvU64("DYNA_REPL_MAX_BYTES", 8000));
+        }
+        if (rsv > 0) l->reply_cache.reserve(rsv / orderer_->lanes() + rsv / (4 * orderer_->lanes()));
+        l->sender = n_senders ? i % n_senders : 0;
+        if (stats_on_) {
+            l->dedup_mu.SetWaitStats(&dedup_wait_us_);
+            l->owd_mu.SetWaitStats(&owd_wait_us_);
+        }
+        lanes_.push_back(std::move(l));
+    }
     if (stats_on_) {
         orderer_->SetStats(&ostats_);
-        dedup_mu_.SetWaitStats(&dedup_wait_us_);
         pending_mu_.SetWaitStats(&pending_wait_us_);
-        owd_mu_.SetWaitStats(&owd_wait_us_);
     }
     // Executor passes at most every DYNA_EXEC_MIN_INTERVAL_US (default 2000): each pass
     // takes the ordering lock; at 55k ops/s per-commit passes held it ~14% of the time.
@@ -130,42 +152,37 @@ DynaReplica::DynaReplica(const specpaxos::Configuration &config,
     transport->Timer(ts_scan_ms_, [this]() { TsAgreementTick(); });
     transport->Timer(hb_ms_, [this]() { HeartbeatTick(); });
 
-    // Background batching (replication + ts-agreement): heavy by default — this traffic
-    // is off the client's commit path, so it trades a little execution delay for far
-    // fewer datagrams. DYNA_REPL_BATCH <= 1 = one message per txn, sent immediately.
-    const uint64_t bg_batch = DeadlineConfig::EnvU64("DYNA_REPL_BATCH", 256);
-    bg_flush_us_ = std::max<uint64_t>(1, DeadlineConfig::EnvU64("DYNA_REPL_FLUSH_US", 500));
-    if (bg_batch > 1) {
-        bg_ = std::make_unique<BgOutbox>(static_cast<uint32_t>(config.n), bg_batch,
-                                         DeadlineConfig::EnvU64("DYNA_REPL_MAX_BYTES", 8000));
-        transport->TimerUS(bg_flush_us_, [this]() { BgFlushTick(); });
-    }
+    if (bg_on_) transport->TimerUS(bg_flush_us_, [this]() { BgFlushTick(); });
     if (order_thread_on_) {
         // Initialize the primary transport's lazy address maps from this thread before
-        // the ordering thread can send through it concurrently.
+        // the lane / sender threads can send through it concurrently.
         proto::Heartbeat hb;
         hb.set_view_id(viewId_);
         hb.set_sender_id(static_cast<uint32_t>(replicaIdx));
         transport->SendMessageToAll(this, hb);
         send_running_.store(true);
-        send_thread_ = std::thread(&DynaReplica::SendLoop, this);
+        for (size_t i = 0; i < n_senders; ++i) {
+            senders_.push_back(std::make_unique<Sender>());
+            senders_.back()->th = std::thread(&DynaReplica::SendLoop, this,
+                                              senders_.back().get(), i);
+        }
         order_running_.store(true);
-        order_thread_ = std::thread(&DynaReplica::OrderingLoop, this);
+        for (auto &l : lanes_) l->th = std::thread(&DynaReplica::OrderingLoop, this, l.get());
     }
-    Notice("DYNA r%d up: n=%d f=%d busyPoll=%d orderThread=%d store=%s failTimeoutMs=%lu "
-           "replBatch=%lu replFlushUs=%lu", replicaIdx, config.n, config.f, busyPoll ? 1 : 0,
-           order_thread_on_ ? 1 : 0,
+    Notice("DYNA r%d up: n=%d f=%d busyPoll=%d orderThread=%d lanes=%zu senders=%zu "
+           "store=%s failTimeoutMs=%lu replBatch=%lu replFlushUs=%lu", replicaIdx, config.n,
+           config.f, busyPoll ? 1 : 0, order_thread_on_ ? 1 : 0, lanes_.size(), senders_.size(),
            db != nullptr ? "harness-db" : "in-memory",
-           (unsigned long)(vcfg.fail_timeout_us / 1000), (unsigned long)(bg_ ? bg_batch : 1),
+           (unsigned long)(vcfg.fail_timeout_us / 1000), (unsigned long)(bg_on_ ? bg_batch : 1),
            (unsigned long)bg_flush_us_);
 }
 
 DynaReplica::~DynaReplica()
 {
     order_running_.store(false);
-    if (order_thread_.joinable()) order_thread_.join();
+    for (auto &l : lanes_) if (l->th.joinable()) l->th.join();
     send_running_.store(false);
-    if (send_thread_.joinable()) send_thread_.join();
+    for (auto &snd : senders_) if (snd->th.joinable()) snd->th.join();
     if (orderer_) orderer_->Stop();
 }
 
@@ -189,7 +206,10 @@ DynaReplica::ClassifyRx(std::string_view type)
     const static auto hb = proto::Heartbeat::default_instance().GetDescriptor()->full_name();
     if (type == fetchRep) return kRxFetchRep;
     const static auto bg = proto::BgBatch::default_instance().GetDescriptor()->full_name();
+    const static auto fastB =
+        proto::FastCommitBatch::default_instance().GetDescriptor()->full_name();
     if (type == req) return kRxRequest;
+    if (type == fastB) return kRxFastBatch;
     if (type == bg) return kRxBg;
     if (type == fast) return kRxFast;
     if (type == slow) return kRxSlow;
@@ -216,31 +236,93 @@ DynaReplica::ReceiveMessage(const TransportAddress &remote,
     // out the recovery traffic. Replication batches still flow (a JOINING server
     // applies them).
     if (paused_.load(std::memory_order_relaxed) &&
-        (kind == kRxRequest || kind == kRxFast || kind == kRxSlow)) {
+        (kind == kRxRequest || kind == kRxFast || kind == kRxSlow || kind == kRxFastBatch)) {
         if (stats_on_) rx_[kind].Add();
         return;
     }
     if (hot && order_thread_on_) {
-        // Parse here (receive thread), process on the ordering thread.
+        // Parse here (receive thread), process on the transaction's lane thread.
         std::unique_ptr<google::protobuf::Message> parsed = ParseHot(kind, data);
+        const bool timed = stats_on_;
         if (parsed && kind == kRxRequest) {
-            // Build the entry here (OWD sample, txn moved out of the parsed message);
-            // the ordering thread only dedups and submits it.
+            // Build the entry here (txn moved out of the parsed message); the lane thread
+            // samples OWD, dedups and submits it.
             auto *req = static_cast<proto::ClientRequest *>(parsed.get());
             auto entry = std::make_shared<TxnEntry>(BuildRequestEntry(
                 std::shared_ptr<TransportAddress>(remote.clone()),
                 std::move(*req->mutable_txn())));
-            const bool timed = stats_on_;
-            order_q_.enqueue([this, entry, timed]() {
+            if (timed) {
+                entry->arrival_us = t0;   // receive-thread time; SubmitRequestEntry overwrites
+                if (entry->txn.has_send_time() && t0 > entry->txn.send_time()) {
+                    owd_net_hist_.Observe(t0 - entry->txn.send_time());
+                }
+            }
+            PostToLane(orderer_->LaneOf(entry->Key()), [this, entry, timed]() {
                 const uint64_t h0 = timed ? WallClockMicros() : 0;
                 ProcessRequestEntry(std::move(*entry));
                 if (timed) rx_us_[kRxRequest].Add(WallClockMicros() - h0);
             });
+        } else if (parsed && kind == kRxBg) {
+            // A batch normally belongs to one lane (the sender batches per lane with the
+            // same LaneOf); split it per lane otherwise, keeping each lane's entry order.
+            auto *b = static_cast<proto::BgBatch *>(parsed.get());
+            const size_t nl = lanes_.size();
+            std::vector<std::shared_ptr<proto::BgBatch>> per(nl);
+            auto slot = [&](uint64_t c, uint64_t r) -> proto::BgBatch & {
+                auto &p = per[orderer_->LaneOf(TxnId{c, r})];
+                if (!p) { p = std::make_shared<proto::BgBatch>(); p->set_sender_id(b->sender_id()); }
+                return *p;
+            };
+            if (nl == 1) {
+                per[0] = std::shared_ptr<proto::BgBatch>(
+                    static_cast<proto::BgBatch *>(parsed.release()));
+            } else {
+                for (auto &m : *b->mutable_prepares()) *slot(m.client_id(), m.request_id()).add_prepares() = std::move(m);
+                for (auto &m : *b->mutable_prepare_replies()) *slot(m.client_id(), m.request_id()).add_prepare_replies() = std::move(m);
+                for (auto &m : *b->mutable_commits()) *slot(m.client_id(), m.request_id()).add_commits() = std::move(m);
+                for (auto &m : *b->mutable_ts_agrees()) *slot(m.client_id(), m.request_id()).add_ts_agrees() = std::move(m);
+            }
+            for (size_t i = 0; i < nl; ++i) {
+                if (!per[i]) continue;
+                std::shared_ptr<proto::BgBatch> part = std::move(per[i]);
+                PostToLane(i, [this, part, timed]() {
+                    const uint64_t h0 = timed ? WallClockMicros() : 0;
+                    HandleBgBatch(*part);
+                    if (timed) rx_us_[kRxBg].Add(WallClockMicros() - h0);
+                });
+            }
+        } else if (parsed && kind == kRxFastBatch) {
+            // One client's FastCommits: route each to its txn's lane (split per lane,
+            // keeping each lane's order).
+            auto *b = static_cast<proto::FastCommitBatch *>(parsed.get());
+            const size_t nl = lanes_.size();
+            std::vector<std::shared_ptr<proto::FastCommitBatch>> per(nl);
+            if (nl == 1) {
+                per[0] = std::shared_ptr<proto::FastCommitBatch>(
+                    static_cast<proto::FastCommitBatch *>(parsed.release()));
+            } else {
+                for (auto &m : *b->mutable_commits()) {
+                    auto &p = per[orderer_->LaneOf(TxnId{m.client_id(), m.request_id()})];
+                    if (!p) p = std::make_shared<proto::FastCommitBatch>();
+                    *p->add_commits() = std::move(m);
+                }
+            }
+            std::shared_ptr<TransportAddress> addr(remote.clone());
+            for (size_t i = 0; i < nl; ++i) {
+                if (!per[i]) continue;
+                std::shared_ptr<proto::FastCommitBatch> part = std::move(per[i]);
+                PostToLane(i, [this, part, addr, timed]() {
+                    const uint64_t h0 = timed ? WallClockMicros() : 0;
+                    ProcessHot(kRxFastBatch, *addr, *part);
+                    if (timed) rx_us_[kRxFastBatch].Add(WallClockMicros() - h0);
+                });
+            }
         } else if (parsed) {
+            TxnId id;
+            const size_t lane = HotTxnId(kind, *parsed, &id) ? orderer_->LaneOf(id) : 0;
             std::shared_ptr<google::protobuf::Message> msg(std::move(parsed));
             std::shared_ptr<TransportAddress> addr(remote.clone());
-            const bool timed = stats_on_;
-            order_q_.enqueue([this, kind, msg, addr, timed]() {
+            PostToLane(lane, [this, kind, msg, addr, timed]() {
                 const uint64_t h0 = timed ? WallClockMicros() : 0;
                 ProcessHot(kind, *addr, *msg);
                 if (timed) rx_us_[kind].Add(WallClockMicros() - h0);
@@ -462,10 +544,47 @@ DynaReplica::ParseHot(RxType kind, std::string_view data)
     case kRxFetch:     m = std::make_unique<proto::FetchRequest>(); break;
     case kRxFetchRep:  m = std::make_unique<proto::FetchReply>(); break;
     case kRxBg:        m = std::make_unique<proto::BgBatch>(); break;
+    case kRxFastBatch: m = std::make_unique<proto::FastCommitBatch>(); break;
     default:           return nullptr;
     }
     if (!m->ParseFromArray(data.data(), static_cast<int>(data.size()))) return nullptr;
     return m;
+}
+
+bool
+DynaReplica::HotTxnId(RxType kind, const google::protobuf::Message &msg, TxnId *id)
+{
+    switch (kind) {
+#define DYNA_TXNID_OF(K, T) \
+    case K: { const auto &m = static_cast<const T &>(msg); \
+              *id = TxnId{m.client_id(), m.request_id()}; return true; }
+    DYNA_TXNID_OF(kRxFast, proto::FastCommit)
+    DYNA_TXNID_OF(kRxSlow, proto::SlowCommit)
+    DYNA_TXNID_OF(kRxPrep, proto::ReplicatePrepare)
+    DYNA_TXNID_OF(kRxPrepReply, proto::ReplicatePrepareReply)
+    DYNA_TXNID_OF(kRxCommit, proto::ReplicateCommit)
+    DYNA_TXNID_OF(kRxTsAgree, proto::TsAgree)
+    DYNA_TXNID_OF(kRxFetch, proto::FetchRequest)
+#undef DYNA_TXNID_OF
+    case kRxRequest: {
+        const auto &t = static_cast<const proto::ClientRequest &>(msg).txn();
+        *id = TxnId{t.client_id(), t.request_id()};
+        return true;
+    }
+    case kRxFetchRep: {
+        const auto &t = static_cast<const proto::FetchReply &>(msg).txn();
+        *id = TxnId{t.client_id(), t.request_id()};
+        return true;
+    }
+    default:
+        return false;
+    }
+}
+
+void
+DynaReplica::PostToLane(size_t lane, std::function<void()> fn)
+{
+    lanes_[lane]->q.enqueue(std::move(fn));
 }
 
 void
@@ -522,6 +641,18 @@ DynaReplica::ProcessHot(RxType kind, const TransportAddress &remote,
                      /*slow=*/false);
         return;
     }
+    case kRxFastBatch: {
+        bool told = false;   // one ViewInfo per batch is enough
+        for (const auto &m : static_cast<const proto::FastCommitBatch &>(msg).commits()) {
+            if (m.view_id() != view) {
+                if (m.view_id() < view && !told) { SendViewInfo(remote); told = true; }
+                continue;
+            }
+            HandleCommit(remote, TxnId{m.client_id(), m.request_id()}, m.agreed_t(),
+                         /*slow=*/false);
+        }
+        return;
+    }
     case kRxSlow: {
         const auto &m = static_cast<const proto::SlowCommit &>(msg);
         if (m.view_id() != view) {
@@ -568,29 +699,60 @@ DynaReplica::ProcessHot(RxType kind, const TransportAddress &remote,
 // --- ordering thread (DYNA_ORDER_THREAD) ---------------------------------------------
 
 void
-DynaReplica::SendLoop()
+DynaReplica::SendLoop(Sender *snd, size_t idx)
 {
-    pthread_setname_np(pthread_self(), "dyna-send");
-    PinSelfFromEnv("DYNA_PIN_SEND");
+    char name[16];
+    snprintf(name, sizeof(name), "dyna-send%zu", idx);
+    pthread_setname_np(pthread_self(), name);
+    PinSelfFromEnv("DYNA_PIN_SEND", idx);
     constexpr size_t kBulk = 64;
     std::function<void()> batch[kBulk];
     ReplyJob jobs[kBulk];
+    // DYNA_REPLY_COMBINE (default 1): replies already queued for the same client leave
+    // as one SpecReplyBatch. Nothing waits for a batch to fill: batches form only when
+    // the sender has a backlog, i.e. exactly when per-packet cost matters.
+    const bool combine = DeadlineConfig::EnvU64("DYNA_REPLY_COMBINE", 1) != 0;
     proto::SpecReply r;
     r.set_server_id(static_cast<uint32_t>(replicaIdx));
+    proto::SpecReplyBatch rbatch;
+    bool grouped[kBulk];
+    auto fill = [&](proto::SpecReply &out, const ReplyJob &j) {
+        out.set_server_id(static_cast<uint32_t>(replicaIdx));
+        out.set_client_id(j.client_id);
+        out.set_request_id(j.request_id);
+        out.set_view_id(j.view_id);
+        out.set_t(j.t);
+        out.set_is_leader(j.is_leader);
+        out.set_owd_estimate(j.owd);
+    };
     while (send_running_.load(std::memory_order_relaxed)) {
-        const size_t nr = reply_q_.try_dequeue_bulk(jobs, kBulk);
+        const uint64_t s0 = stats_on_ ? WallClockMicros() : 0;
+        const size_t nr = snd->replies.try_dequeue_bulk(jobs, kBulk);
+        for (size_t i = 0; i < nr; ++i) grouped[i] = false;
         for (size_t i = 0; i < nr; ++i) {
+            if (grouped[i]) continue;
             ReplyJob &j = jobs[i];
-            r.set_client_id(j.client_id);
-            r.set_request_id(j.request_id);
-            r.set_view_id(j.view_id);
-            r.set_t(j.t);
-            r.set_is_leader(j.is_leader);
-            r.set_owd_estimate(j.owd);
-            transport->SendMessage(this, *j.addr, r);
-            j.addr.reset();
+            size_t same = 0;
+            if (combine) {
+                for (size_t k = i + 1; k < nr; ++k) same += (jobs[k].client_id == j.client_id);
+            }
+            if (same == 0) {
+                fill(r, j);
+                transport->SendMessage(this, *j.addr, r);
+                if (stats_on_) reply_pkts_.Add();
+                continue;
+            }
+            rbatch.Clear();
+            for (size_t k = i; k < nr; ++k) {
+                if (jobs[k].client_id != j.client_id) continue;
+                fill(*rbatch.add_replies(), jobs[k]);
+                grouped[k] = true;
+            }
+            transport->SendMessage(this, *j.addr, rbatch);
+            if (stats_on_) reply_pkts_.Add();
         }
-        const size_t n = send_q_.try_dequeue_bulk(batch, kBulk);
+        for (size_t i = 0; i < nr; ++i) jobs[i].addr.reset();
+        const size_t n = snd->q.try_dequeue_bulk(batch, kBulk);
         for (size_t i = 0; i < n; ++i) {
             batch[i]();
             batch[i] = nullptr;
@@ -599,28 +761,34 @@ DynaReplica::SendLoop()
 #if defined(__x86_64__) || defined(__i386__)
             _mm_pause();
 #endif
+        } else if (stats_on_) {
+            snd->busy_us.Add(WallClockMicros() - s0);
         }
     }
 }
 
 void
-DynaReplica::OrderingLoop()
+DynaReplica::OrderingLoop(Lane *lane)
 {
-    pthread_setname_np(pthread_self(), "dyna-order");
-    PinSelfFromEnv("DYNA_PIN_ORDER");
+    char name[16];
+    snprintf(name, sizeof(name), "dyna-order%zu", lane->idx);
+    pthread_setname_np(pthread_self(), name);
+    PinSelfFromEnv("DYNA_PIN_ORDER", lane->idx);
     constexpr size_t kBulk = 64;
     std::function<void()> batch[kBulk];
     uint64_t last_release_us = 0;
     while (order_running_.load(std::memory_order_relaxed)) {
-        const size_t n = order_q_.try_dequeue_bulk(batch, kBulk);
+        const size_t n = lane->q.try_dequeue_bulk(batch, kBulk);
         const uint64_t t0 = (stats_on_ && n) ? WallClockMicros() : 0;
         if (n > 0) {
             // Same exclusion as the receive threads' hot path: VR / recovery work takes
             // state_lock_ exclusively, so it never interleaves with a hot handler.
             std::shared_lock<RwLock> g(state_lock_);
             for (size_t i = 0; i < n; ++i) {
+                const uint64_t h0 = stats_on_ ? WallClockMicros() : 0;
                 batch[i]();
                 batch[i] = nullptr;
+                if (stats_on_) lane->hmax.Observe(WallClockMicros() - h0);
             }
         }
         // Releases run here too (the orderer has no release thread in this mode). The
@@ -628,14 +796,21 @@ DynaReplica::OrderingLoop()
         // that entered without SubmitTxn (none today) and resumes after a pause.
         const uint64_t now = WallClockMicros();
         if (!orderer_->paused() &&
-            (now >= orderer_->next_due_hint() || now >= last_release_us + 100)) {
+            (now >= orderer_->next_due_hint(lane->idx) || now >= last_release_us + 100)) {
             last_release_us = now;
-            const size_t released = orderer_->ReleaseDue();
-            if (stats_on_ && released) order_busy_us_.Add(WallClockMicros() - now);
+            const size_t released = orderer_->ReleaseDue(lane->idx);
+            if (stats_on_ && released) {
+                lane->busy_us.Add(WallClockMicros() - now);
+                lane->hmax.Observe(WallClockMicros() - now);
+                lane->released.Add(released);
+            }
         }
         if (stats_on_) {
-            if (n) order_busy_us_.Add(WallClockMicros() - t0);
-            order_qmax_.Observe(order_q_.size_approx());
+            if (n) {
+                lane->busy_us.Add(WallClockMicros() - t0);
+                lane->msgs.Add(n);
+            }
+            lane->qmax.Observe(lane->q.size_approx());
         }
         if (n == 0) {
 #if defined(__x86_64__) || defined(__i386__)
@@ -705,7 +880,45 @@ DynaReplica::HandleTsAgree(const proto::TsAgree &m)
     ServerOrderer::TsRecordResult r =
         orderer_->RecordTsProposal(id, m.sender_id(), m.proposed_t(), m.reply());
     if (r.has_action) SendTsAgree(r.action);
-    if (r.transitioned) ReplicateNowIfPrimary(id);   // COMMITTING → start replication now
+    if (r.transitioned) {
+        LeaderSyncDone(r.entry);
+        ReplicateNowIfPrimary(id);   // COMMITTING → start replication now
+    }
+}
+
+void
+DynaReplica::RunTsAgreement()
+{
+    std::vector<ServerOrderer::TsAgreeAction> actions;
+    std::vector<TxnEntry> committed;
+    orderer_->DriveTsAgreement(ts_timeout_us_, &actions, &committed);
+    for (const auto &a : actions) SendTsAgree(a);
+    for (const TxnEntry &e : committed) {
+        LeaderSyncDone(e);
+        ReplicateNowIfPrimary(e.Key());
+    }
+}
+
+void
+DynaReplica::LeaderSyncDone(const TxnEntry &e)
+{
+    if (e.txn.type() != proto::WRITE) return;
+    std::shared_ptr<TransportAddress> addr = e.client_addr;
+    // The txn's own lane first; any lane that heard from this client otherwise.
+    for (size_t k = 0; !addr && k < lanes_.size(); ++k) {
+        Lane &l = *lanes_[(orderer_->LaneOf(e.Key()) + k) % lanes_.size()];
+        std::lock_guard<HybridMutex> lk(l.dedup_mu);
+        auto it = l.client_addrs.find(e.txn.client_id());
+        if (it != l.client_addrs.end()) addr = it->second;
+    }
+    if (!addr) return;   // never heard from this client: its own resend reaches the cache
+    if (e.txn.view_id() < viewId_) SendViewInfo(*addr);
+    ServerOrderer::CommitBrief c;
+    c.t = e.t;
+    c.status = e.status;
+    c.is_leader = e.is_leader_for_this;
+    SendCommitReply(*addr, e.Key(), c);
+    if (stats_on_) sync_reply_tx_.Add();
 }
 
 void
@@ -717,10 +930,7 @@ DynaReplica::TsAgreementTick()
         return;
     }
     const uint64_t scan_t0 = stats_on_ ? WallClockMicros() : 0;
-    std::vector<ServerOrderer::TsAgreeAction> actions;
-    std::vector<TxnEntry> committed;
-    orderer_->DriveTsAgreement(ts_timeout_us_, &actions, &committed);
-    for (const auto &a : actions) SendTsAgree(a);
+    RunTsAgreement();
 
     // Replication (spec §3.6): drive COMMITTING → COMMITTED for txns we lead. The first
     // prepare normally goes out immediately (ReplicateNowIfPrimary); this scan covers
@@ -767,13 +977,14 @@ DynaReplica::TsAgreementTick()
 void
 DynaReplica::BgPrepare(const proto::ReplicatePrepare &m)
 {
-    if (!bg_) {
+    if (!bg_on_) {
         Tx()->SendMessageToAll(this, m);   // (the self copy is ignored on receipt)
         return;
     }
+    Lane &l = LaneFor(TxnId{m.client_id(), m.request_id()});
     for (int r = 0; r < config.n; ++r) {
-        if (r != replicaIdx && bg_->AddPrepare(static_cast<uint32_t>(r), m)) {
-            FlushBgTo(static_cast<uint32_t>(r));
+        if (r != replicaIdx && l.bg->AddPrepare(static_cast<uint32_t>(r), m)) {
+            FlushBgTo(l.idx, static_cast<uint32_t>(r));
         }
     }
 }
@@ -782,48 +993,53 @@ void
 DynaReplica::BgPrepareReply(uint32_t to, const proto::ReplicatePrepareReply &m,
                             const TransportAddress *remote)
 {
-    if (!bg_) {
+    if (!bg_on_) {
         if (remote) Tx()->SendMessage(this, *remote, m);
         else Tx()->SendMessageToReplica(this, static_cast<int>(to), m);
         return;
     }
     if (static_cast<int>(to) == replicaIdx) return;
-    if (bg_->AddPrepareReply(to, m)) FlushBgTo(to);
+    Lane &l = LaneFor(TxnId{m.client_id(), m.request_id()});
+    if (l.bg->AddPrepareReply(to, m)) FlushBgTo(l.idx, to);
 }
 
 void
 DynaReplica::BgCommit(int32_t to, const proto::ReplicateCommit &m)
 {
-    if (!bg_) {
+    if (!bg_on_) {
         if (to == kBgAll) Tx()->SendMessageToAll(this, m);
         else Tx()->SendMessageToReplica(this, to, m);
         return;
     }
+    Lane &l = LaneFor(TxnId{m.client_id(), m.request_id()});
     for (int r = 0; r < config.n; ++r) {
         if (r == replicaIdx || (to != kBgAll && r != to)) continue;
-        if (bg_->AddCommit(static_cast<uint32_t>(r), m)) FlushBgTo(static_cast<uint32_t>(r));
+        if (l.bg->AddCommit(static_cast<uint32_t>(r), m)) FlushBgTo(l.idx, static_cast<uint32_t>(r));
     }
 }
 
 void
 DynaReplica::BgTsAgree(uint32_t to, const proto::TsAgree &m)
 {
-    if (!bg_) {
+    if (!bg_on_) {
         Tx()->SendMessageToReplica(this, static_cast<int>(to), m);
         return;
     }
     if (static_cast<int>(to) == replicaIdx) return;
-    if (bg_->AddTsAgree(to, m)) FlushBgTo(to);
+    Lane &l = LaneFor(TxnId{m.client_id(), m.request_id()});
+    if (l.bg->AddTsAgree(to, m)) FlushBgTo(l.idx, to);
 }
 
 void
-DynaReplica::FlushBgTo(uint32_t to)
+DynaReplica::FlushBgTo(size_t lane, uint32_t to)
 {
+    Lane &l = *lanes_[lane];
     auto b = std::make_shared<proto::BgBatch>();
     size_t entries = 0;
-    if (!bg_ || !bg_->Take(to, b.get(), &entries)) return;
-    if (send_running_.load(std::memory_order_relaxed)) {
-        send_q_.enqueue([this, to, b, entries]() { SendBgBatch(to, *b, entries); });
+    if (!l.bg || !l.bg->Take(to, b.get(), &entries)) return;
+    Sender *snd = SenderFor(l);
+    if (snd != nullptr && send_running_.load(std::memory_order_relaxed)) {
+        snd->q.enqueue([this, to, b, entries]() { SendBgBatch(to, *b, entries); });
     } else {
         SendBgBatch(to, *b, entries);
     }
@@ -840,11 +1056,13 @@ DynaReplica::SendBgBatch(uint32_t to, proto::BgBatch &b, size_t entries)
 void
 DynaReplica::BgFlushTick()
 {
-    for (auto &kv : bg_->TakeAll()) {
-        proto::BgBatch &b = kv.second;
-        SendBgBatch(kv.first, b, static_cast<size_t>(b.prepares_size() +
-                                                      b.prepare_replies_size() +
-                                                      b.commits_size() + b.ts_agrees_size()));
+    for (auto &l : lanes_) {
+        for (auto &kv : l->bg->TakeAll()) {
+            proto::BgBatch &b = kv.second;
+            SendBgBatch(kv.first, b, static_cast<size_t>(b.prepares_size() +
+                                                          b.prepare_replies_size() +
+                                                          b.commits_size() + b.ts_agrees_size()));
+        }
     }
     transport->TimerUS(bg_flush_us_, [this]() { BgFlushTick(); });   // re-arm
 }
@@ -944,13 +1162,19 @@ DynaReplica::SubmitRequestEntry(TxnEntry &&e)
     // where the orderer judges lateness — so the learned bound includes any queueing on
     // the way to the ordering thread. (Sampling on the receive thread instead left ~36%
     // of arrivals late at 35k ops/s.)
+    Lane &L = LaneFor(id);
     const uint64_t arrival = WallClockMicros();
+    if (stats_on_ && e.arrival_us != 0 && arrival >= e.arrival_us) {
+        owd_queue_hist_.Observe(arrival - e.arrival_us);
+    }
     if (e.txn.has_send_time()) {
-        std::lock_guard<HybridMutex> lk(owd_mu_);
+        std::lock_guard<HybridMutex> lk(L.owd_mu);
         if (arrival > e.txn.send_time()) {
-            owd_.sample(e.txn.client_id(), arrival - e.txn.send_time());
+            L.owd->sample(e.txn.client_id(), arrival - e.txn.send_time());
+            if (stats_on_) owd_hist_.Observe(arrival - e.txn.send_time());
         }
-        e.owd_estimate_us = owd_.estimate_us(e.txn.client_id());
+        e.owd_estimate_us = L.owd->estimate_us(e.txn.client_id());
+        if (stats_on_) owd_est_hist_.Observe(e.owd_estimate_us);
     }
     e.arrival_us = arrival;
     if (debug_) {
@@ -963,9 +1187,10 @@ DynaReplica::SubmitRequestEntry(TxnEntry &&e)
     // this: a read retry is a new attempt (fresh request_id, larger t), and a cached
     // reply would carry the old attempt's t.
     if (e.txn.type() != proto::READ) {
-        std::lock_guard<HybridMutex> lk(dedup_mu_);
-        auto cit = reply_cache_.find(id);
-        if (cit != reply_cache_.end()) {
+        std::lock_guard<HybridMutex> lk(L.dedup_mu);
+        if (e.client_addr) L.client_addrs.try_emplace(id.clientid, e.client_addr);
+        auto cit = L.reply_cache.find(id);
+        if (cit != L.reply_cache.end()) {
             proto::SpecReply cached;
             cached.set_client_id(id.clientid);
             cached.set_request_id(id.clientreqid);
@@ -989,8 +1214,8 @@ DynaReplica::SubmitRequestEntry(TxnEntry &&e)
             if (e.client_addr) Tx()->SendMessage(this, *e.client_addr, cached);
             return;
         }
-        if (inflight_.find(id) != inflight_.end()) return;   // in flight -> drop retry
-        inflight_.insert(id);
+        if (L.inflight.find(id) != L.inflight.end()) return;   // in flight -> drop retry
+        L.inflight.insert(id);
     }
     // Poke the orderer's release thread only if it has one (the ordering thread polls).
     orderer_->SubmitTxn(std::move(e), /*poke=*/!order_thread_on_);
@@ -1025,8 +1250,10 @@ DynaReplica::OnSpecReply(const TxnEntry &e)
                (unsigned long)e.t, e.is_leader_for_this ? 1 : 0, e.client_addr ? 1 : 0);
     }
     const bool is_read = (e.txn.type() == proto::READ);
+    Lane &L = LaneFor(e.Key());
+    Sender *snd = SenderFor(L);
     if (e.client_addr) {
-        if (!is_read && send_running_.load(std::memory_order_relaxed)) {
+        if (!is_read && snd != nullptr && send_running_.load(std::memory_order_relaxed)) {
             // Writes carry no results: hand the sender a plain struct to build + send.
             ReplyJob j;
             j.addr = e.client_addr;
@@ -1036,7 +1263,7 @@ DynaReplica::OnSpecReply(const TxnEntry &e)
             j.t = e.t;
             j.owd = e.owd_estimate_us;
             j.is_leader = e.is_leader_for_this;
-            reply_q_.enqueue(std::move(j));
+            snd->replies.enqueue(std::move(j));
         } else {
             Tx()->SendMessage(this, *e.client_addr, BuildSpecReply(e));
         }
@@ -1044,9 +1271,9 @@ DynaReplica::OnSpecReply(const TxnEntry &e)
     if (stats_on_) spec_tx_.Add();
     if (is_read) return;   // reads aren't deduped (see SubmitRequestEntry)
     // Cache for at-most-once AFTER the send (off the release critical path).
-    std::lock_guard<HybridMutex> lk(dedup_mu_);
-    reply_cache_[e.Key()] = CachedSpec{e.t, e.owd_estimate_us};
-    inflight_.erase(e.Key());
+    std::lock_guard<HybridMutex> lk(L.dedup_mu);
+    L.reply_cache[e.Key()] = CachedSpec{e.t, e.owd_estimate_us};
+    L.inflight.erase(e.Key());
 }
 
 void
@@ -1062,8 +1289,9 @@ DynaReplica::FinishCommit(const TxnId &id, const ServerOrderer::CommitBrief &out
                           const TransportAddress *client)
 {
     {
-        std::lock_guard<HybridMutex> lk(dedup_mu_);
-        inflight_.erase(id);
+        Lane &L = LaneFor(id);
+        std::lock_guard<HybridMutex> lk(L.dedup_mu);
+        L.inflight.erase(id);
     }
     // SlowCommit: the client is re-checking the quorum at agreedT (or, if we already
     // executed the txn, at its final t).
@@ -1181,36 +1409,60 @@ DynaReplica::MaybeDumpStats(uint64_t now_us)
     }
     // Average handler µs per message (x10 for one decimal) for the hot types.
     auto per = [&](int k) { return (unsigned long)(rx[k] ? rxus[k] * 10 / rx[k] : 0); };
+    // Per-lane ordering-thread busy% and the max queue depth over lanes.
+    std::string lane_busy;
+    uint64_t qmax = 0;
+    for (auto &l : lanes_) {
+        if (!lane_busy.empty()) lane_busy += ",";
+        const uint64_t lq = l->qmax.Take();
+        lane_busy += std::to_string(l->busy_us.Take() * 100 / elapsed) + "%/" +
+                     std::to_string(l->msgs.Take()) + "m/" + std::to_string(l->released.Take()) +
+                     "r/q" + std::to_string(lq) + "/h" + std::to_string(l->hmax.Take());
+        qmax = std::max<uint64_t>(qmax, lq);
+    }
+    std::string send_busy;
+    for (auto &snd : senders_) {
+        if (!send_busy.empty()) send_busy += ",";
+        send_busy += std::to_string(snd->busy_us.Take() * 100 / elapsed);
+    }
+    Notice("r%d owd p50/p95/p99 us: owd=%s net=%s queue=%s estimate=%s", replicaIdx,
+           owd_hist_.Take().c_str(), owd_net_hist_.Take().c_str(),
+           owd_queue_hist_.Take().c_str(), owd_est_hist_.Take().c_str());
     Notice("r%d cost: handlerUs/msg x10 [req=%lu fast=%lu slow=%lu bg=%lu fetch=%lu] "
-           "orderBusy=%lu%% orderQmax=%lu "
+           "lanes[busy/msgs/released/qmax/hmaxUs]=[%s] orderQmax=%lu sendBusy%%=[%s] "
            "muHoldUs [submit=%s commit=%s repl=%s release=%s]",
            replicaIdx, per(kRxRequest), per(kRxFast), per(kRxSlow), per(kRxBg),
-           per(kRxFetch), (unsigned long)(order_busy_us_.Take() * 100 / elapsed),
-           (unsigned long)order_qmax_.Take(), FmtDist(ostats_.hold_submit_us).c_str(),
+           per(kRxFetch), lane_busy.c_str(),
+           (unsigned long)qmax, send_busy.c_str(), FmtDist(ostats_.hold_submit_us).c_str(),
            FmtDist(ostats_.hold_commit_us).c_str(), FmtDist(ostats_.hold_repl_us).c_str(),
            FmtDist(ostats_.hold_release_us).c_str());
     const uint64_t busy = busy_us_.Take();
     // Format: avg/max/nCOUNT for distributions (µs unless noted); counts are per interval.
     // busy% sums all receive threads (can exceed 100 with DYNA_RX_THREADS > 1).
-    Notice("r%d stats: busy=%lu%% hmax=%luus rx[req=%lu fast=%lu slow=%lu prep=%lu "
-           "prepR=%lu commit=%lu ts=%lu fetch=%lu hb=%lu other=%lu] specTx=%lu "
+    Notice("r%d stats: busy=%lu%% hmax=%luus rx[req=%lu fast=%lu fastB=%lu slow=%lu prep=%lu "
+           "prepR=%lu commit=%lu ts=%lu fetch=%lu hb=%lu other=%lu] specTx=%lu replyPkts=%lu syncTx=%lu "
            "arrive[on=%lu lateL=%lu lateF=%lu dup=%lu] slack=%s late=%s relLag=%s "
-           "execLock=%s execBatch=%s scan=%s bgTx=%s bgRx=%s rxBg=%lu submitWait=%s "
+           "execLock=%s execBatch=%s execPass=%s execSort=%s execApply=%s scan=%s bgTx=%s bgRx=%s rxBg=%lu submitWait=%s "
            "muWait=%s dedupWait=%s "
            "pendingWait=%s owdWait=%s hbGap=%lu tickGap=%lu "
            "size[spec=%zu early=%zu late=%zu executed=%zu]",
            replicaIdx, (unsigned long)(busy * 100 / elapsed),
            (unsigned long)handler_max_us_.Take(), (unsigned long)rx[kRxRequest],
-           (unsigned long)rx[kRxFast], (unsigned long)rx[kRxSlow], (unsigned long)rx[kRxPrep],
+           (unsigned long)rx[kRxFast], (unsigned long)rx[kRxFastBatch],
+           (unsigned long)rx[kRxSlow], (unsigned long)rx[kRxPrep],
            (unsigned long)rx[kRxPrepReply], (unsigned long)rx[kRxCommit],
            (unsigned long)rx[kRxTsAgree], (unsigned long)(rx[kRxFetch] + rx[kRxFetchRep]),
            (unsigned long)rx[kRxHeartbeat],
            (unsigned long)rx[kRxOther], (unsigned long)spec_tx_.Take(),
+           (unsigned long)reply_pkts_.Take(),
+           (unsigned long)sync_reply_tx_.Take(),
            (unsigned long)ostats_.on_time.Take(), (unsigned long)ostats_.late_leader.Take(),
            (unsigned long)ostats_.late_follower.Take(), (unsigned long)ostats_.duplicate.Take(),
            FmtDist(ostats_.slack_us).c_str(), FmtDist(ostats_.lateness_us).c_str(),
            FmtDist(ostats_.release_lag_us).c_str(), FmtDist(ostats_.exec_locked_us).c_str(),
-           FmtDist(ostats_.exec_batch).c_str(), FmtDist(scan_us_).c_str(),
+           FmtDist(ostats_.exec_batch).c_str(), FmtDist(ostats_.exec_pass_us).c_str(),
+           FmtDist(ostats_.exec_sort_us).c_str(), FmtDist(ostats_.exec_apply_us).c_str(),
+           FmtDist(scan_us_).c_str(),
            FmtDist(bg_tx_entries_).c_str(), FmtDist(bg_rx_entries_).c_str(),
            (unsigned long)rx[kRxBg],
            FmtDist(ostats_.submit_wait_us).c_str(), FmtDist(ostats_.mu_wait_us).c_str(),
@@ -1337,8 +1589,10 @@ DynaReplica::InstallNewView()
     {
         // Resends in the new view must reach the orderer (which dedups by id itself):
         // an id stuck "in flight" here (e.g. late-buffered) would otherwise be dropped.
-        std::lock_guard<HybridMutex> lk(dedup_mu_);
-        inflight_.clear();
+        for (auto &l : lanes_) {
+            std::lock_guard<HybridMutex> lk(l->dedup_mu);
+            l->inflight.clear();
+        }
     }
     {
         std::lock_guard<HybridMutex> lk(pending_mu_);
@@ -1347,10 +1601,14 @@ DynaReplica::InstallNewView()
     catchup_ = CatchUp();   // a joiner is a member from here on
     PersistVrState(in.view, in.alive);
     Notice("r%d view %lu installed: alive=%#lx Ms=%zu txns_installed=%zu kvs_applied=%zu "
-           "leftovers=%zu", replicaIdx, (unsigned long)in.view, (unsigned long)in.alive,
-           in.ms.size(), st.txns_installed, st.kvs_applied, st.leftovers);
+           "leftovers=%zu spec_to_sync=%zu", replicaIdx, (unsigned long)in.view,
+           (unsigned long)in.alive, in.ms.size(), st.txns_installed, st.kvs_applied,
+           st.leftovers, st.spec_to_sync);
     paused_ = false;
     orderer_->SetPaused(false);
+    // Leader-sync inherited SPECULATIVE txns now (single-leader ones complete locally) and
+    // tell their clients, instead of waiting out the SPEC age timeout.
+    RunTsAgreement();
 }
 
 void
@@ -1398,9 +1656,11 @@ DynaReplica::ResetForRejoin()
 {
     orderer_->Reset();
     {
-        std::lock_guard<HybridMutex> lk(dedup_mu_);
-        reply_cache_.clear();
-        inflight_.clear();
+        for (auto &l : lanes_) {
+            std::lock_guard<HybridMutex> lk(l->dedup_mu);
+            l->reply_cache.clear();
+            l->inflight.clear();
+        }
     }
     {
         std::lock_guard<HybridMutex> lk(pending_mu_);

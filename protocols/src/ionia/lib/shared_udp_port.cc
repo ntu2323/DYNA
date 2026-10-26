@@ -321,28 +321,38 @@ SharedUDPPort::SocketCallback(evutil_socket_t fd, short what, void *arg)
 void
 SharedUDPPort::OnReadable()
 {
-    constexpr int kBufSize = 65536;
-    char buf[kBufSize];
-    sockaddr_in sender{};
-    socklen_t sender_size = sizeof(sender);
-
     // Bounded batch: the event is level-triggered (EV_PERSIST), so leftover datagrams
     // re-fire on the next loop iteration. Draining until EAGAIN starved libevent's
     // timers under sustained load (DYNA heartbeats stalled >1 s -> false view changes).
+    // One recvmmsg for the whole batch instead of a recvfrom per datagram: at ~300k
+    // ops/s the per-packet syscalls saturated DYNA's receive threads.
     constexpr int kMaxBatch = 64;
+    constexpr size_t kBufSize = 65536;   // per datagram, as before
+    if (!rx_bufs_) rx_bufs_.reset(new char[kMaxBatch * kBufSize]);
+    mmsghdr msgs[kMaxBatch];
+    iovec iov[kMaxBatch];
+    sockaddr_in senders[kMaxBatch];
     for (int i = 0; i < kMaxBatch; ++i) {
-        sender_size = sizeof(sender);
-        const ssize_t sz = recvfrom(fd_, buf, kBufSize, 0,
-                                    reinterpret_cast<sockaddr *>(&sender),
-                                    &sender_size);
-        if (sz < 0) {
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                break;
-            }
-            PWarning("SharedUDPPort: recvfrom failed");
-            break;
+        iov[i].iov_base = rx_bufs_.get() + i * kBufSize;
+        iov[i].iov_len = kBufSize;
+        std::memset(&msgs[i].msg_hdr, 0, sizeof(msgs[i].msg_hdr));
+        msgs[i].msg_hdr.msg_name = &senders[i];
+        msgs[i].msg_hdr.msg_namelen = sizeof(senders[i]);
+        msgs[i].msg_hdr.msg_iov = &iov[i];
+        msgs[i].msg_hdr.msg_iovlen = 1;
+    }
+    const int n = recvmmsg(fd_, msgs, kMaxBatch, MSG_DONTWAIT, nullptr);
+    if (n < 0) {
+        if (errno != EAGAIN && errno != EWOULDBLOCK) PWarning("SharedUDPPort: recvmmsg failed");
+        return;
+    }
+    for (int i = 0; i < n; ++i) {
+        if (msgs[i].msg_hdr.msg_flags & MSG_TRUNC) {
+            Warning("SharedUDPPort: dropping truncated datagram");
+            continue;
         }
-        ProcessPacket(sender, buf, sz);
+        ProcessPacket(senders[i], static_cast<char *>(iov[i].iov_base),
+                      static_cast<ssize_t>(msgs[i].msg_len));
     }
 }
 

@@ -1,0 +1,21 @@
+{
+  "_note": "CloudLab Wisconsin c220g2 (experiment nathantu-321718, 2026-10-26): 6 identical nodes, 2x10-core E5-2660 v3, NIC enp6s0f0",
+  "hosts": {
+    "receiver1": "128.105.145.100",
+    "receiver2": "128.105.145.103",
+    "receiver3": "128.105.145.99",
+    "sender1": "128.105.145.101",
+    "sender2": "128.105.145.98",
+    "sender3": "128.105.145.87"
+  },
+  "receiver_internal": {
+    "receiver1": "10.10.1.1",
+    "receiver2": "10.10.1.3",
+    "receiver3": "10.10.1.4"
+  },
+  "sender_internal": {
+    "sender1": "10.10.1.2",
+    "sender2": "10.10.1.5",
+    "sender3": "10.10.1.6"
+  }
+}

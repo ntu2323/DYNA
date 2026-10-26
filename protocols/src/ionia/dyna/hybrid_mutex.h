@@ -11,6 +11,13 @@
 //   the average contended wait 15 -> 5 µs at 35k ops/s, replica busy 103% -> 73%,
 //   median 1.06 -> 0.55 ms). With a StatDist attached (DYNA_STATS) every
 //   contended acquisition records its wait (µs).
+//
+//   Priority acquisition (Announce + LockAnnounced / UnlockPriority): the orderer's
+//   executor takes every lane lock at once for a consistent snapshot. With plain
+//   (unfair) locking a busy lane thread keeps re-grabbing its lock while the executor,
+//   already holding the other lanes, waits — stalling every lane (at ~175k ops/s this
+//   is what turned arrivals late). An announced priority waiter makes ordinary lock()
+//   callers hold off until it is done, so it waits at most for the current holder.
 
 #ifndef _DYNA_HYBRID_MUTEX_H_
 #define _DYNA_HYBRID_MUTEX_H_
@@ -18,6 +25,7 @@
 #include "dyna/stats.h"
 #include "dyna/wall_clock.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <mutex>
 
@@ -41,18 +49,31 @@ inline uint32_t LockSpinFromEnv()
 class HybridMutex {
 public:
     void lock() {
-        if (m_.try_lock()) return;
+        if (prio_.load(std::memory_order_acquire) == 0 && m_.try_lock()) return;
         const uint64_t t0 = wait_stats_ ? WallClockMicros() : 0;
         const uint32_t spin = LockSpinFromEnv();
         for (uint32_t i = 0; i < spin; ++i) {
             CpuRelax();
+            if (prio_.load(std::memory_order_acquire) != 0) { i = 0; continue; }   // yield to it
             if (m_.try_lock()) { Record(t0); return; }
         }
+        while (prio_.load(std::memory_order_acquire) != 0) CpuRelax();
         m_.lock();
         Record(t0);
     }
     bool try_lock() { return m_.try_lock(); }
     void unlock() { m_.unlock(); }
+
+    // Priority acquisition: Announce first (ordinary lock() callers then hold off),
+    // LockAnnounced to take it, UnlockPriority to release and withdraw.
+    void Announce() { prio_.fetch_add(1, std::memory_order_acq_rel); }
+    void LockAnnounced() {
+        while (!m_.try_lock()) CpuRelax();   // only the current holder is ahead of us
+    }
+    void UnlockPriority() {
+        m_.unlock();
+        prio_.fetch_sub(1, std::memory_order_acq_rel);
+    }
 
     // Optional (DYNA_STATS): record contended waits. Set before concurrent use.
     void SetWaitStats(StatDist *d) { wait_stats_ = d; }
@@ -68,6 +89,7 @@ private:
     }
 
     std::mutex m_;
+    std::atomic<uint32_t> prio_{0};   // announced priority waiters (see above)
     StatDist *wait_stats_ = nullptr;
 };
 
