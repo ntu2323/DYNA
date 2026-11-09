@@ -34,8 +34,17 @@ Here we use the name Fast-Commit to distinguish from the Slow-Commit message des
 - If Client cannot satisfy (1) replies from the Partition Leaders of every involved partition corresponding to wSet, then it means either client multicast request is dropped or the leader’s reply is dropped, because if there is no drop, then the client should get a reply from the Partition Leader (Partition Leader will not throw T into late buffer even if it comes later). 
 If Client cannot satisfy (1), it triggers timeout and Client retries the request with the same timestamp. Each server will also resend the reply if they have previously replied to the same request (We maintain a memory-based hashMap separate from early and late buffers for each received txnIds and the sent replies: it can grow unboundly as we have more and more txns, but we can do an optimization: we save each txnId and their timestamps in the hashMap, and we set a threshold Tthresh, if a txn’s timestamp + Tthresh < current clock time, then we think this txn is too old, then we can safely delete it from the hashmap, later when a retry request comes, the server can just ignore it. It affects liveness but not safety )
 
-(Slow Path) If Client satisfies (1), but Partition Leaders have inconsistent timestamps or could not get sufficient replica responses, then Client aggregates timestamps by picking the Max among them as agreed timestamp, and multicast Slow-Commit message including the commonly-agreed timestamp to all servers. 
+(Slow Path) If Client satisfies (1), but Partition Leaders have inconsistent timestamps, then Client aggregates timestamps by picking the Max among them as agreed timestamp, and multicast Slow-Commit message including the commonly-agreed timestamp to all servers.
 In this case,  the application running atop the Client can move on, because it is not sure whether the txn is committed. It must wait until it receives enough Commit-Reply messages that satisfy the (1) (2) (3) conditions as Fast Path.
+
+(Deadline Upgrade) If Client satisfies (1), but cannot get sufficient replica responses (2), then T may be truly late, i.e. late at f+1 replicas. T must not be committed at T.t in that case, so Client upgrades T to a larger timestamp T.t'. The upgrade is gated through the primary Partition Leader (the involved Partition Leader with the smallest id), because the primary is the only server that marks T.status=Committed on its own (see Background Ordering):
+- Every upgrade carries an epoch number (the number of upgrades of T so far, starting from 0 for the first multicast). Every message about T (requests, Fast-Commit, Slow-Commit, timestamp agreement, Replicate-Prepare, Replicate-Commit, and their replies) carries T's epoch, and a server ignores messages of an older epoch than the one it holds for T.
+- Round 1: Client sends Upgrade <T.t', epoch+1> to the primary only. The primary handles it atomically:
+-- If T.status=Committed at the primary, it replies "committed" with T.t. Client backs off and considers T committed at T.t.
+-- If the primary already sent Replicate-Commit for T but T is not yet durable (see Committing → Committed), it holds the answer until T is Committed.
+-- Otherwise the primary promises: it moves T to T.t' with the new epoch (into its Early-Buffer if T.t' is still ahead of its clock), ignores every message of the old epoch from then on (in particular the old Replicate-PrepareReplies, so it can never commit T at T.t), and replies "ok".
+- Round 2: only after the primary's "ok" does Client multicast T with T.t' and the new epoch to all servers. Every server re-classifies T against T.t' (Early-Buffer / late), even if it holds T Speculative or Commiting at the old timestamp. A Committed T is never touched. Client then collects replies for T.t' as in the Fast Path / Slow Path.
+- Ghost: a server that moves T to a new epoch keeps T blocking conflicting txns from its old timestamp T.t until T becomes Committed (reads and writes with a larger timestamp than T.t wait). If the primary fails, recovery may still settle T at the old timestamp, and nothing ordered after T.t may have been served without T in the meantime.
 
 
 When S receives Commit Messages (i.e., Fast-Commit or Slow-Commit), it first checks its SpecLog, if the SpecLog does not contain this txn T, then it continues to check its late-buffer, if late-buffer does not contain T, then it fetches it from the other servers via 1 RPC, then put T into its SpecLog.
@@ -52,8 +61,11 @@ If T remains Speculative for sufficiently long time (i.e., a timeout), then the 
 It should also send a commit reply to the client in case it is waiting for a quorum check. 
 
 - (Committing → Committed) If T.status = Committing, then that means T already uses the commonly-agreed timestamp, but the Partition Leader is still unsure whether T has been sufficiently replicated to a majority with its commonly agreed timestamp.
-Partition Leader multicast Replicate-Prepare messages to all the other servers, and collects Replicate-PrepareReply, after it collects at least f PrepareReplies from the other replicas, it marks T.status=Committed. 
-After the Partition Leader marks T.status=Committed, it also multicast Replicate-Commit to all the other servers, so that the other servers will also mark T.status=Committed.
+The primary Partition Leader (the involved Partition Leader with the smallest id) multicast Replicate-Prepare messages to all the other servers, and collects Replicate-PrepareReply. A server only replies if it already holds T in its SpecLog at exactly the same timestamp and epoch (it never overwrites T because of a Replicate-Prepare).
+After it collects at least f PrepareReplies from the other replicas (so f+1 servers hold T at T.t), T's timestamp is decided: the primary will no longer accept a Deadline Upgrade for T, and it multicast Replicate-Commit to all the other servers.
+The other servers, after receiving Replicate-Commit, mark T.status=Committed and send Replicate-CommitReply to the primary.
+After the primary collects at least f Replicate-CommitReplies, it marks T.status=Committed. Only then may it execute T, serve reads ordered after T, or answer an Upgrade with "committed".
+Reason: if the primary marked T.status=Committed right after the PrepareReplies, it could execute T and serve a read that sees T, then fail before any other server learns that T is committed. Recovery would then only find T Speculative, and a Deadline Upgrade could move T past that read. With f+1 servers holding T Committed, every recovery quorum of f+1 servers contains one of them.
 
 
 Following the workflow above, every txn will finally become Committed, 
@@ -80,10 +92,11 @@ When T arrives at server S:
 For every T in the Early-Buffer,  S checks its clock time, when the local clock time passes T.t, S will release T, 
 
 - If S is a Partition Leader for any key in T.rset, after T is released, T will wait until all its dependent txns have become Committed and executed to disk, then T will execute disk-read to get results. After S sends replies for T, then T is erased from S’s memory. 
-- Else: S only serves as follower for T.rset, then after T is released, S immediately sends a Reply to client, including <viewId, clientID, requestID, timestamp, …> 
+- Else: S only serves as follower for T.rset, then after T is released, S immediately sends a Reply to client, including <viewId, clientID, requestID, timestamp, prevWrites, …>, where prevWrites lists, for every key in T.rSet, the id <clientID, requestID> of the latest write on that key that S holds in its SpecLog (or has executed) with a smaller OrderKey than T (none if there is no such write). The Partition Leader's reply likewise carries, for every key it reads, the id of the write whose value it returns.
 
 Client collects replies.
-- (Fast Path) If Client receives (1) replies from the Partition Leaders of every involved partition corresponding to rSet, and (2) at least f+1 replies from every involved partition (3) all these replies in (1) and (2) have consistent views and timestamps, then Client considers this request as committed and get the read results from the Partition Leader’s replies.
+- (Fast Path) If Client receives (1) replies from the Partition Leaders of every involved partition corresponding to rSet, and (2) at least f+1 replies from every involved partition (3) all these replies in (1) and (2) have consistent views and timestamps, and (4) every follower reply counted in (2) has prevWrites equal to the write ids in the Partition Leaders' replies, then Client considers this request as committed and get the read results from the Partition Leader’s replies. A follower reply whose prevWrites differ is not counted (Client waits for other replies, or retries as below).
+Reason for (4): suppose follower S holds a write W on a key of T, on time and ordered before T, while the Partition Leader released T before W arrived there and so returned a value without W. Normally the Partition Leader sees W late and moves it past T. But if the Partition Leader fails, recovery finds W Speculative at its timestamp on S and commits it there, before T: T's result missed W. With (4), S's reply names W and is not counted. A write committed before T is held on time by f+1 servers, so it meets T's f+1 replies: either the Partition Leader holds it (and returns it), or a follower that holds it before releasing T reports it (a follower that receives it after releasing T has it late, since its clock has passed T.t).
 - After a timeout, if Client cannot get sufficient replies to satisfy (1)(2)(3), maybe due to message drop, maybe due to late arrival. No matter what anomaly happens, Client retries T with a larger timestamp. Every time T’s timestamp will be current timestamp + one-way delay.  Every retry will use larger one-way delay value.  As Client continues retry, finally it will come to a case that the read-only txn arrives at sufficient number of replicas on time, so that Client can get the valid read results.
 
 Limitation: This design is simpler to understand, but theoretically, it leads to infinite number of retries for read-only txns.  But assuming clocks are well synchronized and one-way-delay are properly measured, read-only txns should also be able to be completed in 1-WAN-RTT.
@@ -143,6 +156,8 @@ PL maintains an in-memory buffer M,
 
 After PL contacts f+1 servers (including itself), it will 
 (1) Pick any key-values are "speculative", "commiting" or "committed" and put these key-values in M while keeping their respective titles
+If several servers report the same txn T, PL keeps one record for T: a "committed" record first (a primary that has sent Replicate-Commit reports T as "committed"), else the record with the highest epoch (see Deadline Upgrade), else "commiting" over "speculative", else the larger timestamp.
+When a server installs M, a "committed" record replaces any local state of T that is not yet committed, and a record with a higher epoch replaces a local state of T with a lower epoch (keeping a ghost of the old timestamp, see Deadline Upgrade).
  
 PL broadcast M to all the other servers. This broadcast request is Recovery-Prepare
  The other servers, after receiving M, send a reply to PL. This reply is Recovery-PrepareReply
@@ -161,7 +176,8 @@ which our replica is now the leader, we need to ensure they can be commited. So 
 So we need to be able to handle these 3 cases correctly. We do this using the leader sync functionality. Typicaly, 
 if a replica is a leader for some txn and does recieve a commit message after a certain amount of time it leader syncs. 
 (If the txn is single leader then that leader's txn info is the truth) after syncing we commit reply to the client in case
-it was waiting for that. Then the txn is set to "commiting" and continues as normal. 
+it was waiting for that. Then the txn is set to "commiting" and continues as normal.
+A client that restarts T in the new view and still lacks sufficient replica responses upgrades T through the new primary of T, with the same Round 1 / Round 2 rule as in the Deadline Upgrade. An inherited "committed" T is never upgraded.
 
 
 
