@@ -1,3 +1,21 @@
+# DYNA
+
+DYNA is a replication protocol for partitioned key-value stores that orders transactions by client-assigned deadlines. A deployment has N = 2f+1 servers. Each server is the Partition Leader for one partition and a follower for the other 2f.
+
+- Clients multicast each transaction with a deadline timestamp. Servers release transactions in deadline order once their clocks pass it.
+- **Fast path:** the transaction commits in one round trip when every involved Partition Leader and at least f+1 replicas reply on time with the same timestamp.
+- **Slow path:** otherwise the leaders agree on a timestamp (leader sync), and a primary leader makes the commit durable on a quorum before the transaction is executed.
+- **Truly late transactions:** these are moved to a new deadline through a primary-gated deadline upgrade.
+- **Leader failures:** these are handled by a view-change recovery protocol.
+
+## Repositories
+
+- **[DynaGo](https://github.com/ntu2323/DynaGo):** the current DYNA implementation, written in Go. Active development happens there.
+- **[Dyna_TLA](https://github.com/ntu2323/Dyna_TLA):** the TLA+ specification of DYNA, plus TLC model-checking configurations for its safety properties.
+- **This repository:** the original C++ prototype, built on the Ionia codebase. It is no longer the main implementation. The protocol design notes are in [`protocols/src/ionia/dyna/dyna_algo_design.txt`](protocols/src/ionia/dyna/dyna_algo_design.txt).
+
+## C++ prototype
+
 DYNA commands (DYNA lives in `protocols/src/ionia/dyna/`; see its `README.md` for unit tests):
 
 ### Build image
